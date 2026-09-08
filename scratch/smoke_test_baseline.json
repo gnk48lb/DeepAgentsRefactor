@@ -1,0 +1,14 @@
+{
+  "deepagents_version": "0.7.13",
+  "has_tool_call_limit_middleware": true,
+  "response": [
+    {
+      "type": "text",
+      "text": "SMOKE_TEST_OK",
+      "extras": {
+        "signature": "EnEKbwERTTIP8ptijbt+WtzFesLIlXtjpWykmGM5dHh4RmErK/q6U4qdNz2QERO3EcQAxotpGkT3cOznc/3J43vPuLq4M9H5wdyyzjsRnzDE4qT8ivCQe5sojW1cyMCTu/XWSD49Zq4djXU/2vUDHy/eEA=="
+      }
+    }
+  ],
+  "status": "SUCCESS"
+}
