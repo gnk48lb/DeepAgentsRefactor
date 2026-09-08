@@ -70,7 +70,7 @@ SILICON_FLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 # Gemini 相关配置
 # 注意：Google Gemini 的 OpenAI 兼容接口需要在 v1beta 后加 /openai/
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6Ju8-FZijZ9dgjaUg6311SntPaKJpyjW-kNdeCYA0bSAA")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "8964")
 
 GITHUB_BASE_URL = "https://models.inference.ai.azure.com"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
