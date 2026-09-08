@@ -1,0 +1,39 @@
+# --- 基础依赖 ---
+python-dotenv>=1.0.0
+huggingface-hub>=0.20.0
+
+# --- 数据库与检索 ---
+pymilvus>=2.4.0
+milvus-lite>=2.4.0
+neo4j>=6.0.0
+sentence-transformers>=3.0.0
+pymysql>=1.1.0
+
+# --- 分词与 NLP ---
+jieba>=0.42.1
+nltk>=3.9.0
+scipy>=1.10.0
+scikit-learn>=1.0.0
+
+# --- LangChain 0.3 核心家族 (严格限制版本以解决导入错误) ---
+langchain-core>=0.3.15
+langchain-community>=0.3.10
+langchain-text-splitters>=0.3.0
+langchain>=0.3.0
+langgraph>=0.2.35
+langgraph-prebuilt>=0.1.0
+langchain-openai>=0.2.0
+langchain-huggingface>=0.1.0
+langchain-mcp-adapters>=0.1.0
+langchain-google-genai>=2.0.0
+
+# --- 核心深度学习 (CPU 版) ---
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2.0
+torchvision>=0.17.0
+
+# --- 工具类 ---
+tavily-python>=0.3.0
+PyMuPDF>=1.23.0
+Pillow>=10.0.0
+docker>=7.0.0

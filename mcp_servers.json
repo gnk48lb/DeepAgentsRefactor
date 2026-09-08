@@ -1,0 +1,33 @@
+{
+  "amap": {
+    "command": "uvx",
+    "args": [
+      "--quiet",
+      "--with",
+      "amap-mcp-server",
+      "python",
+      "app/amap_wrapper.py"
+    ],
+    "env": {
+      "AMAP_MAPS_API_KEY": "${AMAP_API_KEY}"
+    },
+    "transport": "stdio"
+  },
+  "filesystem": {
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-filesystem",
+      "${WORKSPACE_DIR}"
+    ],
+    "transport": "stdio"
+  },
+  "desktop": {
+    "command": "uv",
+    "args": [
+      "run",
+      "app/windows_mcp.py"
+    ],
+    "transport": "stdio"
+  }
+}
