@@ -52,17 +52,20 @@ async def main():
         return report
 
     print("=" * 60, flush=True)
-    print("[3/4] Testing build_initial_messages with memory injection...", flush=True)
+    print("[3/4] Testing build_initial_messages with real Milvus memory...", flush=True)
     try:
-        test_query = "你好，请介绍一下你自己和你拥有的下属专家团队。"
-        test_memories = "- 用户是一名 Python 开发者，喜欢简洁明了的回复"
+        from app import database
+        test_mem = "用户是一名 Python 开发者，喜欢简洁明了的回复"
+        print(f"[*] Inserting test memory into Milvus: '{test_mem}'...", flush=True)
+        database.insert_memory(test_mem)
+
+        test_query = "你好，我是名 Python 开发者，请介绍一下你自己和你拥有的下属专家团队。"
         messages = deep_agent.build_initial_messages(
             user_query=test_query,
-            long_term_memories=test_memories,
         )
-        print(f"[+] SUCCESS: Built {len(messages)} initial messages.", flush=True)
+        print(f"[+] SUCCESS: Built {len(messages)} initial messages from real Milvus retrieval.", flush=True)
         for idx, m in enumerate(messages):
-            print(f"    [{idx}] {type(m).__name__}: {str(m.content)[:80]}...", flush=True)
+            print(f"    [{idx}] {type(m).__name__}: {str(m.content)[:100]}...", flush=True)
     except Exception as e:
         report["errors"].append(f"build_initial_messages failed: {e}")
         print(f"[-] FAILED: build_initial_messages failed: {e}", flush=True)

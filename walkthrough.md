@@ -49,13 +49,13 @@
 - **端到端对话**：成功响应自我介绍并详述了 6 大专家职责分工，报告存入 `scratch/verify_results.json`。
 
 ### 3. 子专家 Task 委派端到端实测 ([scripts/verify_subagent_delegation.py](file:///d:/code/VisualStudioCode/AI/project/GNK48-Agent/DeepAgentsRefactor/scripts/verify_subagent_delegation.py))
-- **测试查询**：“请帮我查询济南市今天的天气情况。”
+- **测试查询**：“请帮我查询北京市今天的天气情况。”
 - **执行轨迹 (Trajectory)**：
   ```
-  Step 0 [HumanMessage]: 请帮我查询济南市今天的天气情况。
-  Step 1 [AIMessage]: Tool Call -> task(args={"description": "查询济南市今天的天气情况。", "subagent_type": "KnowledgeAgent"})
-  Step 2 [ToolMessage]: [Tool Call: web_search] -> Tavily 返回今日济南天气数据
-  Step 3 [AIMessage]: 最终综合回答济南市气温、风力、空气质量及出行建议
+  Step 0 [HumanMessage]: 请帮我查询北京市今天的天气情况。
+  Step 1 [AIMessage]: Tool Call -> task(args={"description": "查询北京市今天的天气情况。", "subagent_type": "KnowledgeAgent"})
+  Step 2 [ToolMessage]: [Tool Call: web_search] -> Tavily 返回今日北京天气数据
+  Step 3 [AIMessage]: 最终综合回答北京市气温、风力、空气质量及出行建议
   ```
 - **委派成功率**：100% 成功通过 deepagents 内置 `task` 工具委派，子专家独立调起工具并向主 Agent 返回结构化报告。
 

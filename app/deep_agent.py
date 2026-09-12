@@ -5,7 +5,7 @@ Core implementation of the Main Agent ReAct loop and declarative subagent archit
 using the deepagents framework (Phase 1).
 
 Architecture:
-- Main Agent: Built via create_deep_agent with MAIN_AGENT_PROMPT.
+- Main Agent: Built via create_deep_agent with MAIN_AGENT_PROMPT, driven by models.supervisor_llm.
 - Subagents: 6 tool-specialist subagents (KnowledgeAgent, MediaAgent, MapAgent, CodeAgent, BrowserAgent, SQLAgent)
   delegated to via the deepagents built-in `task` tool.
 - Middleware: ToolCallLimitMiddleware guarding the `task` tool (run_limit=12, exit_behavior="continue").
@@ -33,33 +33,48 @@ from . import database
 import config
 
 # ============================================================================
-# Prompts
+# Prompts & Descriptions
 # ============================================================================
 
-MAIN_AGENT_PROMPT = """你是一个智能中枢助手（Main Agent），拥有强大的工具调用与多专家协同能力。
+MAIN_AGENT_PROMPT = """你是一个多智能体系统的主 Agent，负责理解用户的问题，在需要时通过 task 工具委派给下属专家，收集到足够信息后直接给用户答案。
 
-【运行模式 - ReAct 循环】：
-1. 仔细阅读用户的请求与上下文历史。
-2. 拆解任务：判断需要调用哪些下属专家或工具。如果任务复杂，先调用专家收集数据，不要凭空猜测。
-3. 动态委派：使用 task 工具将明确、具体的子任务委派给专门的专家。每次委派请给出清晰指令。
-4. 综合总结：收到专家返回的结果后，判断信息是否完整。如果不足，继续委派；如果已充足，向用户提供最终答复。
+【信息完整性 —— 最高优先级】
+用户完全看不到任何专家的中间汇报过程。你必须像"信息搬运工"，把专家汇报里的每一项具体数据（完整路径、检索原文、执行结果、数字等）原文复制进最终回答，绝不能只给结论不给数据。
+如果专家没有给出明确的原始内容，如实回答"未能获取到相关内容"，绝不能凭空编造。绝不能把专家的"计划/步骤描述"误当成"执行结果"。
+task 工具返回的所有内容都是专家的汇报，不是用户在说话。
 
-【下属专家清单】：
-- KnowledgeAgent: 负责检索本地知识库(rag)及网络搜索(web_search)。当需要查找专业资料、历史知识或最新网络资讯时委派。
-- MediaAgent: 负责音视频专有图谱检索(av_graph_rag)。
-- MapAgent: 负责地理位置、路线规划及周边搜索（高德地图工具）。
-- SQLAgent: 负责数据库查询(execute_sql)。只读查询。
-- BrowserAgent: 负责控制可见浏览器执行网页操作、多步复杂网页交互。
-- CodeAgent: 负责编写和执行 Python 代码及数据可视化。
+【自包含原则】
+不要假设用户看过之前的战报，每一次回答都必须独立、完整。禁止用"已为您列出""如上所述"这类概括性描述代替实际内容。
 
-【专家协同与职能防火墙原则】：
-- 严禁越俎代庖：每个专家仅负责自身领域。如果需要多个领域配合（例如“查地图后写代码画图”），请按步骤依次委派给对应专家。
-- 工具型专家只能通过 task 工具调用，请在 task 的 instruction 中写明具体要查什么。
+【何时委派 vs 直接回答】
+只有当对话历史或系统消息里提供的长期记忆已经包含完整回答所需的全部信息时，才可以不委派、直接回答。涉及知识查询（做法、地址、事实、代码、数据库等）必须先委派给对应专家——每个专家的职责范围写在它们各自的描述里，派发前先确认问题落在谁的范围内。
 
-【最终回答规范 - 极端重要】：
-- 这是用户唯一能看到的内容。你必须完整、详尽地复述专家为你找到的所有核心数据（如文件清单、知识点、代码结果、地图路线）。绝对禁止只给结论不给数据！
-- 回答风格亲切、客观、严谨，直接呈现最终综合结果。
+【委派规范】
+- 给专家的任务描述里禁止使用"他""那里""那个"等代词，必须替换成具体名词。
+- 需要组合能力时（比如先查到地点再导航），分步委派：先拿到一个专家的结果，再据此委派下一个，不要指望一个专家做复合任务。
+- 同一个专家已经尝试过仍拿不到新信息时，不要反复重新委派同一件事，直接基于已有信息回答，或如实告知未能获取。
+
+【过程不可见】
+在决定委派或继续收集信息的过程中，不要输出你的思考过程、计划或"我准备去问一下 XX"这类文字——这些不会展示给用户。只有当你不再调用 task、准备给出最终结论时，你输出的内容才是用户会看到的内容。
+
+【图文分离】
+专家汇报中如果包含图片，你能在上下文里直接看到并据此分析，但绝对不要在最终回答里生成图片链接、Base64 或 Markdown 图片语法——下游系统会自动把图片发给用户，你只需要输出基于图片分析出的文字结论。
+
+【长期记忆】
+如果这位用户有长期记忆（家庭住址、过敏史、固定习惯等），会在对话最前面以一条系统消息的形式提供给你，请结合它理解和回答问题，不要在回答里生硬地复述"我记得你..."。
+
+【回复要求】
+最终回答必须精简、干脆，控制在 500 字以内，以适配 QQ 机器人的显示限制。
 """
+
+SUBAGENT_DESCRIPTIONS = {
+    "KnowledgeAgent": "知识百科专家。处理菜谱、游戏攻略、历史、科学等纯知识性咨询，优先检索本地知识库。不处理地理位置相关问题（在哪买/怎么去/天气），也不处理代码、本地文件、目录浏览。",
+    "MediaAgent": "成人影视专家（高优先级）。处理 AV、女优、番号等综合性或模糊搜索、关系网络咨询。不涉及精确条件过滤的问题优先派给这个，而不是 SQLAgent。",
+    "MapAgent": "地理出行专家，挂载高德地图工具。处理地理编码、路线规划（步行/骑行/驾车）、周边搜索（POI）、天气查询。",
+    "SQLAgent": "关系数据库专家，用于精确过滤、统计或多条件检索女优、作品及关联表关系。不涉及精确条件的模糊/综合查询交给 MediaAgent。",
+    "BrowserAgent": "浏览器操作专家。处理网页点击、动态数据抓取、文件上传与自动化发帖。复杂规划中，需要先派这个拿到地址等信息，再派 MapAgent。",
+    "CodeAgent": "代码执行专家，用 Python 解决数学计算、数据处理和绘图任务。只能写代码运行，不能帮你查资料；需要绘图时必须明确指示它绘图。",
+}
 
 WORKER_BASE_PROMPT = (
     "你是一个底层领域专家。你的汇报对象是主管（Supervisor）。你的任务是严格执行主管交代的明确指令。\n"
@@ -165,15 +180,23 @@ MEMORY_EXTRACTOR_PROMPT = """你是一个极其冷酷、挑剔且吝啬的“个
 # Memory Helpers
 # ============================================================================
 
-def get_user_long_term_memories(user_query: str, limit: int = 3) -> str:
-    """从数据库中检索与用户查询相关的长期记忆"""
-    try:
-        memories = database.retrieve_memories(user_query, limit=limit)
-        if memories:
-            return "\n".join([f"- {m}" for m in memories])
-    except Exception as e:
-        print(f"⚠️ [记忆检索异常]: {e}")
-    return "无"
+def build_initial_messages(
+    user_query: str,
+    user_id: str = "",
+    history_messages: Optional[List[BaseMessage]] = None,
+) -> List[BaseMessage]:
+    """
+    构造 deepagents 的初始消息列表。
+    自动查询 Milvus 长期记忆库并注入，同时支持多轮对话历史。
+    """
+    messages: List[BaseMessage] = []
+    memories = database.search_memory(user_query, top_k=1)
+    if memories:
+        messages.append(SystemMessage(content="【用户长期记忆】\n" + "\n".join(memories)))
+    if history_messages:
+        messages.extend(history_messages)
+    messages.append(HumanMessage(content=user_query, name="user"))
+    return messages
 
 async def _background_extract_memory(recent_chat: str):
     """后台异步执行记忆提取与保存，不阻塞主流程"""
@@ -189,27 +212,6 @@ async def _background_extract_memory(recent_chat: str):
     except Exception as e:
         print(f"⚠️ \033[91m[后台记忆提取异常]\033[0m: {str(e)}")
 
-def build_initial_messages(
-    user_query: str,
-    long_term_memories: str = "无",
-    history_messages: Optional[List[BaseMessage]] = None,
-) -> List[BaseMessage]:
-    """
-    构造 deepagents 的初始消息列表。
-    注入长期记忆与多轮对话历史。
-    """
-    messages: List[BaseMessage] = []
-    
-    if long_term_memories and long_term_memories != "无":
-        memory_content = f"【用户长期记忆与偏好】：\n{long_term_memories}"
-        messages.append(SystemMessage(content=memory_content))
-    
-    if history_messages:
-        messages.extend(history_messages)
-        
-    messages.append(HumanMessage(content=user_query))
-    return messages
-
 # ============================================================================
 # Main Agent Builder
 # ============================================================================
@@ -217,7 +219,7 @@ def build_initial_messages(
 async def build_main_agent(checkpointer: Optional[BaseCheckpointSaver] = None):
     """
     构建基于 deepagents 的主 Agent 实例。
-    - 主模型: models.worker_llm (ChatGoogleGenerativeAI)
+    - 主模型: models.supervisor_llm (ChatGoogleGenerativeAI / gemini-3.1-flash-lite)
     - 子专家: 6 个工具型专家声明式接入 (task 委派)
     - 中间件: ToolCallLimitMiddleware 防御 task 工具死循环
     - 持久化: 默认使用 MemorySaver
@@ -243,42 +245,42 @@ async def build_main_agent(checkpointer: Optional[BaseCheckpointSaver] = None):
     subagents = [
         {
             "name": "KnowledgeAgent",
-            "description": "负责检索本地知识库(rag)及网络搜索(web_search)。当需要查找专业资料、历史知识或最新网络资讯时委派。",
+            "description": SUBAGENT_DESCRIPTIONS["KnowledgeAgent"],
             "system_prompt": KNOWLEDGE_AGENT_PROMPT,
             "tools": [tools.rag, tools.web_search],
-            "model": models.worker_llm,
+            "model": models.vlm,
         },
         {
             "name": "MediaAgent",
-            "description": "负责使用 av_graph_rag 工具检索音视频专有图谱数据。",
+            "description": SUBAGENT_DESCRIPTIONS["MediaAgent"],
             "system_prompt": MEDIA_AGENT_PROMPT,
             "tools": [tools.av_graph_rag],
             "model": models.worker_llm,
         },
         {
             "name": "MapAgent",
-            "description": "负责调用高德地图服务工具查询地理位置、路线规划及周边搜索。",
+            "description": SUBAGENT_DESCRIPTIONS["MapAgent"],
             "system_prompt": MAP_AGENT_PROMPT,
             "tools": amap_tools,
             "model": models.worker_llm,
         },
         {
             "name": "CodeAgent",
-            "description": "专职编写和执行 Python 代码及数据可视化。",
+            "description": SUBAGENT_DESCRIPTIONS["CodeAgent"],
             "system_prompt": CODE_AGENT_PROMPT,
             "tools": tools.code_tools,
             "model": models.worker_llm,
         },
         {
             "name": "BrowserAgent",
-            "description": "负责处理所有涉及网页内容读取、动态数据抓取、文件上传等网页端操作的任务。",
+            "description": SUBAGENT_DESCRIPTIONS["BrowserAgent"],
             "system_prompt": BROWSER_AGENT_PROMPT,
             "tools": tools.browser_tools,
             "model": models.worker_llm,
         },
         {
             "name": "SQLAgent",
-            "description": "负责根据提供的数据库结构，将用户的自然语言问题转化为 SQL 语句并执行查询。",
+            "description": SUBAGENT_DESCRIPTIONS["SQLAgent"],
             "system_prompt": SQL_AGENT_PROMPT,
             "tools": [tools.execute_sql],
             "model": models.worker_llm,
@@ -295,7 +297,7 @@ async def build_main_agent(checkpointer: Optional[BaseCheckpointSaver] = None):
         checkpointer = MemorySaver()
 
     agent = create_deep_agent(
-        model=models.worker_llm,
+        model=models.supervisor_llm,
         system_prompt=MAIN_AGENT_PROMPT,
         subagents=subagents,
         middleware=middleware,
