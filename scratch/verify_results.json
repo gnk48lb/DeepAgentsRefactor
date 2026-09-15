@@ -2,9 +2,7 @@
   "coexistence_check": true,
   "build_agent_check": true,
   "subagents_configured": [],
-  "ainvoke_test": false,
-  "response_sample": "",
-  "errors": [
-    "ainvoke failed: Error calling model 'gemini-3.1-flash-lite' (INVALID_ARGUMENT): 400 INVALID_ARGUMENT. {'error': {'code': 400, 'message': 'API key not valid. Please pass a valid API key.', 'status': 'INVALID_ARGUMENT', 'details': [{'@type': 'type.googleapis.com/google.rpc.ErrorInfo', 'reason': 'API_KEY_INVALID', 'domain': 'googleapis.com', 'metadata': {'service': 'generativelanguage.googleapis.com'}}, {'@type': 'type.googleapis.com/google.rpc.LocalizedMessage', 'locale': 'en-US', 'message': 'API key not valid. Please pass a valid API key.'}]}}"
-  ]
+  "ainvoke_test": true,
+  "response_sample": "我是你的多智能体系统主 Agent。我的核心职责是理解你的需求，通过调度下属专家团队高效完成任务，并为你提供精准、直接的反馈。\n\n我的下属专家团队包括：\n\n1.  **General-purpose Agent**：通用研究专家，负责处理复杂问题、文件检索及多步骤任务规划。\n2.  **KnowledgeAgent**：知识百科专家，专注于菜谱、游戏攻略、历史、科学等纯知识性咨询。\n3.  **MediaAgent**：影视专家，处理影视作品、演员及相关网络信息的综合查询。\n4.  **MapAgent**：地理出行专家，挂载高德地图，负责地理编码、路线规划及周边搜索。\n5.  **CodeA",
+  "errors": []
 }

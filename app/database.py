@@ -226,33 +226,47 @@ def insert_memory(text: str):
     try:
         c = get_client()
         coll_name = config.MEMORY_COLLECTION_NAME
+        if not c.has_collection(coll_name):
+            init_memory_collection()
+        else:
+            try:
+                c.load_collection(collection_name=coll_name)
+            except Exception:
+                pass
+
         vector = models.embeddings.embed_query(text)
 
         # ── 语义去重 (Semantic Upsert)：插入前先检索，相似度 > 0.92 则覆盖旧记忆 ──
         if c.has_collection(coll_name):
-            res = c.search(
-                collection_name=coll_name,
-                data=[vector],
-                limit=1,
-                output_fields=["id", "text"],
-                search_params={"metric_type": "IP"}
-            )
-            if res and res[0]:
-                top_hit = res[0][0]
-                score = top_hit["distance"]
-                hit_id = top_hit["id"]
-                if score > 0.92:
-                    old_text = top_hit["entity"]["text"]
-                    print(f"\U0001f504 \033[93m[记忆去重]\033[0m: 发现高度相似记忆 (相似度: {score:.4f})")
-                    print(f"  旧记忆: {old_text}")
-                    print(f"  新记忆: {text} -> 执行覆盖写入。")
-                    c.delete(collection_name=coll_name, pks=[hit_id])
+            try:
+                res = c.search(
+                    collection_name=coll_name,
+                    data=[vector],
+                    limit=1,
+                    output_fields=["id", "text"],
+                    search_params={"metric_type": "IP"}
+                )
+                if res and res[0]:
+                    top_hit = res[0][0]
+                    score = top_hit["distance"]
+                    hit_id = top_hit["id"]
+                    if score > 0.92:
+                        old_text = top_hit["entity"]["text"]
+                        print(f"🔄 \033[93m[记忆去重]\033[0m: 发现高度相似记忆 (相似度: {score:.4f})")
+                        print(f"  旧记忆: {old_text}")
+                        print(f"  新记忆: {text} -> 执行覆盖写入。")
+                        c.delete(collection_name=coll_name, pks=[hit_id])
+            except Exception as se:
+                print(f"⚠️ [记忆查重跳过]: {se}")
         # ─────────────────────────────────────────────────────────────────────────
 
         data = [{"vector": vector, "text": text}]
         c.insert(collection_name=coll_name, data=data)
-        # 强制刷新以保证立即检索可见
-        c.flush(coll_name)
+        # Windows Milvus Lite 下 flush 可能因 tmp 文件替换锁报 WinError 183，保护性调用
+        try:
+            c.flush(coll_name)
+        except Exception:
+            pass
     except Exception as e:
         print(f"❌ [插入记忆失败]: {e}")
 
@@ -261,7 +275,12 @@ def search_memory(query: str, top_k=3) -> List[str]:
         c = get_client()
         coll_name = config.MEMORY_COLLECTION_NAME
         if not c.has_collection(coll_name):
-            return []
+            init_memory_collection()
+        else:
+            try:
+                c.load_collection(collection_name=coll_name)
+            except Exception:
+                pass
         
         # 直接检索，依赖异常处理而非不稳定的 row_count
         vector = models.embeddings.embed_query(query)
