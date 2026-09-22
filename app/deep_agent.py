@@ -329,7 +329,7 @@ async def build_main_agent(checkpointer: Optional[BaseCheckpointSaver] = None):
     else:
         print("[-] Warning: ToolCallLimitMiddleware not available, task tool limit disabled.")
 
-    # 声明式 subagents 列表（包含 6 个工具型专家 + 2 个编译型 HITL 子图专家）
+    # 声明式 subagents 列表（包含 6 个工具型专家 + 2 个编译型 HITL 子图专家 + 1 个兜底覆盖）
     subagents = [
         {
             "name": "KnowledgeAgent",
@@ -375,6 +375,19 @@ async def build_main_agent(checkpointer: Optional[BaseCheckpointSaver] = None):
         },
         file_subagent,
         desktop_subagent,
+        # 显式覆盖框架内置的 general-purpose subagent。
+        # 根据 deepagents 文档："这些设置只在调用方没有提供一个名叫 general-purpose 的 subagent 时才生效"。
+        # 注册同名条目是不依赖 provider key 匹配的硬覆盖，比 register_harness_profile 更可靠。
+        {
+            "name": "general-purpose",
+            "description": "仅当用户请求明显不属于以上任何专家范围时才使用，绝大多数情况不应该被调用。",
+            "system_prompt": (
+                "如果你被调用，说明主 Agent 判断这个任务不属于任何专属领域专家的范围。"
+                "请如实告知用户无法处理这类请求，不要尝试执行任何工具操作或猜测性回答。"
+            ),
+            "tools": [],
+            "model": models.worker_llm,
+        },
     ]
 
     if checkpointer is None:

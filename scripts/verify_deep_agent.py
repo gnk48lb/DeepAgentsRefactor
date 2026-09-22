@@ -1,12 +1,13 @@
 """
 scripts/verify_deep_agent.py
 
-End-to-end verification script for Phase 1 of deepagents migration.
+End-to-end verification script for Phase 1/2 of deepagents migration.
 Validates:
 1. app/deep_agent.py import and coexistence with app/graph.py
-2. build_main_agent() compilation with all 6 declarative subagents & middleware
-3. Message structure with build_initial_messages()
-4. End-to-end ainvoke execution without touching any production path
+2. build_main_agent() compilation with all subagents & middleware
+3. Hard schema validation: introspect task tool args_schema to confirm
+   subagent_type only accepts the 9 declared expert names (no LLM call needed)
+4. End-to-end ainvoke smoke test
 """
 
 import asyncio
@@ -21,6 +22,7 @@ async def main():
     report = {
         "coexistence_check": False,
         "build_agent_check": False,
+        "schema_validation": False,
         "subagents_configured": [],
         "ainvoke_test": False,
         "response_sample": "",
@@ -52,38 +54,110 @@ async def main():
         return report
 
     print("=" * 60, flush=True)
-    print("[3/4] Testing build_initial_messages with real Milvus memory...", flush=True)
+    print("[3/4] Hard schema validation: inspecting task tool args_schema...", flush=True)
     try:
-        from app import database
-        test_mem = "用户是一名 Python 开发者，喜欢简洁明了的回复"
-        print(f"[*] Inserting test memory into Milvus: '{test_mem}'...", flush=True)
-        database.insert_memory(test_mem)
+        # 从编译好的 agent 直接取 task 工具，不依赖模型文字生成
+        task_tool = agent.get_tool("task")
+        if task_tool is None:
+            raise RuntimeError("agent.get_tool('task') returned None — task tool not found")
 
-        test_query = "你好，我是名 Python 开发者，请介绍一下你自己和你拥有的下属专家团队。"
-        messages = deep_agent.build_initial_messages(
-            user_query=test_query,
-        )
-        print(f"[+] SUCCESS: Built {len(messages)} initial messages from real Milvus retrieval.", flush=True)
-        for idx, m in enumerate(messages):
-            print(f"    [{idx}] {type(m).__name__}: {str(m.content)[:100]}...", flush=True)
+        schema = task_tool.args_schema
+        if schema is None:
+            raise RuntimeError("task tool has no args_schema")
+
+        # 兼容 Pydantic v1 / v2：从 schema 元数据或 JSON schema 提取 subagent_type 的约束
+        allowed_values: list | None = None
+
+        # 方式 1：Pydantic v2 model_fields + annotation.__args__ (Literal)
+        if hasattr(schema, "model_fields") and "subagent_type" in schema.model_fields:
+            field_info = schema.model_fields["subagent_type"]
+            ann = field_info.annotation
+            if hasattr(ann, "__args__"):
+                allowed_values = list(ann.__args__)
+
+        # 方式 2：Pydantic v1 __fields__
+        if allowed_values is None and hasattr(schema, "__fields__") and "subagent_type" in schema.__fields__:
+            field = schema.__fields__["subagent_type"]
+            outer = getattr(field, "outer_type_", None) or getattr(field, "annotation", None)
+            if outer is not None and hasattr(outer, "__args__"):
+                allowed_values = list(outer.__args__)
+
+        # 方式 3：退化到 JSON schema enum（兜底，无论 Pydantic 版本）
+        if allowed_values is None:
+            try:
+                if hasattr(schema, "model_json_schema"):
+                    js = schema.model_json_schema()
+                elif hasattr(schema, "schema"):
+                    js = schema.schema()
+                else:
+                    js = {}
+                props = js.get("properties", {})
+                st = props.get("subagent_type", {})
+                if "enum" in st:
+                    allowed_values = list(st["enum"])
+                elif "allOf" in st:
+                    defs = js.get("$defs", {})
+                    ref_name = st["allOf"][0].get("$ref", "").split("/")[-1]
+                    allowed_values = list(defs.get(ref_name, {}).get("enum", []))
+            except Exception as schema_err:
+                raise RuntimeError(f"Failed to parse JSON schema: {schema_err}")
+
+        if allowed_values is None:
+            raise RuntimeError(
+                "Could not extract allowed values for subagent_type from args_schema. "
+                f"Schema type: {type(schema)}"
+            )
+
+        # 声明的 9 个专家名字（6 工具型 + 2 HITL 编译型 + 1 兜底覆盖）
+        EXPECTED_SUBAGENTS = {
+            "KnowledgeAgent",
+            "MediaAgent",
+            "MapAgent",
+            "CodeAgent",
+            "BrowserAgent",
+            "SQLAgent",
+            "FileAgent",
+            "DesktopAgent",
+            "general-purpose",
+        }
+
+        actual_set = set(allowed_values)
+        print(f"    task.args_schema subagent_type allowed values ({len(actual_set)}):", flush=True)
+        for name in sorted(actual_set):
+            status = "✓" if name in EXPECTED_SUBAGENTS else "✗ UNEXPECTED"
+            print(f"      {status}  {name}", flush=True)
+
+        missing = EXPECTED_SUBAGENTS - actual_set
+        extra   = actual_set - EXPECTED_SUBAGENTS
+
+        if missing:
+            raise AssertionError(f"Missing subagents in schema: {missing}")
+        if extra:
+            raise AssertionError(f"Unexpected subagents in schema: {extra}")
+
+        report["schema_validation"] = True
+        report["subagents_configured"] = sorted(actual_set)
+        print(f"[+] SUCCESS: task tool schema contains exactly the expected {len(EXPECTED_SUBAGENTS)} subagents.", flush=True)
+
     except Exception as e:
-        report["errors"].append(f"build_initial_messages failed: {e}")
-        print(f"[-] FAILED: build_initial_messages failed: {e}", flush=True)
+        report["errors"].append(f"Schema validation failed: {e}")
+        print(f"[-] FAILED: Schema validation failed: {e}", flush=True)
         return report
 
     print("=" * 60, flush=True)
     print("[4/4] Testing agent.ainvoke with thread_id checkpoint...", flush=True)
     try:
-        config_invoke = {"configurable": {"thread_id": "phase1_verification_thread_1"}}
+        test_query = "你好，简单介绍一下你自己。"
+        messages = deep_agent.build_initial_messages(user_query=test_query)
+        config_invoke = {"configurable": {"thread_id": "phase2_schema_verify_thread_1"}}
         result = await agent.ainvoke({"messages": messages}, config=config_invoke)
-        
+
         last_message = result["messages"][-1]
         content = getattr(last_message, "content", str(last_message))
         if isinstance(content, list):
-            # Format text list from Gemini / OpenAI multimodal output
             text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and "text" in p]
             content = " ".join(text_parts) if text_parts else str(content)
-            
+
         report["ainvoke_test"] = True
         report["response_sample"] = content[:300]
         print("[+] SUCCESS: ainvoke returned final response!", flush=True)
