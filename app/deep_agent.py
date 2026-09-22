@@ -14,11 +14,28 @@ Architecture:
 
 from typing import List, Optional, Sequence, Any, Dict
 import asyncio
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, BaseMessage
+from langchain_core.runnables import Runnable
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 
-from deepagents import create_deep_agent
+from deepagents import (
+    create_deep_agent,
+    CompiledSubAgent,
+    register_harness_profile,
+    HarnessProfile,
+    GeneralPurposeSubagentProfile,
+)
+
+# 确保关掉默认的 general-purpose subagent（由专属专家全面承接任务，避免不可控兜底）
+for _provider in ("google_genai", "openai"):
+    try:
+        register_harness_profile(
+            _provider,
+            HarnessProfile(general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False)),
+        )
+    except Exception:
+        pass
 
 # ToolCallLimitMiddleware guard
 try:
@@ -30,7 +47,55 @@ from . import models
 from . import tools
 from . import mcp_service
 from . import database
+from .graph import (
+    build_file_agent_subgraph,
+    build_desktop_agent_subgraph,
+    FILE_AGENT_PROMPT,
+    DESKTOP_AGENT_PROMPT,
+)
 import config
+
+
+class SubgraphCompiledWrapper(Runnable):
+    """
+    包装已有编译子图（FileAgent / DesktopAgent），使其适配 deepagents 的 CompiledSubAgent 规范：
+    1. 自动从 task 传入的 HumanMessage 提取 instruction 并填充子图需要的 state 字段；
+    2. 确保子图的最终汇报 ToolMessage/AIMessage 文本被 deepagents 正确提取为 AIMessage。
+    """
+    def __init__(self, subgraph):
+        self.subgraph = subgraph
+
+    def invoke(self, state, config=None, **kwargs):
+        raise NotImplementedError("Use async ainvoke")
+
+    async def ainvoke(self, state, config=None, **kwargs):
+        msgs = state.get("messages", [])
+        description = ""
+        for m in reversed(msgs):
+            if isinstance(m, HumanMessage):
+                if isinstance(m.content, str):
+                    description = m.content
+                elif isinstance(m.content, list):
+                    description = " ".join(p.get("text", "") for p in m.content if isinstance(p, dict) and "text" in p)
+                break
+
+        subgraph_input = {
+            "messages": msgs,
+            "current_tool_call_id": state.get("current_tool_call_id") or "call_subgraph",
+            "instruction_to_worker": state.get("instruction_to_worker") or description,
+            "user_query": state.get("user_query") or description,
+        }
+
+        result = await self.subgraph.ainvoke(subgraph_input, config)
+
+        res_msgs = list(result.get("messages", []))
+        if res_msgs and isinstance(res_msgs[-1], ToolMessage):
+            final_content = res_msgs[-1].content
+            res_msgs.append(AIMessage(content=final_content))
+            result["messages"] = res_msgs
+
+        return result
+
 
 # ============================================================================
 # Prompts & Descriptions
@@ -227,6 +292,29 @@ async def build_main_agent(checkpointer: Optional[BaseCheckpointSaver] = None):
     # 确保 MCP 服务已初始化
     await mcp_service.initialize_mcp()
     amap_tools = mcp_service.get_tools_by_server("amap")
+    filesystem_tools = mcp_service.get_tools_by_server("filesystem")
+    desktop_tools = mcp_service.get_tools_by_server("desktop")
+
+    # 构建已编译子图并使用 SubgraphCompiledWrapper 适配 deepagents
+    file_agent_subgraph = build_file_agent_subgraph(
+        filesystem_tools=filesystem_tools,
+        system_prompt=FILE_AGENT_PROMPT,
+    )
+    desktop_agent_subgraph = build_desktop_agent_subgraph(
+        desktop_tools=desktop_tools,
+        system_prompt=DESKTOP_AGENT_PROMPT,
+    )
+
+    file_subagent = CompiledSubAgent(
+        name="FileAgent",
+        description="本地文件专家，读取/写入/编辑项目内文件，涉及危险操作（写入/编辑/移动）会暂停并请求人工授权。",
+        runnable=SubgraphCompiledWrapper(file_agent_subgraph),
+    )
+    desktop_subagent = CompiledSubAgent(
+        name="DesktopAgent",
+        description="桌面操作专家，通过截图+网格坐标操作 Windows 桌面 GUI，涉及高危按键组合会暂停并请求人工授权。",
+        runnable=SubgraphCompiledWrapper(desktop_agent_subgraph),
+    )
 
     # 配置中间件
     middleware = []
@@ -241,7 +329,7 @@ async def build_main_agent(checkpointer: Optional[BaseCheckpointSaver] = None):
     else:
         print("[-] Warning: ToolCallLimitMiddleware not available, task tool limit disabled.")
 
-    # 声明式 subagents 列表
+    # 声明式 subagents 列表（包含 6 个工具型专家 + 2 个编译型 HITL 子图专家）
     subagents = [
         {
             "name": "KnowledgeAgent",
@@ -285,12 +373,8 @@ async def build_main_agent(checkpointer: Optional[BaseCheckpointSaver] = None):
             "tools": [tools.execute_sql],
             "model": models.worker_llm,
         },
-        # ====================================================================
-        # NOTE [Subsequent Phases]:
-        # FileAgent and DesktopAgent involve interactive HITL (Human-in-the-loop)
-        # compiled subgraphs and approval mechanisms. They will be integrated
-        # in Phase 2/3. Do NOT add them here in Phase 1 to avoid runtime schema mismatches.
-        # ====================================================================
+        file_subagent,
+        desktop_subagent,
     ]
 
     if checkpointer is None:
