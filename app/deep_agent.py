@@ -13,6 +13,7 @@ Architecture:
 """
 
 from typing import List, Optional, Sequence, Any, Dict
+from .utils import extract_text
 import asyncio
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, BaseMessage
 from langchain_core.runnables import Runnable
@@ -268,7 +269,7 @@ async def _background_extract_memory(recent_chat: str):
     try:
         final_prompt = MEMORY_EXTRACTOR_PROMPT.format(recent_chat=recent_chat)
         res = await models.extractor_llm.ainvoke(final_prompt)
-        content = res.content.strip()
+        content = extract_text(res.content).strip()
         if content and content.upper() != "NONE" and "NONE" not in content.upper():
             database.insert_memory(content)
             print(f"--- \033[92m[后台记忆保存]\033[0m: {content} ---")

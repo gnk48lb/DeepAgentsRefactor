@@ -6,6 +6,7 @@ from io import BytesIO
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_core.messages import HumanMessage
 from . import models
+from .utils import extract_text
 import hashlib
 
 def get_file_sha256(byte_data: bytes) -> str:
@@ -123,7 +124,7 @@ def process_pdfs_and_images(source_dir=SOURCE_DIR, is_incremental=False):
                 
                 try:
                     res = models.vlm.invoke([msg])
-                    content_res = res.content
+                    content_res = extract_text(res.content)
                     rel_img_path = os.path.relpath(file_path, "data")
                     with open(summary_path, "w", encoding="utf-8") as f:
                         f.write(f"<!-- image_path: {rel_img_path} -->\n\n")

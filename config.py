@@ -51,18 +51,19 @@ EMBEDDING_MODEL = "BAAI/bge-m3"
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 
 # 文字模型 LLM (Worker)
-WORKER_LLM_MODEL = "gpt-4.1"
+WORKER_LLM_MODEL = "gemini-3.1-flash-lite-preview"
 
 # 文字模型 LLM (Supervisor)
-SUPERVISOR_LLM_MODEL = "gpt-4o"
-# SUPERVISOR_LLM_MODEL = "gemini-3.1-flash-lite-preview"
+SUPERVISOR_LLM_MODEL = "gemini-3.1-flash-lite"
 
 # 多模态模型 VLM
-# VLM_MODEL = "gpt-4.1"
-VLM_MODEL = "gpt-4.1"
+VLM_MODEL = "gemini-3.1-flash-lite"
 
 # 浏览器多模态模型 (BrowserAgent)
 BROWSER_VLM_MODEL = "gemini-3.1-flash-lite"
+
+# 桌面多模态模型 (DesktopAgent)
+DESKTOP_VLM_MODEL = "gemini-3.1-flash-lite"
 
 # SiliconFlow 相关配置 (暂时注释)
 SILICON_FLOW_BASE_URL = "https://api.siliconflow.cn/v1"

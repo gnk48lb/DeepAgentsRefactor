@@ -54,59 +54,62 @@ async def main():
         return report
 
     print("=" * 60, flush=True)
-    print("[3/4] Hard schema validation: inspecting task tool args_schema...", flush=True)
+    print("[3/4] Hard schema validation: inspecting task tool args_schema & subagents...", flush=True)
     try:
-        # 从编译好的 agent 直接取 task 工具，不依赖模型文字生成
-        task_tool = agent.get_tool("task")
-        if task_tool is None:
-            raise RuntimeError("agent.get_tool('task') returned None — task tool not found")
+        # 从编译图的 tools 节点中提取 task 工具
+        tools_node = agent.nodes.get("tools")
+        if tools_node is None:
+            raise RuntimeError("Graph has no 'tools' node")
+
+        tools_by_name = getattr(tools_node, "tools_by_name", None)
+        if tools_by_name is None and hasattr(tools_node, "bound"):
+            tools_by_name = getattr(tools_node.bound, "tools_by_name", None)
+
+        if not tools_by_name or "task" not in tools_by_name:
+            raise RuntimeError(f"task tool not found in tools node. Available: {list(tools_by_name.keys()) if tools_by_name else None}")
+
+        task_tool = tools_by_name["task"]
+        print(f"[+] Found task tool: {task_tool.name}", flush=True)
 
         schema = task_tool.args_schema
         if schema is None:
             raise RuntimeError("task tool has no args_schema")
 
-        # 兼容 Pydantic v1 / v2：从 schema 元数据或 JSON schema 提取 subagent_type 的约束
-        allowed_values: list | None = None
+        # 打印 args_schema 的 JSON Schema 定义
+        if hasattr(schema, "model_json_schema"):
+            schema_json = schema.model_json_schema()
+        elif hasattr(schema, "schema"):
+            schema_json = schema.schema()
+        else:
+            schema_json = str(schema)
+        print(f"    task.args_schema: {schema}", flush=True)
+        print(f"    task.args_schema JSON: {schema_json}", flush=True)
 
-        # 方式 1：Pydantic v2 model_fields + annotation.__args__ (Literal)
+        # 提取 subagent_type 实际允许的取值列表：
+        # 1. 优先从 task 工具底层闭包的 subagent_graphs 获取（实际运行时路由表）
+        allowed_values = None
+        coro = getattr(task_tool, "coroutine", None) or getattr(task_tool, "func", None)
+        if coro and hasattr(coro, "__code__") and hasattr(coro, "__closure__") and coro.__closure__:
+            closure_dict = dict(zip(coro.__code__.co_freevars, [c.cell_contents for c in coro.__closure__]))
+            if "subagent_graphs" in closure_dict:
+                allowed_values = list(closure_dict["subagent_graphs"].keys())
+
+        # 2. 如果闭包不可用，从 tool description 的 Available agent types 列表解析
+        if not allowed_values and task_tool.description:
+            import re
+            matches = re.findall(r"^-\s*([A-Za-z0-9_-]+):", task_tool.description, flags=re.MULTILINE)
+            if matches:
+                allowed_values = matches
+
+        # 3. 如果 schema 有 Literal / Enum 约束，也一并提取
         if hasattr(schema, "model_fields") and "subagent_type" in schema.model_fields:
             field_info = schema.model_fields["subagent_type"]
             ann = field_info.annotation
-            if hasattr(ann, "__args__"):
+            if hasattr(ann, "__args__") and ann.__args__:
                 allowed_values = list(ann.__args__)
 
-        # 方式 2：Pydantic v1 __fields__
-        if allowed_values is None and hasattr(schema, "__fields__") and "subagent_type" in schema.__fields__:
-            field = schema.__fields__["subagent_type"]
-            outer = getattr(field, "outer_type_", None) or getattr(field, "annotation", None)
-            if outer is not None and hasattr(outer, "__args__"):
-                allowed_values = list(outer.__args__)
-
-        # 方式 3：退化到 JSON schema enum（兜底，无论 Pydantic 版本）
         if allowed_values is None:
-            try:
-                if hasattr(schema, "model_json_schema"):
-                    js = schema.model_json_schema()
-                elif hasattr(schema, "schema"):
-                    js = schema.schema()
-                else:
-                    js = {}
-                props = js.get("properties", {})
-                st = props.get("subagent_type", {})
-                if "enum" in st:
-                    allowed_values = list(st["enum"])
-                elif "allOf" in st:
-                    defs = js.get("$defs", {})
-                    ref_name = st["allOf"][0].get("$ref", "").split("/")[-1]
-                    allowed_values = list(defs.get(ref_name, {}).get("enum", []))
-            except Exception as schema_err:
-                raise RuntimeError(f"Failed to parse JSON schema: {schema_err}")
-
-        if allowed_values is None:
-            raise RuntimeError(
-                "Could not extract allowed values for subagent_type from args_schema. "
-                f"Schema type: {type(schema)}"
-            )
+            raise RuntimeError("Could not extract allowed values for subagent_type from task tool")
 
         # 声明的 9 个专家名字（6 工具型 + 2 HITL 编译型 + 1 兜底覆盖）
         EXPECTED_SUBAGENTS = {
@@ -122,7 +125,7 @@ async def main():
         }
 
         actual_set = set(allowed_values)
-        print(f"    task.args_schema subagent_type allowed values ({len(actual_set)}):", flush=True)
+        print(f"    task tool subagent_type allowed values ({len(actual_set)}):", flush=True)
         for name in sorted(actual_set):
             status = "✓" if name in EXPECTED_SUBAGENTS else "✗ UNEXPECTED"
             print(f"      {status}  {name}", flush=True)
@@ -131,13 +134,13 @@ async def main():
         extra   = actual_set - EXPECTED_SUBAGENTS
 
         if missing:
-            raise AssertionError(f"Missing subagents in schema: {missing}")
+            raise AssertionError(f"Missing subagents in task tool: {missing}")
         if extra:
-            raise AssertionError(f"Unexpected subagents in schema: {extra}")
+            raise AssertionError(f"Unexpected subagents in task tool: {extra}")
 
         report["schema_validation"] = True
         report["subagents_configured"] = sorted(actual_set)
-        print(f"[+] SUCCESS: task tool schema contains exactly the expected {len(EXPECTED_SUBAGENTS)} subagents.", flush=True)
+        print(f"[+] SUCCESS: task tool contains exactly the expected {len(EXPECTED_SUBAGENTS)} subagents.", flush=True)
 
     except Exception as e:
         report["errors"].append(f"Schema validation failed: {e}")

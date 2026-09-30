@@ -111,7 +111,7 @@ reranker = SiliconFlowReranker(config.RERANKER_MODEL, config.SILICON_FLOW_API_KE
 
 # Initialize Worker LLM (Text only)
 worker_llm = ChatGoogleGenerativeAI(
-    model="gemini-3.1-flash-lite-preview",
+    model=config.WORKER_LLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
     temperature=0
 )
@@ -123,8 +123,7 @@ worker_llm = ChatGoogleGenerativeAI(
 # )
 
 supervisor_llm = ChatGoogleGenerativeAI(
-    model="gemini-3.1-flash-lite",
-    # model="gemini-3.1-flash-lite-preview",
+    model=config.SUPERVISOR_LLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
     temperature=0
 )
@@ -148,23 +147,23 @@ browser_vlm = ChatGoogleGenerativeAI(
 
 # Initialize Desktop VLM
 desktop_llm = ChatGoogleGenerativeAI(
-    model="gemini-3.1-flash-lite",
+    model=config.DESKTOP_VLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
     temperature=0
 )
 
 # Initialize VLM (Multimodal)
-vlm = ChatOpenAI(
+vlm = ChatGoogleGenerativeAI(
     model=config.VLM_MODEL,
-    base_url=config.GITHUB_BASE_URL,
-    api_key=config.GITHUB_TOKEN
+    google_api_key=config.GEMINI_API_KEY,
+    temperature=0
 )
 
 # Initialize Extractor LLM (Memory Extraction)
-extractor_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    base_url=config.GITHUB_BASE_URL,
-    api_key=config.GITHUB_TOKEN
+extractor_llm = ChatGoogleGenerativeAI(
+    model="gemini-3.1-flash-lite",
+    google_api_key=config.GEMINI_API_KEY,
+    temperature=0
 )
 
 
