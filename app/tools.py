@@ -233,6 +233,7 @@ def execute_python_code(code: str) -> any:
 
         # 【多模态组装】：有图片时返回 list，与现有拦截器无缝对接
         if res["images"]:
+            from . import outbox
             content = [
                 {
                     "type": "text",
@@ -240,10 +241,12 @@ def execute_python_code(code: str) -> any:
                 }
             ]
             for img_b64 in res["images"]:
-                content.append({
+                img_item = {
                     "type": "image_url",
                     "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
-                })
+                }
+                outbox.push(img_item)
+                content.append(img_item)
             return content
         else:
             # 无图片时返回纯文本，保持简洁

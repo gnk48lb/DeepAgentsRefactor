@@ -23,6 +23,7 @@ if sys.platform == "win32":
 
 from app import deep_agent
 from app import database
+from app import outbox
 import config
 import asyncio
 import traceback
@@ -56,6 +57,7 @@ def _truncate(text: str, limit: int = 800) -> str:
 async def run_agent(query: str, agent, config_dict: dict) -> str:
     """运行 DeepAgent 并在控制台打印彩色流式输出。
     返回最终回复文本（用于记忆提取）。"""
+    outbox.begin()
     messages = deep_agent.build_initial_messages(
         user_query=query,
         user_id="console_user",
@@ -195,6 +197,34 @@ async def run_agent(query: str, agent, config_dict: dict) -> str:
             state = await agent.aget_state(config_dict)
     except Exception as hitl_err:
         print(f"⚠️ \033[93m[HITL 检查异常]\033[0m: {hitl_err}")
+
+    # ---- 发件箱统计与转储 ----
+    try:
+        images = outbox._outbox.get() or []
+        print(f"\n📬 [发件箱统计]: 本轮共捕获 {len(images)} 张图片")
+        if images:
+            import base64
+            debug_dir = os.path.join("storage", "outbox_debug")
+            os.makedirs(debug_dir, exist_ok=True)
+            for idx, img_item in enumerate(images):
+                url = img_item.get("image_url", {}).get("url", "")
+                if url.startswith("data:image/jpeg;base64,"):
+                    b64_str = url[len("data:image/jpeg;base64,"):]
+                elif "base64," in url:
+                    b64_str = url.split("base64,", 1)[1]
+                else:
+                    b64_str = url
+                print(f"  - 图片 #{idx+1} Base64 长度: {len(b64_str)}")
+                try:
+                    img_data = base64.b64decode(b64_str)
+                    save_path = os.path.join(debug_dir, f"outbox_img_{idx+1}.png")
+                    with open(save_path, "wb") as f:
+                        f.write(img_data)
+                    print(f"    已保存至: {save_path}")
+                except Exception as save_err:
+                    print(f"    解码/保存失败: {save_err}")
+    except Exception as outbox_err:
+        print(f"⚠️ [发件箱检查异常]: {outbox_err}")
 
     return final_text
 
