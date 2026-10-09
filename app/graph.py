@@ -442,7 +442,24 @@ class FileAgentState(TypedDict):
     user_query: str
 
 
-def build_file_agent_subgraph(filesystem_tools: list, system_prompt: str, llm=None):
+def _last_ai_with_calls(messages):
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            return i, m
+    return -1, None
+
+
+def _unanswered_tool_calls(messages):
+    """最近一条带 tool_calls 的 AIMessage 里，后面还没有对应 ToolMessage 的调用。"""
+    i, ai = _last_ai_with_calls(messages)
+    if ai is None:
+        return []
+    answered = {m.tool_call_id for m in messages[i + 1:] if isinstance(m, ToolMessage)}
+    return [tc for tc in ai.tool_calls if tc["id"] not in answered]
+
+
+def build_file_agent_subgraph(filesystem_tools: list, system_prompt: str, llm=None, checkpointer=None):
     """
     构建带 Human-in-the-loop 的 FileAgent 子图。
 
@@ -451,9 +468,8 @@ def build_file_agent_subgraph(filesystem_tools: list, system_prompt: str, llm=No
       fa_safe_tools     — 执行安全工具（read/list/search 等），直接执行不拦截
       fa_dangerous_tools— 执行危险工具前调用 interrupt() 等待用户授权
 
-    子图不携带 Checkpointer，由父图（主图）的 MemorySaver 统一管理状态持久化。
-    interrupt() 触发时，父图的 ainvoke() 会自动返回，主图状态被保存。
-    用户回复后通过 Command(resume=value) 恢复执行。
+    子图不携带 Checkpointer（默认），由父图（主图）的 MemorySaver 统一管理状态持久化。
+    也可传入 checkpointer 供单测独立测试。
     """
     if llm is None:
         llm = models.worker_llm
@@ -495,9 +511,8 @@ def build_file_agent_subgraph(filesystem_tools: list, system_prompt: str, llm=No
 
     async def fa_safe_tools_node(state: FileAgentState) -> dict:
         """执行所有安全工具调用，不需要用户确认。"""
-        last_ai: AIMessage = state["messages"][-1]
         tool_messages = []
-        for tc in last_ai.tool_calls:
+        for tc in _unanswered_tool_calls(state["messages"]):
             if tc["name"] in dangerous_names:
                 continue  # 危险工具不在这里执行
             print(f"  🤖 [FileAgent] 正在调用安全工具: \033[94m{tc['name']}\033[0m, 参数: {tc['args']}")
@@ -519,50 +534,45 @@ def build_file_agent_subgraph(filesystem_tools: list, system_prompt: str, llm=No
 
     async def fa_dangerous_tools_node(state: FileAgentState) -> dict:
         """
-        执行危险工具节点（回归单步确认模式）。
+        执行危险工具节点（单步确认模式）。
+        取尚未回复的危险调用里的第一个，interrupt() 作为第一个动作，批准则执行、拒绝则返回现有的 CRITICAL ERROR 文本。
         """
-        last_ai: AIMessage = state["messages"][-1]
-        tool_messages = []
+        pending = [tc for tc in _unanswered_tool_calls(state["messages"]) if tc["name"] in dangerous_names]
+        tc = pending[0]
 
-        for tc in last_ai.tool_calls:
-            if tc["name"] not in dangerous_names:
-                continue
+        print(f"\n🔴 \033[91m[FileAgent HITL]\033[0m: 危险工具 '{tc['name']}' 请求授权...")
 
-            print(f"\n🔴 \033[91m[FileAgent HITL]\033[0m: 危险工具 '{tc['name']}' 请求授权...")
+        # 每次只处理一个危险工具，遇到就暂停
+        decision: str = interrupt({
+            "tool_name": tc["name"],
+            "tool_args": tc["args"],
+            "tool_call_id": tc["id"]
+        })
 
-            # 每次只处理一个危险工具，遇到就暂停
-            decision: str = interrupt({
-                "tool_name": tc["name"],
-                "tool_args": tc["args"],
-                "tool_call_id": tc["id"]
-            })
+        if isinstance(decision, str) and decision.strip().upper() == "Y":
+            tool = tool_map.get(tc["name"])
+            try:
+                result = await tool.ainvoke(tc["args"])
+                result = str(result)
+                print(f"  ✅ [FileAgent HITL] 执行成功")
+            except Exception as e:
+                result = f"工具执行出错: {e}"
+        else:
+            # 注入一个极强语义的错误，防止模型（尤其是 Gemini）产生“再试一次”的幻觉
+            result = (
+                "CRITICAL ERROR: USER PERMISSION DENIED. "
+                f"The user has explicitly forbidden the execution of '{tc['name']}'. "
+                "DO NOT attempt to retry this tool call or any similar calls in this turn. "
+                "If this operation is essential for the remaining task, you MUST stop and report "
+                "to the supervisor that the task was cancelled by the user."
+            )
+            print(f"  ⛔ [FileAgent HITL] 用户已拒绝工具 '{tc['name']}'")
 
-            if isinstance(decision, str) and decision.strip().upper() == "Y":
-                tool = tool_map.get(tc["name"])
-                try:
-                    result = await tool.ainvoke(tc["args"])
-                    result = str(result)
-                    print(f"  ✅ [FileAgent HITL] 执行成功")
-                except Exception as e:
-                    result = f"工具执行出错: {e}"
-            else:
-                # 注入一个极强语义的错误，防止模型（尤其是 Gemini）产生“再试一次”的幻觉
-                result = (
-                    "CRITICAL ERROR: USER PERMISSION DENIED. "
-                    f"The user has explicitly forbidden the execution of '{tc['name']}'. "
-                    "DO NOT attempt to retry this tool call or any similar calls in this turn. "
-                    "If this operation is essential for the remaining task, you MUST stop and report "
-                    "to the supervisor that the task was cancelled by the user."
-                )
-                print(f"  ⛔ [FileAgent HITL] 用户已拒绝工具 '{tc['name']}'")
-
-            tool_messages.append(ToolMessage(
-                content=result,
-                tool_call_id=tc["id"],
-                name=tc["name"],
-            ))
-
-        return {"messages": tool_messages}
+        return {"messages": [ToolMessage(
+            content=result,
+            tool_call_id=tc["id"],
+            name=tc["name"],
+        )]}
 
     async def fa_summarize_node(state: FileAgentState) -> dict:
         """子图收尾节点：将所有工具执行结果汇总为一条战报格式的消息回传主图。"""
@@ -595,19 +605,15 @@ def build_file_agent_subgraph(filesystem_tools: list, system_prompt: str, llm=No
 
     # ── 路由函数 ──────────────────────────────────────────────────────────────
 
-    def _route_after_llm(state: FileAgentState) -> str:
-        """根据 LLM 输出的 tool_calls 决定下一步节点。"""
-        last_ai: AIMessage = state["messages"][-1]
-        if not getattr(last_ai, "tool_calls", None):
-            return "fa_summarize"  # 无工具调用，走总结节点收尾
-        # 有危险工具调用则先走危险节点，有安全工具则走安全节点
-        for tc in last_ai.tool_calls:
-            if tc["name"] in dangerous_names:
-                return "fa_dangerous_tools"
-        return "fa_safe_tools"
-
-    def _route_after_tools(state: FileAgentState) -> str:
-        """工具执行完毕后，总是回到 LLM 决策节点继续。"""
+    def _next_step(state: FileAgentState) -> str:
+        msgs = state["messages"]
+        if isinstance(msgs[-1], AIMessage) and not msgs[-1].tool_calls:
+            return "fa_summarize"
+        pending = _unanswered_tool_calls(msgs)
+        if any(tc["name"] not in dangerous_names for tc in pending):
+            return "fa_safe_tools"
+        if any(tc["name"] in dangerous_names for tc in pending):
+            return "fa_dangerous_tools"
         return "fa_llm"
 
     # ── 子图组装 ──────────────────────────────────────────────────────────────
@@ -619,45 +625,13 @@ def build_file_agent_subgraph(filesystem_tools: list, system_prompt: str, llm=No
     subgraph.add_node("fa_summarize", fa_summarize_node)
 
     subgraph.add_edge(START, "fa_llm")
-    subgraph.add_conditional_edges("fa_llm", _route_after_llm)
-    subgraph.add_conditional_edges("fa_safe_tools", _route_after_tools)
-    subgraph.add_conditional_edges("fa_dangerous_tools", _route_after_tools)
+    subgraph.add_conditional_edges("fa_llm", _next_step)
+    subgraph.add_conditional_edges("fa_safe_tools", _next_step)
+    subgraph.add_conditional_edges("fa_dangerous_tools", _next_step)
     subgraph.add_edge("fa_summarize", END)
 
-    # 编译时不指定 checkpointer，由父图（主图）的 MemorySaver 统一负责状态持久化
-    return subgraph.compile()
-
-    def _route_after_llm(state: FileAgentState) -> str:
-        """根据 LLM 输出的 tool_calls 决定下一步节点。"""
-        last_ai: AIMessage = state["messages"][-1]
-        if not getattr(last_ai, "tool_calls", None):
-            return "fa_summarize"  # 无工具调用，走总结节点收尾
-        # 有危险工具调用则先走危险节点，有安全工具则走安全节点
-        for tc in last_ai.tool_calls:
-            if tc["name"] in dangerous_names:
-                return "fa_dangerous_tools"
-        return "fa_safe_tools"
-
-    def _route_after_tools(state: FileAgentState) -> str:
-        """工具执行完毕后，总是回到 LLM 决策节点继续。"""
-        return "fa_llm"
-
-    # ── 子图组装 ──────────────────────────────────────────────────────────────
-
-    subgraph = StateGraph(FileAgentState)
-    subgraph.add_node("fa_llm", fa_llm_node)
-    subgraph.add_node("fa_safe_tools", fa_safe_tools_node)
-    subgraph.add_node("fa_dangerous_tools", fa_dangerous_tools_node)
-    subgraph.add_node("fa_summarize", fa_summarize_node)
-
-    subgraph.add_edge(START, "fa_llm")
-    subgraph.add_conditional_edges("fa_llm", _route_after_llm)
-    subgraph.add_conditional_edges("fa_safe_tools", _route_after_tools)
-    subgraph.add_conditional_edges("fa_dangerous_tools", _route_after_tools)
-    subgraph.add_edge("fa_summarize", END)
-
-    # 编译时不指定 checkpointer，由父图（主图）的 MemorySaver 统一负责状态持久化
-    return subgraph.compile()
+    # 编译时支持 checkpointer 参数
+    return subgraph.compile(checkpointer=checkpointer)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DesktopAgent Subgraph —— 带动态风险拦截的桌面操作 Agent
@@ -669,7 +643,7 @@ class DesktopAgentState(TypedDict):
     instruction_to_worker: str
     user_query: str
 
-def build_desktop_agent_subgraph(desktop_tools: list, system_prompt: str, llm=None):
+def build_desktop_agent_subgraph(desktop_tools: list, system_prompt: str, llm=None, checkpointer=None):
     if llm is None:
         llm = models.desktop_llm
 
@@ -725,57 +699,34 @@ def build_desktop_agent_subgraph(desktop_tools: list, system_prompt: str, llm=No
         return {"messages": [response]}
 
     async def da_tools_node(state: DesktopAgentState) -> dict:
-        last_ai: AIMessage = state["messages"][-1]
-        tool_messages = []
-        for tc in last_ai.tool_calls:
-            tool_name = tc["name"]
-            args = tc.get("args", {})
-            
-            is_high_risk = False
-            warning_msg = ""
-            if tool_name == "press_hotkey":
-                keys = args.get("keys", "").lower()
-                high_risk_keys = ["enter", "return", "delete", "alt", "win", "ctrl"]
-                if any(k in keys for k in high_risk_keys):
-                    is_high_risk = True
-                    warning_msg = f"检测到高危按键组合：'{keys}'"
-                    
-            if is_high_risk:
-                print(f"\n🔴 \033[91m[DesktopAgent HITL]\033[0m: 危险工具 '{tool_name}' 请求授权...")
-                # 使用 interrupt 函数进行安全拦截，并传入友好的提示信息给前端
-                decision: str = interrupt(
-                    f"🛡️ 安全系统拦截：DesktopAgent 尝试高危操作。\n"
-                    f"原因：{warning_msg}\n"
-                    f"工具：{tool_name}\n"
-                    f"参数：{args}\n"
-                    f"请回复 Y 授权继续，或回复 N 阻断该操作。"
-                )
+        pending = _unanswered_tool_calls(state["messages"])
+        tc = pending[0]
+        tool_name = tc["name"]
+        args = tc.get("args", {})
+        
+        is_high_risk = False
+        warning_msg = ""
+        if tool_name == "press_hotkey":
+            keys = args.get("keys", "").lower()
+            high_risk_keys = ["enter", "return", "delete", "alt", "win", "ctrl"]
+            if any(k in keys for k in high_risk_keys):
+                is_high_risk = True
+                warning_msg = f"检测到高危按键组合：'{keys}'"
                 
-                if isinstance(decision, str) and decision.strip().upper() == "Y":
-                    print(f"  ✅ [DesktopAgent HITL] 用户已授权执行高危按键：{keys}")
-                    # 执行高危工具
-                    tool = tool_map.get(tool_name)
-                    if tool is None:
-                        result = f"工具 '{tool_name}' 未找到。"
-                    else:
-                        try:
-                            result = await tool.ainvoke(args)
-                            result = str(result)
-                        except Exception as e:
-                            result = f"工具执行出错: {e}"
-                else:
-                    print(f"  🚫 [DesktopAgent HITL] 用户拒绝了高危按键：{keys}")
-                    # 注入安全拦截的错误结果，通知 AI 调整计划
-                    result = (
-                        "CRITICAL ERROR: USER PERMISSION DENIED. "
-                        "The user actively rejected this operation. "
-                        "DO NOT try to execute this tool or target again. "
-                        "Please reply to the user and explain that the operation was denied, "
-                        "or try another completely different, non-dangerous way."
-                    )
-            else:
-                # 正常非高危操作
-                print(f"  🤖 [DesktopAgent] 正在执行操作: \033[94m{tool_name}\033[0m, 参数: {args}")
+        if is_high_risk:
+            print(f"\n🔴 \033[91m[DesktopAgent HITL]\033[0m: 危险工具 '{tool_name}' 请求授权...")
+            # 使用 interrupt 函数进行安全拦截，并传入友好的提示信息给前端
+            decision: str = interrupt(
+                f"🛡️ 安全系统拦截：DesktopAgent 尝试高危操作。\n"
+                f"原因：{warning_msg}\n"
+                f"工具：{tool_name}\n"
+                f"参数：{args}\n"
+                f"请回复 Y 授权继续，或回复 N 阻断该操作。"
+            )
+            
+            if isinstance(decision, str) and decision.strip().upper() == "Y":
+                print(f"  ✅ [DesktopAgent HITL] 用户已授权执行高危按键：{keys}")
+                # 执行高危工具
                 tool = tool_map.get(tool_name)
                 if tool is None:
                     result = f"工具 '{tool_name}' 未找到。"
@@ -785,13 +736,34 @@ def build_desktop_agent_subgraph(desktop_tools: list, system_prompt: str, llm=No
                         result = str(result)
                     except Exception as e:
                         result = f"工具执行出错: {e}"
-                        
-            tool_messages.append(ToolMessage(
-                content=result,
-                tool_call_id=tc["id"],
-                name=tool_name,
-            ))
-        return {"messages": tool_messages}
+            else:
+                print(f"  🚫 [DesktopAgent HITL] 用户拒绝了高危按键：{keys}")
+                # 注入安全拦截的错误结果，通知 AI 调整计划
+                result = (
+                    "CRITICAL ERROR: USER PERMISSION DENIED. "
+                    "The user actively rejected this operation. "
+                    "DO NOT try to execute this tool or target again. "
+                    "Please reply to the user and explain that the operation was denied, "
+                    "or try another completely different, non-dangerous way."
+                )
+        else:
+            # 正常非高危操作
+            print(f"  🤖 [DesktopAgent] 正在执行操作: \033[94m{tool_name}\033[0m, 参数: {args}")
+            tool = tool_map.get(tool_name)
+            if tool is None:
+                result = f"工具 '{tool_name}' 未找到。"
+            else:
+                try:
+                    result = await tool.ainvoke(args)
+                    result = str(result)
+                except Exception as e:
+                    result = f"工具执行出错: {e}"
+                    
+        return {"messages": [ToolMessage(
+            content=result,
+            tool_call_id=tc["id"],
+            name=tool_name,
+        )]}
 
     async def da_summarize_node(state: DesktopAgentState) -> dict:
         msgs = state["messages"]
@@ -822,6 +794,9 @@ def build_desktop_agent_subgraph(desktop_tools: list, system_prompt: str, llm=No
             return "da_summarize"
         return "da_tools"
 
+    def _after_tools(state: DesktopAgentState) -> str:
+        return "da_tools" if _unanswered_tool_calls(state["messages"]) else "da_llm"
+
     subgraph = StateGraph(DesktopAgentState)
     subgraph.add_node("da_llm", da_llm_node)
     subgraph.add_node("da_tools", da_tools_node)
@@ -829,10 +804,10 @@ def build_desktop_agent_subgraph(desktop_tools: list, system_prompt: str, llm=No
 
     subgraph.add_edge(START, "da_llm")
     subgraph.add_conditional_edges("da_llm", _route_after_llm)
-    subgraph.add_edge("da_tools", "da_llm")
+    subgraph.add_conditional_edges("da_tools", _after_tools)
     subgraph.add_edge("da_summarize", END)
 
-    return subgraph.compile()
+    return subgraph.compile(checkpointer=checkpointer)
 
 WORKER_BASE_PROMPT = (
     "你是一个底层领域专家。你的汇报对象是主管（Supervisor）。你的任务是严格执行主管交代的明确指令。\n"
@@ -923,25 +898,6 @@ def build_graph():
     )
 
     # ── FileAgent：带 HITL 拦截的子图 ───────────────────────────────────────
-    FILE_AGENT_PROMPT = (
-        WORKER_BASE_PROMPT
-        + "你是 FileAgent，负责操作本地文件系统（Filesystem MCP）。\n"
-        + "你可以读取文件内容、查看目录结构、搜索文件、写入/编辑文件、移动文件等。\n"
-        + "【安全红线 - 严重警告】\n"
-        + f"  · 所有操作必须限定在项目工作区内：{config.WORKSPACE_DIR}\n"
-        + "  · 绝对禁止传入含 '../' 的路径或系统绝对路径（如 /etc, /home 等）。\n"
-        + "  · 如果你在执行危险操作时触发了 HITL 授权，且用户返回了 'DENIED' 或拒绝信息，"
-        + "    你必须立即停止对该工具的尝试。严禁循环请求同一个工具！\n"
-        + "    在这种情况下，你应该礼貌地向主管报告该步骤已被用户取消，并根据情况继续其他安全步骤或直接结束任务。\n"
-        + "【效率原则】\n"
-        + "  · 优先使用 directory_tree 或 list_directory 获取目录全貌，再按需读取具体文件。\n"
-        + "  · 读取大文件时，优先使用 search_files 或 get_file_info 确认内容再决定是否 read_file。\n"
-        + "【路径适配规范】\n"
-        + "  · 如果主管提供的路径包含反斜杠（如 data\\files），你必须将其转换为正斜杠（data/files）后再传给工具。\n"
-        + "【关于删除操作的特殊说明】\n"
-        + "  · 当前工具集不直接提供 delete_file 工具。如果主管要求你“删除”文件，"
-        + "    你必须使用 move_file 工具将目标文件移动到项目根目录下的 'archive_trash' 文件夹中（如果该文件夹不存在，请先用 create_directory 创建它）。"
-    )
     file_agent_subgraph = build_file_agent_subgraph(
         filesystem_tools=filesystem_tools,
         system_prompt=FILE_AGENT_PROMPT,
@@ -970,23 +926,6 @@ def build_graph():
         return {"messages": [final_report_msg]}
 
     # ── DesktopAgent：带动态拦截的桌面操作专家 ───────────────────────────────
-    DESKTOP_AGENT_PROMPT = (
-        WORKER_BASE_PROMPT
-        + "你是 DesktopAgent，负责通过纯视觉和模拟键鼠操作 Windows 桌面。\n"
-        + "【⚠️ 桌面操作核心防坑准则】\n"
-        + "1. **切回桌面**：如果第一步 take_grid_screenshot 发现屏幕被应用窗口（如 VS Code、浏览器）占满，而你的目标在桌面上，**你必须首先**调用 `press_hotkey(keys='win+d')` 来显示桌面！切换后**必须再次调用 `take_grid_screenshot`** 观察新的桌面网格！\n"
-        + "2. **精细坐标校准（防偏左偏右）**：\n"
-        + "   - 网格横向为 A-Z（26列），纵向为 1-16（16行）。A在最左，Z在最右。\n"
-        + "   - 如果目标在“最右上角”（例如右上角的文件夹），它通常位于 Z1、Y1、Z2、Y2 等最右侧的格子里。W1、P1 明显偏左，请仔细核对 Z, Y, X, W, V 的顺序，避免数错列！\n"
-        + "   - 每次决定点击前，在脑海中从最右侧（Z列）向左倒数，核实目标到底在第几列。\n"
-        + "【操作流程】\n"
-        + "1. 使用 take_grid_screenshot 获取带网格的屏幕截图。\n"
-        + "2. 观察截图，若未在桌面则调用 `press_hotkey(keys='win+d')` 切回桌面并重新截图。\n"
-        + "3. 仔细对照网格字母和数字，确定目标所在的网格（如 Z1），调用 click_grid_center(grid_id='Z1', click_type='double') 双击打开文件夹。\n"
-        + "4. 需要输入中文时，优先使用 safe_input_text，避免拼音输入法干扰。\n"
-        + "5. 需要按快捷键时，使用 press_hotkey（如 ctrl+a）。\n"
-        + "【重要安全限制】：部分高危按键操作会触发用户授权拦截，请勿滥用。"
-    )
     desktop_agent_subgraph = build_desktop_agent_subgraph(
         desktop_tools=desktop_tools,
         system_prompt=DESKTOP_AGENT_PROMPT,

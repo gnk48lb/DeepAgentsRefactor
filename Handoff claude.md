@@ -1,24 +1,19 @@
 # 交接文档：Deep Agents 重构项目（给新的 Claude 对话）
 
-> 更新于 2026-10-01。新对话没有前文记忆，本文是唯一的上下文来源。
-> 与仓库里的 `deepagents-refactor-plan*.md`、`walkthrough*.md` 冲突时，以本文和用户上传的**实际代码**为准（那些是历史记录，部分已过时）。
-
+> 更新于 2026-10-01。
 ---
 
 ## 0. 你的角色与工作方式
 
-- 你是架构顾问兼 code reviewer。用户用 **Antigravity**（Google 的 AI 编程助手，能读写仓库、跑命令）执行改动；你负责规划、写给 Antigravity 的提示词、审核它的回报。
-- 你**看不到仓库**，只能看到用户上传或粘贴的内容。开始前让用户上传第 9 节的文件；审核时让用户贴 Antigravity 的**原始输出**，不要只看它的总结。
-- 用户偏好：中文；先商量再动手；提示词要能整段复制；风险可接受（独立副本目录 + git，大不了推倒重来）；全部重构完成后由用户自己做最终测试，**包括 DesktopAgent，不要让 Antigravity 测 DesktopAgent**。
-- 用户有时会把"另一个对话"的 review 贴来让你核对。请独立验证其中具体的事实性说法（日期、API 名、issue 编号）。此前出现过把相邻文章的日期读串的错误，结论没变，说法却是错的。
+- 你是架构顾问兼 code reviewer。用户用 **Antigravity**（Google 的 AI Agent，能读写仓库、跑命令）执行改动；你负责规划、写给 Antigravity 的提示词、审核它的回报。
+- 用户偏好：先商量再动手；提示词要能整段复制；风险可接受（独立副本目录 + git，大不了推倒重来）；全部重构完成后由用户自己做最终测试，**包括 DesktopAgent，不要让 Antigravity 测 DesktopAgent**。
 - 前任的失误也要认：`MAIN_AGENT_PROMPT` 里"图文分离"一段声称主 Agent 能在上下文里看到专家汇报中的图片，没有核实 `task` 的返回方式，已证实是错的（见 7.1）。
 
 ## 1. 项目与目标
 
 - **项目**：GNK48-Agent，QQ 机器人（NoneBot）多智能体系统，Windows 本机运行。依赖 Milvus Lite（知识库/记忆）、Neo4j（媒体图谱）、MySQL、Docker（代码沙箱）、MCP（高德/文件系统/桌面）。
 - **目标**：把原来手写的 LangGraph Supervisor+Router+8 个 Worker，迁移到 **deepagents 0.7.13**（LangChain 的 agent harness：主 Agent 的 ReAct 循环 + 内置 `task` 工具委派 subagent）。
-- 在独立副本目录 `DeepAgentsRefactor` 中进行，git 分支 `deepagents-phase1`（以 `git branch` 为准）。uv 管理依赖：deepagents 0.7.13、langchain 1.4.0、langchain-core 1.6.2、langchain-google-genai 4.3.7。
-- 新旧并存：旧入口 `main.py` + `app/graph.py` 仍可运行。**`app/deep_agent.py` 仍 import `app/graph.py`**（`build_file_agent_subgraph`、`build_desktop_agent_subgraph`、两个 `*_AGENT_PROMPT`），所以 graph.py 现在不能删。
+- 在独立副本目录 `DeepAgentsRefactor` 中进行。uv 管理依赖：deepagents 0.7.13、langchain 1.4.0、langchain-core 1.6.2、langchain-google-genai 4.3.7。
 
 ## 2. 当前架构（已实现）
 
@@ -34,7 +29,7 @@
 - `build_initial_messages()`：应用层调 `database.search_memory(top_k=1)`，命中则作为 SystemMessage 前置。`_background_extract_memory()`：后台提取长期记忆。
 
 **其他新增/改动**
-- `app/outbox.py`（新，**未提交**）：基于 contextvar 的图片发件箱。`execute_python_code` 产出沙箱图片时 `push`；入口每条消息在 `astream` 前 `begin()`。原因：`task` 只回传文本，图片无法经消息链路到达接入层。
+- `app/outbox.py`：基于 contextvar 的图片发件箱。`execute_python_code` 产出沙箱图片时 `push`；入口每条消息在 `astream` 前 `begin()`。原因：`task` 只回传文本，图片无法经消息链路到达接入层。
 - `app/utils.py::extract_text`：Gemini 3.x 返回的 `content` 是 list（含 `extras.signature` 的 text 块），统一用它取文本；`deep_agent.py`、`main_deepagents.py`、`loader.py` 已改用。
 - `config.py` / `app/models.py`：所有 LLM 均为 Gemini（GitHub Models 已退役，域名 NXDOMAIN）。`worker_llm`/`supervisor_llm`/`desktop_llm` 读 config，改前改后取值一致。
 - `mcp_servers.json`、`app/mcp_service.py`：未改（amap / filesystem / desktop）。
@@ -125,35 +120,7 @@ general-purpose 的硬覆盖不依赖它。以后凡是依赖 profile 的改动�
 
 **7.9 `graph.py` 暂时不能退役**，见第 1 节。
 
-## 8. 给 Antigravity 写提示词的协议
-
-**此前出现过的回报失真（都有证据）**
-1. Part 1 自报"全部顺利完成"，复查发现 5 处问题：天气路由给了 KnowledgeAgent、记忆检索调用了不存在的函数、`MAIN_AGENT_PROMPT` 与规格不符、两处 model 写错。
-2. 验证 general-purpose 是否被关掉，用的是"问模型介绍你的团队"，这证明不了任何事。
-3. 要求"原样输出"，实际重新打字（战报"夜间多云"，最终回答"夜间多复"）。
-4. 要求"贴最终回答原文"，用省略号和括号概括带过。
-5. 验收要求"知识型问题"，实际跑了"1+1"。
-6. 一轮 4 项任务只汇报了 2 项，另外 2 项整个没提。
-7. 调查结论与源码不符：说 `execute_python_code` 只返回文字路径，实际代码有图片时返回含 `image_url` 的 list。
-
-**写提示词时**
-- 每条 ≤4 项，编号；每项写明"可检查的交付物"。
-- 要求先贴 `git status --short`，结束时贴 `git status --short`、`git diff --stat`、`git log --oneline -3`——漏项一眼可见。
-- 要求逐条对应编号汇报，标 ✅/❌/⏸，不得省略。
-- 要求原样粘贴终端输出，同时保存到 `scratch/logs/`，用户可以核对文件。
-- 写明"不要做"的清单；环境问题（Docker、网络）一律"停下来报告"；需要决策的事不要交给它。
-
-**审核回报时检查**
-条目数是否等于提示词条目数；有没有省略号/括号概括；战报与最终回答的文字是否一致（笔误往往暴露重新打字）；测试用例是否按规格；结论是否有对应证据；要求贴源码的是否贴了。
-
-## 9. 新对话开始前，请用户上传
-
-必传：`handoff-claude.md`（本文）、`app/deep_agent.py`、`main_deepagents.py`、`app/tools.py`、`app/outbox.py`、`config.py`、`app/models.py`、`pyproject.toml`
-做 `plugins/chat.py` 迁移时再传：`plugins/chat.py`、`bot.py`
-按需：`app/graph.py`（很大，只在涉及 FileAgent/DesktopAgent 子图时需要）、`app/database.py`、`app/sandbox.py`
-建议你的第一句回复：用自己的话复述当前状态和下一步，确认理解一致，**先不要写提示词**。
-
-## 10. 技术备忘
+## 8. 技术备忘
 
 **deepagents 0.7.13**
 - `create_deep_agent(model, system_prompt, subagents, middleware, checkpointer)`；`model=` 接受 `BaseChatModel` 实例。
