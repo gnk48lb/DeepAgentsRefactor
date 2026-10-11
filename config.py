@@ -51,19 +51,19 @@ EMBEDDING_MODEL = "BAAI/bge-m3"
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 
 # 文字模型 LLM (Worker)
-WORKER_LLM_MODEL = "gemini-3.1-flash-lite-preview"
+WORKER_LLM_MODEL = "gemini-3.5-flash-lite"
 
 # 文字模型 LLM (Supervisor)
-SUPERVISOR_LLM_MODEL = "gemini-3.1-flash-lite"
+SUPERVISOR_LLM_MODEL = "gemini-3.5-flash-lite"
 
 # 多模态模型 VLM
-VLM_MODEL = "gemini-3.1-flash-lite"
+VLM_MODEL = "gemini-3.5-flash-lite"
 
 # 浏览器多模态模型 (BrowserAgent)
-BROWSER_VLM_MODEL = "gemini-3.1-flash-lite"
+BROWSER_VLM_MODEL = "gemini-3.5-flash-lite"
 
 # 桌面多模态模型 (DesktopAgent)
-DESKTOP_VLM_MODEL = "gemini-3.1-flash-lite"
+DESKTOP_VLM_MODEL = "gemini-3.5-flash-lite"
 
 # SiliconFlow 相关配置 (暂时注释)
 SILICON_FLOW_BASE_URL = "https://api.siliconflow.cn/v1"
@@ -87,3 +87,7 @@ DOCKER_MAX_MEM = "256m"
 REFRESH_COLLECTION = False # 本次需设为 True 以重建 Schema
 CLEAR_MEMORY_ON_STARTUP = False # 是否在启动时清空长期记忆集合
 REFRESH_BM25 = False # 手动触发 BM25 模型的重新拟合与旧数据稀疏向量的局部更新
+
+# 权限配置：主人 QQ 号列表（英文逗号分隔）
+OWNER_QQ_IDS = {x.strip() for x in os.getenv("OWNER_QQ_IDS", "").split(",") if x.strip()}
+

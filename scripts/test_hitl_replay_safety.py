@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import sys
 from pathlib import Path
 from collections import Counter
@@ -229,6 +229,89 @@ async def test_da_1():
     print("  -> DA-1 PASS")
 
 
+async def test_fa_5():
+    print("=" * 60)
+    print("Running FA-5: path 包含 workspace/ 前缀规范化断言")
+    received_path = []
+    counts = Counter()
+    def fake_write_file(path: str = "", **kwargs) -> str:
+        received_path.append(path)
+        counts["write_file"] += 1
+        return "write_file ok"
+
+    tool = StructuredTool.from_function(
+        func=fake_write_file,
+        name="write_file",
+        description="write_file",
+        args_schema={"type": "object", "properties": {"path": {"type": "string"}}}
+    )
+    calls = [
+        {"name": "write_file", "args": {"path": "workspace/a.txt"}, "id": "c1"},
+    ]
+    llm = ScriptedLLM([AIMessage(content="", tool_calls=calls)])
+    subgraph = graph.build_file_agent_subgraph([tool], "prompt", llm=llm, checkpointer=MemorySaver())
+    cfg = {"configurable": {"thread_id": "fa-5"}}
+
+    # 执行并截获 interrupt payload
+    await subgraph.ainvoke(
+        {"messages": [HumanMessage(content="go")], "current_tool_call_id": "call_root", "instruction_to_worker": "go", "user_query": "go"},
+        cfg
+    )
+    state = await subgraph.aget_state(cfg)
+    interrupts = []
+    for t in state.tasks:
+        if hasattr(t, "interrupts") and t.interrupts:
+            interrupts.extend(t.interrupts)
+    assert len(interrupts) > 0, "应触发中断"
+    payload = interrupts[0].value if hasattr(interrupts[0], "value") else interrupts[0]
+    payload_path = payload.get("tool_args", {}).get("path")
+    print(f"  interrupt payload path: '{payload_path}'")
+    assert payload_path == "a.txt", f"interrupt payload path 应为 'a.txt'，实际为 '{payload_path}'"
+
+    # 批准执行
+    await subgraph.ainvoke(Command(resume="Y"), cfg)
+    print(f"  工具实际接收到的 path: {received_path}")
+    assert received_path == ["a.txt"], f"工具实际接收 path 应为 ['a.txt']，实际为 {received_path}"
+    print("  -> FA-5 PASS")
+
+
+async def test_fa_6():
+    print("=" * 60)
+    print("Running FA-6: 假工具抛异常或报错，断言打印 ❌ 而不是 ✅")
+    def fake_error_tool(path: str = "", **kwargs) -> str:
+        raise RuntimeError("Simulated filesystem permission error")
+
+    tool = StructuredTool.from_function(
+        func=fake_error_tool,
+        name="write_file",
+        description="write_file",
+        args_schema={"type": "object", "properties": {"path": {"type": "string"}}}
+    )
+    calls = [
+        {"name": "write_file", "args": {"path": "a.txt"}, "id": "c1"},
+    ]
+    llm = ScriptedLLM([AIMessage(content="", tool_calls=calls)])
+    subgraph = graph.build_file_agent_subgraph([tool], "prompt", llm=llm, checkpointer=MemorySaver())
+    cfg = {"configurable": {"thread_id": "fa-6"}}
+
+    # 运行到中断
+    await subgraph.ainvoke(
+        {"messages": [HumanMessage(content="go")], "current_tool_call_id": "call_root", "instruction_to_worker": "go", "user_query": "go"},
+        cfg
+    )
+
+    # 捕获恢复执行时的 stdout
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        await subgraph.ainvoke(Command(resume="Y"), cfg)
+    output = buf.getvalue()
+    print(f"  捕获到的输出片段:\n{output.strip()}")
+    assert "❌" in output, "执行失败应打印 ❌"
+    assert "✅" not in output, "执行失败绝不应打印 ✅"
+    print("  -> FA-6 PASS")
+
+
 async def main():
     print("############################################################")
     print("Starting HITL Replay Safety Unit Tests")
@@ -237,6 +320,8 @@ async def main():
     await test_fa_2()
     await test_fa_3()
     await test_fa_4()
+    await test_fa_5()
+    await test_fa_6()
     await test_da_1()
     print("############################################################")
     print("ALL UNIT TESTS PASSED!")
@@ -245,3 +330,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

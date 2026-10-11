@@ -459,6 +459,25 @@ def _unanswered_tool_calls(messages):
     return [tc for tc in ai.tool_calls if tc["id"] not in answered]
 
 
+def _normalize_fs_args(args: dict) -> dict:
+    """对 path、source、destination、directory 字段及 paths 列表，去掉开头的 workspace/ 或 workspace\\"""
+    import re
+    if not isinstance(args, dict):
+        return args
+    new_args = dict(args)
+    def _strip_ws(val: str) -> str:
+        return re.sub(r"^workspace[/\\]", "", val, flags=re.IGNORECASE)
+
+    for key in ("path", "source", "destination", "directory"):
+        if key in new_args and isinstance(new_args[key], str):
+            new_args[key] = _strip_ws(new_args[key])
+
+    if "paths" in new_args and isinstance(new_args["paths"], list):
+        new_args["paths"] = [_strip_ws(p) if isinstance(p, str) else p for p in new_args["paths"]]
+
+    return new_args
+
+
 def build_file_agent_subgraph(filesystem_tools: list, system_prompt: str, llm=None, checkpointer=None):
     """
     构建带 Human-in-the-loop 的 FileAgent 子图。
@@ -515,13 +534,14 @@ def build_file_agent_subgraph(filesystem_tools: list, system_prompt: str, llm=No
         for tc in _unanswered_tool_calls(state["messages"]):
             if tc["name"] in dangerous_names:
                 continue  # 危险工具不在这里执行
-            print(f"  🤖 [FileAgent] 正在调用安全工具: \033[94m{tc['name']}\033[0m, 参数: {tc['args']}")
+            norm_args = _normalize_fs_args(tc.get("args") or {})
+            print(f"  🤖 [FileAgent] 正在调用安全工具: \033[94m{tc['name']}\033[0m, 参数: {norm_args}")
             tool = tool_map.get(tc["name"])
             if tool is None:
                 result = f"工具 '{tc['name']}' 未找到。"
             else:
                 try:
-                    result = await tool.ainvoke(tc["args"])
+                    result = await tool.ainvoke(norm_args)
                     result = str(result)
                 except Exception as e:
                     result = f"工具执行出错: {e}"
@@ -539,24 +559,29 @@ def build_file_agent_subgraph(filesystem_tools: list, system_prompt: str, llm=No
         """
         pending = [tc for tc in _unanswered_tool_calls(state["messages"]) if tc["name"] in dangerous_names]
         tc = pending[0]
+        norm_args = _normalize_fs_args(tc.get("args") or {})
 
         print(f"\n🔴 \033[91m[FileAgent HITL]\033[0m: 危险工具 '{tc['name']}' 请求授权...")
 
         # 每次只处理一个危险工具，遇到就暂停
         decision: str = interrupt({
             "tool_name": tc["name"],
-            "tool_args": tc["args"],
+            "tool_args": norm_args,
             "tool_call_id": tc["id"]
         })
 
         if isinstance(decision, str) and decision.strip().upper() == "Y":
             tool = tool_map.get(tc["name"])
             try:
-                result = await tool.ainvoke(tc["args"])
+                result = await tool.ainvoke(norm_args)
                 result = str(result)
-                print(f"  ✅ [FileAgent HITL] 执行成功")
+                if (result.startswith("工具 '") and "执行出错" in result) or result.startswith("工具执行出错"):
+                    print(f"  ❌ [FileAgent HITL] 执行失败: {result[:200]}")
+                else:
+                    print(f"  ✅ [FileAgent HITL] 执行成功")
             except Exception as e:
                 result = f"工具执行出错: {e}"
+                print(f"  ❌ [FileAgent HITL] 执行失败: {result[:200]}")
         else:
             # 注入一个极强语义的错误，防止模型（尤其是 Gemini）产生“再试一次”的幻觉
             result = (
@@ -824,6 +849,7 @@ FILE_AGENT_PROMPT = (
     + "【安全红线 - 严重警告】\n"
     + f"  · 所有操作必须限定在项目工作区内：{config.WORKSPACE_DIR}\n"
     + "  · 绝对禁止传入含 '../' 的路径或系统绝对路径（如 /etc, /home 等）。\n"
+    + "  · 文件路径一律相对于工作区根目录。用户或主管写的 \"workspace/xxx\" 指的就是工作区里的 \"xxx\"，传给工具时必须去掉 \"workspace/\" 前缀。\n"
     + "  · 如果你在执行危险操作时触发了 HITL 授权，且用户返回了 'DENIED' 或拒绝信息，"
     + "    你必须立即停止对该工具的尝试。严禁循环请求同一个工具！\n"
     + "    在这种情况下，你应该礼貌地向主管报告该步骤已被用户取消，并根据情况继续其他安全步骤或直接结束任务。\n"

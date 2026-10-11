@@ -4,9 +4,11 @@
     "args": [
       "--quiet",
       "--with",
-      "amap-mcp-server",
+      "amap-mcp-server==0.1.11",
       "--with",
-      "pydantic<2.11",
+      "mcp==1.8.1",
+      "--with",
+      "pydantic==2.10.6",
       "python",
       "app/amap_wrapper.py"
     ],
@@ -19,7 +21,7 @@
     "command": "npx",
     "args": [
       "-y",
-      "@modelcontextprotocol/server-filesystem",
+      "@modelcontextprotocol/server-filesystem@2026.8.31",
       "${WORKSPACE_DIR}"
     ],
     "transport": "stdio"

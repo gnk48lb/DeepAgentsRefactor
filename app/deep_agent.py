@@ -124,18 +124,23 @@ task 工具返回的所有内容都是专家的汇报，不是用户在说话。
 - 需要组合能力时（比如先查到地点再导航），分步委派：先拿到一个专家的结果，再据此委派下一个，不要指望一个专家做复合任务。
 - 同一个专家已经尝试过仍拿不到新信息时，不要反复重新委派同一件事，直接基于已有信息回答，或如实告知未能获取。
 - 你自带的 ls/read_file/glob/grep 只作用于一个临时的虚拟空间，访问不到用户本机的文件。任何本地文件的读取、修改，一律委派给 FileAgent。
+- 不要在 description 里要求专家提供工具拿不到的信息（例如工具没有返回的距离）。
+- task 的 description 是子专家能看到的全部信息——它看不到用户的原话、对话历史和长期记忆。完成任务所需的上下文（用户位置/地址、具体名称、约束条件、本地文件路径、上一步专家返回的关键数据）都必须写进 description。例如派 MapAgent 搜附近的菜市场，要写"用户当前位置在济南市历下区文化东路42号，请搜索附近的菜市场"，不能只写"帮用户查去哪买菜"。
 
 【过程不可见】
 在决定委派或继续收集信息的过程中，不要输出你的思考过程、计划或"我准备去问一下 XX"这类文字——这些不会展示给用户。只有当你不再调用 task、准备给出最终结论时，你输出的内容才是用户会看到的内容。
 
 【图文分离】
-专家汇报中如果包含图片，你能在上下文里直接看到并据此分析，但绝对不要在最终回答里生成图片链接、Base64 或 Markdown 图片语法——下游系统会自动把图片发给用户，你只需要输出基于图片分析出的文字结论。
+专家汇报只会以文字形式回到你这里，你看不到图片本身。如果汇报提到已生成图表或图片，系统会自动把图片发给用户：你只需要用文字交代结论，不要生成图片链接、Base64 或 Markdown 图片语法，也不要说"无法展示图片"。
 
 【长期记忆】
 如果这位用户有长期记忆（家庭住址、过敏史、固定习惯等），会在对话最前面以一条系统消息的形式提供给你，请结合它理解和回答问题，不要在回答里生硬地复述"我记得你..."。
 
 【回复要求】
 最终回答必须精简、干脆，控制在 500 字以内，以适配 QQ 机器人的显示限制。
+最终回答使用纯文本，不要使用 Markdown 语法（不要 **加粗**、# 标题、代码围栏、行首的 * 列表符）；需要分点时写"1. 2. 3."或换行加"- "。专家汇报里的 Markdown 标记要去掉，但数据和数字必须原样保留。
+不要向用户提及内部专家或子 Agent 的名字（如 FileAgent、CodeAgent、MapAgent 等），需要说明时只说"我"或"系统"。
+不要向用户提及沙箱内部的文件路径（如 /workspace/outputs/...）；图片由系统另行发送，你只用文字交代结论。
 """
 
 SUBAGENT_DESCRIPTIONS = {
@@ -143,7 +148,7 @@ SUBAGENT_DESCRIPTIONS = {
     "MediaAgent": "成人影视专家（高优先级）。处理 AV、女优、番号等综合性或模糊搜索、关系网络咨询。不涉及精确条件过滤的问题优先派给这个，而不是 SQLAgent。",
     "MapAgent": "地理出行专家，挂载高德地图工具。处理地理编码、路线规划（步行/骑行/驾车）、周边搜索（POI）、天气查询。",
     "SQLAgent": "关系数据库专家，用于精确过滤、统计或多条件检索女优、作品及关联表关系。不涉及精确条件的模糊/综合查询交给 MediaAgent。",
-    "BrowserAgent": "浏览器操作专家。处理网页点击、动态数据抓取、文件上传与自动化发帖。复杂规划中，需要先派这个拿到地址等信息，再派 MapAgent。",
+    "BrowserAgent": "浏览器操作专家。处理网页点击、登录、动态数据抓取、文件上传与自动化发帖。它可以直接接收本地文件路径（如 workspace/1.png）完成网页上传，无需先派 FileAgent 读取；只要任务涉及网页端发布/登录/点击等交互，就直接派给它，不要提前结束并让用户手动操作。复杂规划中，需要先派这个拿到地址等信息，再派 MapAgent。",
     "CodeAgent": "代码执行专家，用 Python 解决数学计算、数据处理和绘图任务。只能写代码运行，不能帮你查资料；需要绘图时必须明确指示它绘图。",
 }
 
@@ -170,13 +175,16 @@ MEDIA_AGENT_PROMPT = (
 )
 
 MAP_AGENT_PROMPT = (
-    WORKER_BASE_PROMPT + "你是 MapAgent，负责调用高德地图服务工具。必须先获取经纬度再进行周边/坐标类搜索。"
+    WORKER_BASE_PROMPT
+    + "你是 MapAgent，负责调用高德地图服务工具。必须先获取经纬度再进行周边/坐标类搜索。\n"
+    + "只报告工具实际返回的字段。工具没有返回距离就不要写距离，更不要给不同地点填同一个距离；确实需要距离时，对每个地点分别调用距离/路线工具。"
 )
 
 CODE_AGENT_PROMPT = (
     WORKER_BASE_PROMPT
-    + "你是 CodeAgent，专职编写和执行 Python 代码。"
-    + "【画图强制要求】：如果需要绘图（如 matplotlib），必须在代码中显式将图片 savefig 保存到 '/workspace/outputs/' 目录下，且以 .png 结尾。禁止调用 plt.show()。"
+    + "你是 CodeAgent，专职编写和执行 Python 代码解决纯数学计算、数据处理和绘图任务。\n"
+    + "【运行环境限制 - 极端重要】：你运行在完全隔离且每次调用后即销毁的临时 Docker 沙箱中，绝对无法读写或修改用户宿主机的本地文件（如 workspace/ 目录下的文件）。严禁执行 Python 代码尝试读取或改写用户宿主机文件！若主管要求你读写或改写本地文件，请直接汇报无法访问或修改宿主机本地文件，严禁调用 execute_python_code 反复尝试重试！\n"
+    + "【画图强制要求】：如果需要绘图（如 matplotlib），必须在代码中显式将图片 savefig 保存到 '/workspace/outputs/' 目录下，且以 .png 结尾。禁止调用 plt.show()。\n"
     + "沙箱已预装 pandas, numpy, matplotlib。"
 )
 
@@ -263,7 +271,7 @@ def build_initial_messages(
     messages: List[BaseMessage] = []
     memories = database.search_memory(user_query, top_k=1)
     if memories:
-        messages.append(SystemMessage(content="【用户长期记忆】\n" + "\n".join(memories)))
+        messages.append(SystemMessage(content="【用户长期记忆（背景信息，仅在与用户问题相关时参考，不相关请忽略）】\n" + "\n".join(memories)))
     if history_messages:
         messages.extend(history_messages)
     messages.append(HumanMessage(content=user_query, name="user"))
@@ -276,7 +284,7 @@ async def _background_extract_memory(recent_chat: str):
         res = await models.extractor_llm.ainvoke(final_prompt)
         content = extract_text(res.content).strip()
         if content and content.upper() != "NONE" and "NONE" not in content.upper():
-            database.insert_memory(content)
+            await asyncio.to_thread(database.insert_memory, content)
             print(f"--- \033[92m[后台记忆保存]\033[0m: {content} ---")
         else:
             print("--- \033[90m[后台记忆跳过]: 未发现长期价值信息\033[0m ---")
@@ -287,11 +295,15 @@ async def _background_extract_memory(recent_chat: str):
 # Main Agent Builder
 # ============================================================================
 
-async def build_main_agent(checkpointer: Optional[BaseCheckpointSaver] = None):
+async def build_main_agent(
+    checkpointer: Optional[BaseCheckpointSaver] = None,
+    include_privileged: bool = True,
+):
     """
     构建基于 deepagents 的主 Agent 实例。
     - 主模型: models.supervisor_llm (ChatGoogleGenerativeAI / gemini-3.1-flash-lite)
-    - 子专家: 6 个工具型专家声明式接入 (task 委派)
+    - 子专家: 声明式接入 (task 委派)
+    - include_privileged: 若为 False，则不构建、不注册 FileAgent / DesktopAgent / BrowserAgent
     - 中间件: ToolCallLimitMiddleware 防御 task 工具死循环
     - 持久化: 默认使用 MemorySaver
     """
@@ -300,29 +312,6 @@ async def build_main_agent(checkpointer: Optional[BaseCheckpointSaver] = None):
     amap_tools = mcp_service.get_tools_by_server("amap")
     if not amap_tools:
         print("⚠️ 警告：MapAgent 没有任何高德工具，地图/天气查询将不可用！")
-    filesystem_tools = mcp_service.get_tools_by_server("filesystem")
-    desktop_tools = mcp_service.get_tools_by_server("desktop")
-
-    # 构建已编译子图并使用 SubgraphCompiledWrapper 适配 deepagents
-    file_agent_subgraph = build_file_agent_subgraph(
-        filesystem_tools=filesystem_tools,
-        system_prompt=FILE_AGENT_PROMPT,
-    )
-    desktop_agent_subgraph = build_desktop_agent_subgraph(
-        desktop_tools=desktop_tools,
-        system_prompt=DESKTOP_AGENT_PROMPT,
-    )
-
-    file_subagent = CompiledSubAgent(
-        name="FileAgent",
-        description="本地文件专家，读取/写入/编辑项目内文件，涉及危险操作（写入/编辑/移动）会暂停并请求人工授权。",
-        runnable=SubgraphCompiledWrapper(file_agent_subgraph),
-    )
-    desktop_subagent = CompiledSubAgent(
-        name="DesktopAgent",
-        description="桌面操作专家，通过截图+网格坐标操作 Windows 桌面 GUI，涉及高危按键组合会暂停并请求人工授权。",
-        runnable=SubgraphCompiledWrapper(desktop_agent_subgraph),
-    )
 
     # 配置中间件
     middleware = []
@@ -337,7 +326,7 @@ async def build_main_agent(checkpointer: Optional[BaseCheckpointSaver] = None):
     else:
         print("[-] Warning: ToolCallLimitMiddleware not available, task tool limit disabled.")
 
-    # 声明式 subagents 列表（包含 6 个工具型专家 + 2 个编译型 HITL 子图专家 + 1 个兜底覆盖）
+    # 声明式基础专家列表（非特权专家）
     subagents = [
         {
             "name": "KnowledgeAgent",
@@ -368,42 +357,77 @@ async def build_main_agent(checkpointer: Optional[BaseCheckpointSaver] = None):
             "model": models.worker_llm,
         },
         {
-            "name": "BrowserAgent",
-            "description": SUBAGENT_DESCRIPTIONS["BrowserAgent"],
-            "system_prompt": BROWSER_AGENT_PROMPT,
-            "tools": tools.browser_tools,
-            "model": models.worker_llm,
-        },
-        {
             "name": "SQLAgent",
             "description": SUBAGENT_DESCRIPTIONS["SQLAgent"],
             "system_prompt": SQL_AGENT_PROMPT,
             "tools": [tools.execute_sql],
             "model": models.worker_llm,
         },
-        file_subagent,
-        desktop_subagent,
-        # 显式覆盖框架内置的 general-purpose subagent。
-        # 根据 deepagents 文档："这些设置只在调用方没有提供一个名叫 general-purpose 的 subagent 时才生效"。
-        # 注册同名条目是不依赖 provider key 匹配的硬覆盖，比 register_harness_profile 更可靠。
-        {
-            "name": "general-purpose",
-            "description": "仅当用户请求明显不属于以上任何专家范围时才使用，绝大多数情况不应该被调用。",
-            "system_prompt": (
-                "如果你被调用，说明主 Agent 判断这个任务不属于任何专属领域专家的范围。"
-                "请如实告知用户无法处理这类请求，不要尝试执行任何工具操作或猜测性回答。"
-            ),
-            "tools": [],
-            "model": models.worker_llm,
-        },
     ]
+
+    # 特权专家：FileAgent / DesktopAgent / BrowserAgent 仅在 include_privileged=True 时构建并注册
+    if include_privileged:
+        filesystem_tools = mcp_service.get_tools_by_server("filesystem")
+        filesystem_tools = [t for t in filesystem_tools if t.name != "read_media_file"]
+        desktop_tools = mcp_service.get_tools_by_server("desktop")
+
+        file_agent_subgraph = build_file_agent_subgraph(
+            filesystem_tools=filesystem_tools,
+            system_prompt=FILE_AGENT_PROMPT,
+        )
+        desktop_agent_subgraph = build_desktop_agent_subgraph(
+            desktop_tools=desktop_tools,
+            system_prompt=DESKTOP_AGENT_PROMPT,
+        )
+
+        file_subagent = CompiledSubAgent(
+            name="FileAgent",
+            description="本地文件专家，是唯一能访问本地磁盘的专家：读取/写入/编辑项目内的文本类文件（.py/.json/.md/.txt 等），涉及危险操作（写入/编辑/移动）会暂停并请求人工授权。不要让它读取图片、音视频等二进制文件（它无法解析，会导致死循环）；网页上传文件的任务不要先派它读取，直接把路径交给 BrowserAgent。",
+            runnable=SubgraphCompiledWrapper(file_agent_subgraph),
+        )
+        desktop_subagent = CompiledSubAgent(
+            name="DesktopAgent",
+            description="桌面操作专家，通过截图+网格坐标操作 Windows 桌面 GUI，涉及高危按键组合会暂停并请求人工授权。",
+            runnable=SubgraphCompiledWrapper(desktop_agent_subgraph),
+        )
+
+        subagents.append({
+            "name": "BrowserAgent",
+            "description": SUBAGENT_DESCRIPTIONS["BrowserAgent"],
+            "system_prompt": BROWSER_AGENT_PROMPT,
+            "tools": tools.browser_tools,
+            "model": models.worker_llm,
+        })
+        subagents.append(file_subagent)
+        subagents.append(desktop_subagent)
+
+    # 显式覆盖框架内置的 general-purpose subagent
+    subagents.append({
+        "name": "general-purpose",
+        "description": "仅当用户请求明显不属于以上任何专家范围时才使用，绝大多数情况不应该被调用。",
+        "system_prompt": (
+            "如果你被调用，说明主 Agent 判断这个任务不属于任何专属领域专家的范围。"
+            "请如实告知用户无法处理这类请求，不要尝试执行任何工具操作或猜测性回答。"
+        ),
+        "tools": [],
+        "model": models.worker_llm,
+    })
 
     if checkpointer is None:
         checkpointer = MemorySaver()
 
+    system_prompt = MAIN_AGENT_PROMPT
+    if not include_privileged:
+        restricted_prompt_suffix = (
+            "\n\n【受限模式】\n"
+            "当前没有文件、桌面、浏览器相关的专家。涉及读写本地文件、操作桌面或浏览器的请求，"
+            "直接用一句话告诉用户你没有这个权限，不要委派给其他专家，也不要提及内部专家的名字。"
+        )
+        system_prompt = MAIN_AGENT_PROMPT.strip() + restricted_prompt_suffix + "\n"
+
     agent = create_deep_agent(
         model=models.supervisor_llm,
-        system_prompt=MAIN_AGENT_PROMPT,
+        system_prompt=system_prompt,
         subagents=subagents,
         middleware=middleware,
         checkpointer=checkpointer,
