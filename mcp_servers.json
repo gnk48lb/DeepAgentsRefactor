@@ -5,6 +5,8 @@
       "--quiet",
       "--with",
       "amap-mcp-server",
+      "--with",
+      "pydantic<2.11",
       "python",
       "app/amap_wrapper.py"
     ],

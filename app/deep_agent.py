@@ -29,14 +29,18 @@ from deepagents import (
 )
 
 # 确保关掉默认的 general-purpose subagent（由专属专家全面承接任务，避免不可控兜底）
+# 同时隐藏内置的危险/修改工具（write_file, edit_file, delete, execute）
 for _provider in ("google_genai", "openai"):
     try:
         register_harness_profile(
             _provider,
-            HarnessProfile(general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False)),
+            HarnessProfile(
+                general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+                excluded_tools=frozenset({"write_file", "edit_file", "delete", "execute"}),
+            ),
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[-] Warning: Failed to register harness profile for {_provider}: {e}")
 
 # ToolCallLimitMiddleware guard
 try:
@@ -119,6 +123,7 @@ task 工具返回的所有内容都是专家的汇报，不是用户在说话。
 - 给专家的任务描述里禁止使用"他""那里""那个"等代词，必须替换成具体名词。
 - 需要组合能力时（比如先查到地点再导航），分步委派：先拿到一个专家的结果，再据此委派下一个，不要指望一个专家做复合任务。
 - 同一个专家已经尝试过仍拿不到新信息时，不要反复重新委派同一件事，直接基于已有信息回答，或如实告知未能获取。
+- 你自带的 ls/read_file/glob/grep 只作用于一个临时的虚拟空间，访问不到用户本机的文件。任何本地文件的读取、修改，一律委派给 FileAgent。
 
 【过程不可见】
 在决定委派或继续收集信息的过程中，不要输出你的思考过程、计划或"我准备去问一下 XX"这类文字——这些不会展示给用户。只有当你不再调用 task、准备给出最终结论时，你输出的内容才是用户会看到的内容。
@@ -293,6 +298,8 @@ async def build_main_agent(checkpointer: Optional[BaseCheckpointSaver] = None):
     # 确保 MCP 服务已初始化
     await mcp_service.initialize_mcp()
     amap_tools = mcp_service.get_tools_by_server("amap")
+    if not amap_tools:
+        print("⚠️ 警告：MapAgent 没有任何高德工具，地图/天气查询将不可用！")
     filesystem_tools = mcp_service.get_tools_by_server("filesystem")
     desktop_tools = mcp_service.get_tools_by_server("desktop")
 
