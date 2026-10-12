@@ -1,7 +1,7 @@
-﻿import sys, os, asyncio
+import sys, os, asyncio
 sys.path.insert(0, os.path.abspath("."))
 from app import deep_agent, database
-from main_deepagents import run_agent
+from main import run_agent
 
 async def main():
     database.run_global_database_init()

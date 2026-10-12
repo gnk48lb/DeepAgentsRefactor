@@ -5,11 +5,11 @@ Core implementation of the Main Agent ReAct loop and declarative subagent archit
 using the deepagents framework (Phase 1).
 
 Architecture:
-- Main Agent: Built via create_deep_agent with MAIN_AGENT_PROMPT, driven by models.supervisor_llm.
+- Main Agent: Built via create_deep_agent with MAIN_AGENT_PROMPT.
 - Subagents: 6 tool-specialist subagents (KnowledgeAgent, MediaAgent, MapAgent, CodeAgent, BrowserAgent, SQLAgent)
   delegated to via the deepagents built-in `task` tool.
 - Middleware: ToolCallLimitMiddleware guarding the `task` tool (run_limit=12, exit_behavior="continue").
-- HITL Subgraphs: FileAgent and DesktopAgent are deferred to subsequent phases.
+- HITL Subgraphs: FileAgent and DesktopAgent are integrated as compiled subgraphs with human-in-the-loop approval.
 """
 
 from typing import List, Optional, Sequence, Any, Dict

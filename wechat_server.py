@@ -5,46 +5,23 @@ from fastapi import FastAPI, Request, Response
 import uvicorn
 from langchain_core.messages import HumanMessage
 
-# --- 引入你的项目核心模块 ---
-from app import graph, database, mcp_service
+# --- 引入项目核心模块 ---
+from app import chat_service
 import config
 
 app = FastAPI()
-agent_app = None
 
 WECHAT_TOKEN = "gnk48_agent_token_2026"
 
 @app.on_event("startup")
 async def startup_event():
-    global agent_app
     print("🚀 正在初始化 Multi-Agent 系统...")
-    # 数据库全家桶一键初始化
-    database.run_global_database_init()
-    await mcp_service.initialize_mcp()
-    agent_app = graph.build_graph()
+    await chat_service.init_service()
     print("✅ 系统初始化完成，FastAPI 启动，正在监听微信公众号请求...")
 
 async def get_agent_response(query: str, user_id: str) -> str:
-    global agent_app
-    inputs = {"messages": [HumanMessage(content=query)]}
-    config_dict = {
-        "recursion_limit": 15,
-        "configurable": {"thread_id": user_id} 
-    }
-    final_answer = "抱歉，系统暂时无法处理您的请求。"
-    try:
-        async for event in agent_app.astream(inputs, config=config_dict):
-            for node_name, state_update in event.items():
-                if node_name == "Supervisor":
-                    next_agent = state_update.get("next_agent", "")
-                    messages = state_update.get("messages", [])
-                    if next_agent == "FINISH":
-                        if messages and hasattr(messages[-1], "name") and messages[-1].name == "Supervisor_Final":
-                            final_answer = messages[-1].content
-    except Exception as e:
-        print(f"❌ Agent 执行异常: {str(e)}")
-        final_answer = f"系统内部错误: {str(e)}"
-    return final_answer
+    reply = await chat_service.handle_message(user_id=user_id, content=query)
+    return reply.text
 
 # 👑 【核心修改点】路由 1：处理微信服务器的接入验证 (GET 请求)
 @app.get("/wechat")
