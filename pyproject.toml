@@ -1,7 +1,7 @@
 [project]
 name = "qqbot"
 version = "0.1.0"
-description = "Add your description here"
+description = "基于 DeepAgents 与 LangGraph 的多智能体 QQ 机器人与个人助理系统"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
