@@ -99,6 +99,10 @@ class SiliconFlowReranker:
 
 reranker = SiliconFlowReranker(config.RERANKER_MODEL, config.SILICON_FLOW_API_KEY)
 
+# --- Gemini Models Initialization ---
+if not config.GEMINI_API_KEY:
+    raise ValueError("未配置 GEMINI_API_KEY（或 GOOGLE_API_KEY）")
+
 # Initialize Worker LLM (Text only)
 worker_llm = ChatGoogleGenerativeAI(
     model=config.WORKER_LLM_MODEL,
@@ -136,7 +140,7 @@ vlm = ChatGoogleGenerativeAI(
 
 # Initialize Extractor LLM (Memory Extraction)
 extractor_llm = ChatGoogleGenerativeAI(
-    model="gemini-3.1-flash-lite",
+    model=config.EXTRACTOR_LLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
     temperature=0
 )

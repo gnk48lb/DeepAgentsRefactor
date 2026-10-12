@@ -65,16 +65,14 @@ BROWSER_VLM_MODEL = "gemini-3.5-flash-lite"
 # 桌面多模态模型 (DesktopAgent)
 DESKTOP_VLM_MODEL = "gemini-3.5-flash-lite"
 
+# 记忆提取模型 (Memory Extraction)
+EXTRACTOR_LLM_MODEL = os.getenv("EXTRACTOR_LLM_MODEL", "gemini-3.1-flash-lite")
+
 # SiliconFlow 相关配置 (暂时注释)
 SILICON_FLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 
 # Gemini 相关配置
-# 注意：Google Gemini 的 OpenAI 兼容接口需要在 v1beta 后加 /openai/
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "8964"
-
-GITHUB_BASE_URL = "https://models.inference.ai.azure.com"
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 
 # Advanced RAG Configurations

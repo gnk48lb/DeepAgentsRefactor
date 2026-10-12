@@ -53,13 +53,7 @@ async def run_browser_task(task_description: str, llm) -> str:
                 temperature=0
             )
         else:
-            from browser_use.llm.openai.chat import ChatOpenAI
-            browser_llm = ChatOpenAI(
-                model=config.BROWSER_VLM_MODEL,
-                api_key=config.GITHUB_TOKEN,
-                base_url=config.GITHUB_BASE_URL,
-                temperature=0
-            )
+            raise ValueError("BROWSER_VLM_MODEL 必须是 Gemini 模型")
             
         browser = await init_browser()
 
