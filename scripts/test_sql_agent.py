@@ -91,7 +91,7 @@ def main():
     # 确保你的 .env 中配置了 OPENAI_API_KEY (如果使用中转 API，请配置 OPENAI_API_BASE)
     llm = ChatGoogleGenerativeAI(
         model="gemini-3.1-flash-lite-preview",
-        google_api_key="AIzaSyBsbDZSna5xyiocLhLG8hRxNG_3HfCy_0U",
+        google_api_key=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"),
         temperature=0
     )
 
