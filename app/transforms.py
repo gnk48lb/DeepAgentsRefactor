@@ -3,6 +3,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from . import models
 from .models import QueryIntent, ExtractedEntities
+from .utils import extract_text
 import logging
 
 logger = logging.getLogger(__name__)
@@ -21,11 +22,11 @@ def route_query(query: str) -> str:
 Return ONLY the strategy name (hyde, step_back, multi_query, or none). Do not output any other text.
 """
     try:
-        response = models.llm.invoke([
+        response = models.worker_llm.invoke([
             SystemMessage(content=sys_prompt),
             HumanMessage(content=f"Query: {query}")
         ])
-        strategy = response.content.strip().lower()
+        strategy = extract_text(response.content).strip().lower()
         if strategy not in ["hyde", "step_back", "multi_query", "none"]:
             return "none"
         return strategy
@@ -41,11 +42,11 @@ def generate_hyde(query: str) -> str:
 The passage should sound like it came from a game wiki or official patch notes.
 Do not include any introductory or concluding remarks, just the hypothetical answer."""
     try:
-        response = models.llm.invoke([
+        response = models.worker_llm.invoke([
             SystemMessage(content=sys_prompt),
             HumanMessage(content=f"Query: {query}")
         ])
-        return response.content.strip()
+        return extract_text(response.content).strip()
     except Exception:
         return query
 
@@ -56,11 +57,11 @@ def generate_step_back(query: str) -> str:
     sys_prompt = """You are an expert at information retrieval. Given a specific user question, generate a more abstract, broader "step-back" question that helps understand the underlying concepts.
 Do not include any introductory remarks. Just the question itself."""
     try:
-        response = models.llm.invoke([
+        response = models.worker_llm.invoke([
             SystemMessage(content=sys_prompt),
             HumanMessage(content=f"Query: {query}")
         ])
-        return response.content.strip()
+        return extract_text(response.content).strip()
     except Exception:
         return query
 
@@ -72,11 +73,12 @@ def generate_multi_query(query: str) -> list[str]:
 These alternative queries should capture different keywords or perspectives.
 Output exactly 3 lines, each line containing one query. Do not include numbering, bullet points, or introductory text."""
     try:
-        response = models.llm.invoke([
+        response = models.worker_llm.invoke([
             SystemMessage(content=sys_prompt),
             HumanMessage(content=f"Query: {query}")
         ])
-        lines = [line.strip() for line in response.content.split('\n') if line.strip()]
+        text_content = extract_text(response.content)
+        lines = [line.strip() for line in text_content.split('\n') if line.strip()]
         # Remove any leading numbers or dashes that the LLM might have added despite instructions
         clean_lines = []
         for line in lines:
