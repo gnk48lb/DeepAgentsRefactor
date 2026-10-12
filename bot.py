@@ -6,6 +6,13 @@ import os
 # 确保能正确导入 app 等模块
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+import logging
+
+# 压低 faiss 与 milvus 的日志噪音
+logging.getLogger("milvus_lite").setLevel(logging.WARNING)
+logging.getLogger("faiss").setLevel(logging.WARNING)
+logging.getLogger("pymilvus").setLevel(logging.WARNING)
+
 # 初始化 NoneBot
 nonebot.init()
 
