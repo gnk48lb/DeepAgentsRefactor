@@ -16,6 +16,7 @@ from langgraph.types import interrupt
 
 from . import models
 from . import mcp_service
+from .utils import extract_text
 import config
 
 
@@ -115,9 +116,6 @@ HIGH_RISK_HOTKEYS = ["enter", "return", "delete", "alt", "win", "ctrl"]
 class FileAgentState(TypedDict):
     """FileAgent 子图专用状态；messages 字段与主图共享 operator.add 语义。"""
     messages: Annotated[List[BaseMessage], operator.add]
-    current_tool_call_id: str
-    instruction_to_worker: str
-    user_query: str
 
 
 def _last_ai_with_calls(messages):
@@ -180,29 +178,9 @@ def build_file_agent_subgraph(filesystem_tools: list, system_prompt: str, llm=No
         """调用 LLM，决定下一步工具调用或直接生成回答。"""
         msgs = state["messages"]
         sys_msg = SystemMessage(content=system_prompt)
-        
-        target_tool_call_id = state.get("current_tool_call_id")
-        
-        task_instruction = state.get("instruction_to_worker", "")
-        user_query = state.get("user_query", "")
-        
-        # 寻找子图内部产生的交互
-        split_idx = 0
-        for i in range(len(msgs) - 1, -1, -1):
-            if isinstance(msgs[i], AIMessage) and msgs[i].tool_calls:
-                if any(tc["id"] == target_tool_call_id for tc in msgs[i].tool_calls):
-                    split_idx = i
-                    break
-                
-        isolated_start_msg = HumanMessage(content=f"【用户原始请求背景】：{user_query}\n\n【当前核心任务】：{task_instruction}")
-        
-        # 取该次调用之后的所有子图内部产生的交互
-        internal_history = msgs[split_idx+1:]
-        sanitized_msgs = _sanitize_messages_for_llm(internal_history)
-        
-        # 绑定工具 schema 给 LLM
+        sanitized_msgs = _sanitize_messages_for_llm(msgs)
         bound_llm = llm.bind_tools(filesystem_tools)
-        response: AIMessage = await bound_llm.ainvoke([sys_msg, isolated_start_msg] + sanitized_msgs)
+        response: AIMessage = await bound_llm.ainvoke([sys_msg] + sanitized_msgs)
         return {"messages": [response]}
 
     async def fa_safe_tools_node(state: FileAgentState) -> dict:
@@ -279,31 +257,20 @@ def build_file_agent_subgraph(filesystem_tools: list, system_prompt: str, llm=No
     async def fa_summarize_node(state: FileAgentState) -> dict:
         """子图收尾节点：将所有工具执行结果汇总为一条战报格式的消息回传主图。"""
         msgs = state["messages"]
-        # 提取当前子图运行产生的最后一条 AI 总结消息
         worker_text = ""
         for msg in reversed(msgs):
             if isinstance(msg, AIMessage) and msg.content:
-                worker_text = msg.content
+                worker_text = extract_text(msg.content)
                 break
-        
-        # 如果是列表且只包含文本，强转为字符串以净化上下文
-        if isinstance(worker_text, list):
-            has_image = any(isinstance(c, dict) and c.get("type") == "image_url" for c in worker_text)
-            if not has_image:
-                worker_text = "\n".join(c.get("text", "") for c in worker_text if isinstance(c, dict) and c.get("type") == "text")
-        
-        # 如果最后一条消息只是计划（Plan）而没产生实际结果，强制增加警告提示
+
         if "【执行】" in worker_text or "请开始执行" in worker_text:
             if not any(isinstance(m, ToolMessage) for m in state["messages"][-5:]):
                 worker_text += "\n⚠️ [警告] 专家未能通过工具获取到实际数据，以上仅为计划描述。"
-            
-        # 【稳健重构】：构造显式的“内部汇报”头部
-        report_header = f"【内部专家汇报 - 来源：FileAgent】\n"
+
+        report_header = "【内部专家汇报 - 来源：FileAgent】\n"
         report_content = report_header + worker_text
-                
-        # 返回 ToolMessage 与 Supervisor 产生闭环
-        tool_call_id = state.get("current_tool_call_id")
-        return {"messages": [ToolMessage(content=report_content, tool_call_id=tool_call_id, name="FileAgent")]}
+
+        return {"messages": [AIMessage(content=report_content)]}
 
     # ── 路由函数 ──────────────────────────────────────────────────────────────
 
@@ -342,9 +309,52 @@ def build_file_agent_subgraph(filesystem_tools: list, system_prompt: str, llm=No
 
 class DesktopAgentState(TypedDict):
     messages: Annotated[List[BaseMessage], operator.add]
-    current_tool_call_id: str
-    instruction_to_worker: str
-    user_query: str
+
+
+HISTORICAL_SCREENSHOT_PLACEHOLDER = "（历史截图已省略，请以最新截图为准）"
+LATEST_SCREENSHOT_TOOL_MESSAGE = "截图获取成功，已通过下方系统图片消息展示给您。"
+
+
+def _process_desktop_messages_for_llm(messages: list) -> list:
+    """处理 DesktopAgent 消息历史中的截图：
+    只对最后一条 take_grid_screenshot 的 ToolMessage 保留多模态图片展示；
+    更早的历史截图只保留固定占位文案的 ToolMessage，防止 token 暴涨及坐标混淆。
+    """
+    last_screenshot_idx = -1
+    for idx, msg in enumerate(messages):
+        if isinstance(msg, ToolMessage) and getattr(msg, "name", None) == "take_grid_screenshot":
+            last_screenshot_idx = idx
+
+    processed = []
+    for idx, msg in enumerate(messages):
+        if isinstance(msg, ToolMessage) and getattr(msg, "name", None) == "take_grid_screenshot":
+            if idx == last_screenshot_idx:
+                # 最新截图：短文本 ToolMessage + 紧随其后的带图 HumanMessage
+                processed.append(ToolMessage(
+                    content=LATEST_SCREENSHOT_TOOL_MESSAGE,
+                    tool_call_id=getattr(msg, "tool_call_id", ""),
+                    name=msg.name,
+                ))
+                base64_data = str(msg.content).strip()
+                if "base64," in base64_data:
+                    base64_data = base64_data.split("base64,")[1]
+                base64_data = re.sub(r"\s+", "", base64_data)
+                img_url = f"data:image/jpeg;base64,{base64_data}"
+                processed.append(HumanMessage(content=[
+                    {"type": "text", "text": "[系统消息：以下是 DesktopAgent 获取的当前 Windows 屏幕带红色网格线坐标的截图，请通过该截图分析并确定你需要点击或操作的图标的 A1-Z16 坐标]"},
+                    {"type": "image_url", "image_url": {"url": img_url}},
+                ]))
+            else:
+                # 历史截图：只保留固定占位文案 ToolMessage，不带图片
+                processed.append(ToolMessage(
+                    content=HISTORICAL_SCREENSHOT_PLACEHOLDER,
+                    tool_call_id=getattr(msg, "tool_call_id", ""),
+                    name=msg.name,
+                ))
+        else:
+            processed.append(msg)
+
+    return processed
 
 
 def build_desktop_agent_subgraph(desktop_tools: list, system_prompt: str, llm=None, checkpointer=None):
@@ -356,49 +366,11 @@ def build_desktop_agent_subgraph(desktop_tools: list, system_prompt: str, llm=No
     async def da_llm_node(state: DesktopAgentState) -> dict:
         msgs = state["messages"]
         sys_msg = SystemMessage(content=system_prompt)
-        
-        target_tool_call_id = state.get("current_tool_call_id")
-        task_instruction = state.get("instruction_to_worker", "")
-        user_query = state.get("user_query", "")
-        
-        split_idx = 0
-        for i in range(len(msgs) - 1, -1, -1):
-            if isinstance(msgs[i], AIMessage) and msgs[i].tool_calls:
-                if any(tc["id"] == target_tool_call_id for tc in msgs[i].tool_calls):
-                    split_idx = i
-                    break
-                    
-        isolated_start_msg = HumanMessage(content=f"【用户原始请求背景】：{user_query}\n\n【当前核心任务】：{task_instruction}")
-        internal_history = msgs[split_idx+1:]
-        sanitized_msgs = _sanitize_messages_for_llm(internal_history)
-        
-        # 🚀 核心大招：动态拦截并处理 take_grid_screenshot 的 base64 返回值，转换成真实的图片格式
-        processed_msgs = []
-        for msg in sanitized_msgs:
-            if isinstance(msg, ToolMessage) and msg.name == "take_grid_screenshot":
-                # 1. 插入一个纯文本 ToolMessage 告诉 LLM 工具执行成功
-                processed_msgs.append(ToolMessage(
-                    content="截图获取成功，已通过下方系统图片消息展示给您。",
-                    tool_call_id=msg.tool_call_id,
-                    name=msg.name
-                ))
-                # 2. 紧跟一条 HumanMessage，通过数据 URL 协议把 Base64 数据封装为多模态图片节点，让 VLM 能直接“看”到！
-                base64_data = str(msg.content).strip()
-                if "base64," in base64_data:
-                    base64_data = base64_data.split("base64,")[1]
-                # 滤除非 base64 字符
-                base64_data = re.sub(r"\s+", "", base64_data)
-                
-                img_url = f"data:image/jpeg;base64,{base64_data}"
-                processed_msgs.append(HumanMessage(content=[
-                    {"type": "text", "text": "[系统消息：以下是 DesktopAgent 获取的当前 Windows 屏幕带红色网格线坐标的截图，请通过该截图分析并确定你需要点击或操作的图标的 A1-Z16 坐标]"},
-                    {"type": "image_url", "image_url": {"url": img_url}}
-                ]))
-            else:
-                processed_msgs.append(msg)
-        
+        sanitized_msgs = _sanitize_messages_for_llm(msgs)
+        # 🚀 核心大招：动态拦截并处理 take_grid_screenshot 的 base64 返回值，仅最新截图保留真实图片
+        processed_msgs = _process_desktop_messages_for_llm(sanitized_msgs)
         bound_llm = llm.bind_tools(desktop_tools)
-        response = await bound_llm.ainvoke([sys_msg, isolated_start_msg] + processed_msgs)
+        response = await bound_llm.ainvoke([sys_msg] + processed_msgs)
         return {"messages": [response]}
 
     async def da_tools_node(state: DesktopAgentState) -> dict:
@@ -472,23 +444,17 @@ def build_desktop_agent_subgraph(desktop_tools: list, system_prompt: str, llm=No
         worker_text = ""
         for msg in reversed(msgs):
             if isinstance(msg, AIMessage) and msg.content:
-                worker_text = msg.content
+                worker_text = extract_text(msg.content)
                 break
-                
-        if isinstance(worker_text, list):
-            has_image = any(isinstance(c, dict) and c.get("type") == "image_url" for c in worker_text)
-            if not has_image:
-                worker_text = "\n".join(c.get("text", "") for c in worker_text if isinstance(c, dict) and c.get("type") == "text")
-                
+
         if "【执行】" in worker_text or "请开始执行" in worker_text:
             if not any(isinstance(m, ToolMessage) for m in state["messages"][-5:]):
                 worker_text += "\n⚠️ [警告] 专家未能通过工具获取到实际数据，以上仅为计划描述。"
-                
-        report_header = f"【内部专家汇报 - 来源：DesktopAgent】\n"
+
+        report_header = "【内部专家汇报 - 来源：DesktopAgent】\n"
         report_content = report_header + worker_text
-                
-        tool_call_id = state.get("current_tool_call_id")
-        return {"messages": [ToolMessage(content=report_content, tool_call_id=tool_call_id, name="DesktopAgent")]}
+
+        return {"messages": [AIMessage(content=report_content)]}
 
     def _route_after_llm(state: DesktopAgentState) -> str:
         last_ai: AIMessage = state["messages"][-1]

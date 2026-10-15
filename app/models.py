@@ -21,6 +21,9 @@ logging.getLogger("langchain_google_genai").setLevel(logging.WARNING)
 
 # --- Embedding & Reranking Models ---
 
+SILICONFLOW_EMBEDDING_TIMEOUT = 60
+SILICONFLOW_RERANK_TIMEOUT = 30
+
 # Initialize HuggingFace Dense Embeddings (API) for GraphRAG
 av_embeddings = HuggingFaceEndpointEmbeddings(
     model=config.EMBEDDING_MODEL,
@@ -42,7 +45,12 @@ class SiliconFlowEmbeddings(BaseModel, Embeddings):
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
             payload = {"model": self.model, "input": batch}
-            resp = requests.post(f"{self.base_url}/embeddings", json=payload, headers=headers)
+            resp = requests.post(
+                f"{self.base_url}/embeddings",
+                json=payload,
+                headers=headers,
+                timeout=SILICONFLOW_EMBEDDING_TIMEOUT,
+            )
             data = resp.json()
             if "data" not in data or data["data"] is None:
                 # 记录详细错误，判断是否被模型网关拦截 (内容审核)
@@ -87,7 +95,12 @@ class SiliconFlowReranker:
             "documents": [p[1] for p in pairs],
             "top_n": len(pairs)
         }
-        resp = requests.post(self.url, json=payload, headers=headers)
+        resp = requests.post(
+            self.url,
+            json=payload,
+            headers=headers,
+            timeout=SILICONFLOW_RERANK_TIMEOUT,
+        )
         data = resp.json()
         
         # SiliconFlow 返回格式: {"results": [{"index": 0, "relevance_score": 0.9}, ...]}

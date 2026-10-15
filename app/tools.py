@@ -1,6 +1,7 @@
+import re
 from langchain_core.tools import tool
 from .database import get_client, execute_hybrid_search, rerank_candidates
-from .graph_rag import MediaGraphRetriever
+from .graph_rag import MediaGraphRetriever, get_media_retriever
 from datetime import datetime
 import config
 from . import models
@@ -151,27 +152,37 @@ def av_graph_rag(query: str) -> str:
     """专门用于检索日本AV作品、番号、女优、男优、题材标签（如人妻、温泉、熟女等）相关信息的工具。当用户询问任何关于成人视频、特定番号作品或相关演员时，必须优先且仅能调用此工具。"""
     print(f"\n[Tool Call: av_graph_rag] Query: {query}")
     try:
-        retriever = MediaGraphRetriever()
+        retriever = get_media_retriever()
         return retriever.search(query)
     except Exception as e:
         import traceback
         traceback.print_exc()
         return f"Error executing AV graph search: {e}"
 
+def _prepare_select_sql(sql: str) -> str:
+    """预处理 SELECT SQL 语句：校验单条 SELECT 并确保包含 LIMIT。"""
+    if not re.match(r"^\s*SELECT", sql, re.IGNORECASE):
+        raise ValueError("Security Check Failed. Only SELECT statements are allowed.")
+    s = sql.strip()
+    while s.endswith(";"):
+        s = s[:-1].strip()
+    if ";" in s:
+        raise ValueError("Security Check Failed. Multiple statements are not allowed.")
+    if not re.search(r"\bLIMIT\b", s, re.IGNORECASE):
+        s = s + "\nLIMIT 50"
+    return s
+
+
 @tool("execute_sql")
 def execute_sql(sql_query: str) -> str:
     """执行 SQL SELECT 查询并返回结果。当需要精确过滤/多条件筛选/统计计算（如女优身高、罩杯统计、发行年份过滤等）本库 MySQL 数据时调用。"""
     print(f"\n[Tool Call: execute_sql] SQL: {sql_query}")
-    import re
     import pymysql
     
-    # 1. 安全性检查：只允许 SELECT
-    if not re.match(r"^\s*SELECT", sql_query, re.IGNORECASE):
-        return "Error: Security Check Failed. Only SELECT statements are allowed."
-    
-    # 2. 性能要求：如果没有 LIMIT，自动加上 LIMIT 50
-    if not re.search(r"\bLIMIT\b", sql_query, re.IGNORECASE):
-        sql_query = sql_query.strip().rstrip(";") + " LIMIT 50"
+    try:
+        sql_query = _prepare_select_sql(sql_query)
+    except ValueError as e:
+        return f"Error: {e}"
 
     connection = None
     host = config.MYSQL_HOST
@@ -179,13 +190,6 @@ def execute_sql(sql_query: str) -> str:
     password = config.MYSQL_PASSWORD
     database = config.MYSQL_DATABASE
     port = int(config.MYSQL_PORT)
-
-    # 自动识别初始占位配置并进行回退，确保即使没修改 .env 也能跑通
-    if database == "my_database" and port == 3306:
-        host = "127.0.0.1"
-        password = "8964"
-        database = "av_db"
-        port = 8964
 
     try:
         connection = pymysql.connect(

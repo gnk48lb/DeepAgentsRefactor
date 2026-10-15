@@ -1,14 +1,22 @@
 import json
 import pymysql
+import sys
+from pathlib import Path
 
-# 1. MySQL 连接配置（请根据你的实际情况修改）
+# Add project root to sys.path
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
+
+import config
+
+# 1. MySQL 连接配置（复用 config 配置）
 DB_CONFIG = {
-    "host": "localhost",
-    "port": 8964,
-    "user": "root",          # 你的 MySQL 用户名
-    "password": "8964",  # 你的 MySQL 密码
-    "database": "av_db",     # 你的数据库名
-    "charset": "utf8mb4"
+    "host": config.MYSQL_HOST,
+    "port": int(config.MYSQL_PORT),
+    "user": config.MYSQL_USER,
+    "password": config.MYSQL_PASSWORD,
+    "database": config.MYSQL_DATABASE,
+    "charset": "utf8mb4",
 }
 
 def init_mysql_tables():
@@ -132,8 +140,10 @@ def import_works_and_relations(file_path):
 if __name__ == "__main__":
     # 执行一键迁移
     init_mysql_tables()
-    
-    # 💡 替换成你实际存放 jsonl 文件的路径
-    import_actresses(r"D:\code\VisualStudioCode\AI\project\GNK48-Agent\QQbot\data\GraphRAG\actresses.jsonl")
-    import_works_and_relations(r"D:\code\VisualStudioCode\AI\project\GNK48-Agent\QQbot\data\GraphRAG\work.jsonl")    
+
+    actresses_path = _PROJECT_ROOT / "data" / "graphrag" / "actresses.jsonl"
+    works_path = _PROJECT_ROOT / "data" / "graphrag" / "work.jsonl"
+
+    import_actresses(str(actresses_path))
+    import_works_and_relations(str(works_path))
     print("\n🎉 恭喜，所有结构化数据已成功洗入 MySQL，可以开始进行 Text-to-SQL 的接入了！")

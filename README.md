@@ -29,8 +29,8 @@ GNK48-Agent 采用声明式主智能体配合垂直领域子专家架构。主 A
 
 ### 2.3 特权版 vs 受限版
 系统根据 `config.OWNER_QQ_IDS` 自动为不同权限的用户构建专属 Agent 实例：
-- **特权版 (Owner)**: 挂载全量 8 个子专家（含具有本地系统/文件写操作的 `FileAgent` 和系统桌面控制的 `DesktopAgent`）。
-- **受限版 (Normal)**: 移除了 `FileAgent` 和 `DesktopAgent`，普通用户无法触碰服务器文件系统或物理桌面。
+- **特权版 (Owner)**: 挂载全量 8 个子专家（包含具有本地文件读写权限的 `FileAgent`、物理桌面控制的 `DesktopAgent` 以及自动化操作网页的 `BrowserAgent`）。
+- **受限版 (Normal)**: 受限版不挂载 `FileAgent`、`DesktopAgent`、`BrowserAgent`，普通用户仅可使用知识检索、图谱检索、高德地图、代码沙箱执行和数据库查询等非特权专家。
 
 ---
 
@@ -39,32 +39,36 @@ GNK48-Agent 采用声明式主智能体配合垂直领域子专家架构。主 A
 ```text
 DeepAgentsRefactor/
 ├── app/                      # 核心业务逻辑
+│   ├── amap_wrapper.py       # 高德地图工具包装与坐标校验
+│   ├── browser_service.py    # 浏览器自动化控制封装 (Playwright)
 │   ├── chat_service.py       # 统一对话服务层（处理锁、并发、HITL与发件箱）
+│   ├── database.py           # Milvus 向量库与长期记忆管理
 │   ├── deep_agent.py         # 主 Agent 与声明式专家装配中心
 │   ├── graph.py              # FileAgent 与 DesktopAgent 的 HITL 子图定义与提示词
-│   ├── models.py             # LLM / VLM / 向量模型与重排器单例定义
-│   ├── tools.py              # 本地工具集合（RAG, Docker Code, SQL 等）
+│   ├── graph_rag.py          # 媒体图谱检索器 (Neo4j + Milvus Hybrid)
+│   ├── loader.py             # 文档与多模态数据加载、切片与图片编码
 │   ├── mcp_service.py        # MCP 协议客户端管理 (Amap, Filesystem, Desktop)
-│   ├── database.py           # Milvus 向量库与长期记忆管理
-│   ├── browser_service.py    # 浏览器自动化控制封装
+│   ├── models.py             # LLM / VLM / 向量模型与重排器单例定义
 │   ├── outbox.py             # 图片跨轮发件箱旁路
-│   └── utils.py              # 通用辅助工具 (extract_text)
+│   ├── sandbox.py            # Docker Python 沙箱代码执行环境
+│   ├── tools.py              # 本地工具集合（RAG, Docker Code, SQL 等）
+│   ├── transforms.py         # 查询转换增强 (HyDE, Step-Back, Multi-Query) 与意图路由
+│   ├── utils.py              # 通用辅助工具 (extract_text)
+│   └── windows_mcp.py        # Windows 桌面/原生交互 MCP 工具适配
 ├── plugins/                  # NoneBot2 插件层
 │   └── chat.py               # QQ 消息接收与 ChatService 薄封装
-├── scripts/                  # 运维与常用测试脚本
+├── scripts/                  # 运维与工具脚本
 │   ├── chat_cli.py           # 命令行多轮对话与 HITL 测试终端
+│   ├── docker-compose.yml    # Neo4j / Milvus / MinIO / Etcd 本地组件容器编排
+│   ├── login_setup.py        # 浏览器自动化持久化登录引导脚本
 │   ├── manage_memory.py      # Milvus 长期记忆查看与清理工具
-│   ├── migrate_to_mysql.py   # 数据迁移至 MySQL
-│   ├── test_hitl_replay_safety.py  # HITL 重放幂等性与节点重复执行单测
-│   ├── hitl_replay_repro.py  # 中断恢复回归脚本
-│   ├── test_http_image.py    # 图片处理测试
-│   └── archive/              # 历史一次性验证脚本归档（不保证能运行）
-├── docs/migration/           # 架构迁移历史文档
+│   └── migrate_to_mysql.py   # 数据迁移至 MySQL
 ├── storage/                  # 运行时持久化目录（Milvus DB、浏览器配置等，已忽略）
 ├── workspace/                # FileAgent 操作工作区（已忽略）
 ├── bot.py                    # NoneBot2 QQ 机器人启动入口
 ├── main.py                   # 本地控制台多轮对话入口
 ├── config.py                 # 全局配置中心
+├── mcp_servers.json          # MCP 服务配置
 ├── pyproject.toml            # 依赖与项目元数据 (uv)
 └── .env.example              # 环境变量配置模板
 ```
@@ -81,17 +85,23 @@ uv sync
 
 ### 4.2 配置环境变量
 参考 `.env.example` 在根目录下创建 `.env` 文件并填入相应 API 密钥：
-- `GEMINI_API_KEY`（或 `GOOGLE_API_KEY`）：必填，Gemini 3.5 模型 API 密钥。
+- `GEMINI_API_KEY`（或 `GOOGLE_API_KEY`）：必填，Gemini 模型 API 密钥。
 - `AMAP_API_KEY`：高德地图 Web 服务 API Key。
 - `TAVILY_API_KEY`：Tavily 搜索 API Key。
 - `SILICON_FLOW_API_KEY`：硅基流动 Embedding / Reranker API Key。
 - `HUGGINGFACEHUB_API_TOKEN`：Hugging Face 访问令牌。
 
-### 4.3 基础服务组件用途
-- **Docker**: 供 `CodeAgent` 启动轻量 Python 沙箱容器 (`python-ds:latest`) 安全运行任意代码。
-- **Neo4j**: 提供知识图谱存储与 Cypher 关系查询，供 `MediaAgent` 使用。
-- **MySQL**: 存储女优与作品结构化关系数据，供 `SQLAgent` 精确筛选查询。
-- **Milvus (Milvus-Lite)**: 本地单机向量数据库，用于知识库检索 (`rag`) 以及用户跨会话长期记忆存储。
+### 4.3 基础服务组件与启动
+- **Docker Compose 一键启动**:
+  从项目根目录执行以下命令启动后台依赖容器（Neo4j / Milvus / MinIO / Etcd）：
+  ```bash
+  docker compose --env-file .env -f scripts/docker-compose.yml up -d
+  ```
+- **各组件用途说明**:
+  - **Docker**: 供 `CodeAgent` 启动轻量 Python 沙箱容器 (`python-ds:latest`) 安全运行任意代码。
+  - **Neo4j**: 提供知识图谱存储与 Cypher 关系查询，供 `MediaAgent` 使用。
+  - **MySQL**: 存储女优与作品结构化关系数据，供 `SQLAgent` 精确筛选查询。
+  - **Milvus (Milvus-Lite)**: 本地单机向量数据库，用于知识库检索 (`rag`) 以及用户跨会话长期记忆存储。
 
 ---
 
@@ -121,8 +131,8 @@ uv run python scripts/chat_cli.py --user 111
 - **单聊**与**不同群聊**中，同一个真实用户对应的 openid 可能各不相同。
 - **设置方法**：
   1. 启动机器人并先在私聊或群聊中发送任意测试消息。
-  2. 观察控制台输出的日志：`[chat] 收到来自用户: <user_id> 的消息`。
-  3. 将该 `<user_id>` 填入 `.env` 中的 `OWNER_QQ_IDS`（多个 ID 用半角逗号分隔），例如：
+  2. 观察控制台输出的日志：`[chat] user_id=<id>`。
+  3. 将该 `<id>` 填入 `.env` 中的 `OWNER_QQ_IDS`（多个 ID 用半角逗号分隔），例如：
      ```bash
      OWNER_QQ_IDS="ABCD1234EFGH,IJKL5678MNOP"
      ```
@@ -132,7 +142,7 @@ uv run python scripts/chat_cli.py --user 111
 
 ## 7. HITL 人工授权说明
 
-在特权模式下，当 `FileAgent` 或 `DesktopAgent` 尝试执行高危操作（如写文件、重命名文件、创建目录、执行高危系统按键）时，系统会自动挂起并弹出授权请求：
+在特权模式下，当 `FileAgent` 或 `DesktopAgent` 尝试执行高危操作（如写文件、编辑文件、移动文件、执行高危系统按键）时，系统会自动挂起并弹出授权请求：
 ```text
 ⚠️ 敏感操作授权拦截
 ──────────────────
@@ -146,16 +156,17 @@ uv run python scripts/chat_cli.py --user 111
 
 ---
 
-## 8. 测试脚本说明
+## 8. 工具与测试脚本说明
 
-- `scripts/test_hitl_replay_safety.py`：单测套件，验证 LangGraph 在单步 HITL 中断恢复时不会重复执行已批准的安全/危险工具调用。
-- `scripts/hitl_replay_repro.py`：微型重现脚本，用于复现与比对 LangGraph 中断恢复节点的执行次数。
+- `scripts/chat_cli.py`：命令行多轮对话终端，脱离 QQ 测试 Agent 交互与 HITL 授权流程。
 - `scripts/manage_memory.py`：管理 Milvus 长期记忆库，支持 `list` 查看与 `delete <id>` 删除。
+- `scripts/migrate_to_mysql.py`：从 `data/graphrag/*.jsonl` 导入演员与作品结构化数据至 MySQL。
+- `scripts/login_setup.py`：浏览器自动化持久化登录引导脚本，支持传入一个或多个目标 URL（默认 B站），在弹出的有头浏览器中完成登录并保存 Cookie/Profile。
 
 ---
 
 ## 9. 已知限制
 
 1. **DesktopAgent 不稳定**: 桌面操作依赖网格视觉识别，受分辨率和缩放比例影响较大，可能存在点击漂移。
-2. **受限版专家权限**: 当前受限版仅去除了 `FileAgent` 和 `DesktopAgent`，仍然挂载了 `MediaAgent`、`SQLAgent` 与 `CodeAgent`。
+2. **受限版专家权限**: 受限版不挂载 `FileAgent`、`DesktopAgent`、`BrowserAgent`，普通用户仅可使用知识检索、图谱检索、高德地图、代码沙箱执行和数据库查询等非特权专家。
 3. **MemorySaver 会话重启丢失**: 当前状态保存器为内存级 `MemorySaver`，机器人进程重启后进行中的上下文与未决 HITL 中断会丢失。长期事实依赖 Milvus 后台抽取持久化。

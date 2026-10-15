@@ -115,13 +115,13 @@ def _load_mcp_config() -> dict:
 def _is_path_safe(path_str: str) -> bool:
     """判断路径是否在 WORKSPACE_DIR 范围内（防止 ../ 路径逃逸）。
 
-    使用 os.path.realpath 解析符号链接后再做前缀比较。
+    使用 os.path.realpath 解析符号链接后再通过 commonpath 校验。
     """
     try:
         real = os.path.realpath(os.path.join(_WORKSPACE_REAL, path_str))
-    except Exception:
+        return os.path.commonpath([_WORKSPACE_REAL, real]) == _WORKSPACE_REAL
+    except (ValueError, Exception):
         return False
-    return real.startswith(_WORKSPACE_REAL)
 
 
 def _check_filesystem_args(tool_name: str, tool_input: dict) -> Optional[str]:

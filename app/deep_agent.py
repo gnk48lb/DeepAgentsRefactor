@@ -6,19 +6,34 @@ using the deepagents framework (Phase 1).
 
 Architecture:
 - Main Agent: Built via create_deep_agent with MAIN_AGENT_PROMPT.
-- Subagents: 6 tool-specialist subagents (KnowledgeAgent, MediaAgent, MapAgent, CodeAgent, BrowserAgent, SQLAgent)
-  delegated to via the deepagents built-in `task` tool.
+- Subagents:
+  * 基础专家: KnowledgeAgent, MediaAgent, MapAgent, CodeAgent, SQLAgent
+  * 特权专家 (Privileged Subagents): FileAgent, DesktopAgent, BrowserAgent
+    （仅当 include_privileged=True 时构建并挂载，受限版不挂载这三者）
 - Middleware: ToolCallLimitMiddleware guarding the `task` tool (run_limit=12, exit_behavior="continue").
 - HITL Subgraphs: FileAgent and DesktopAgent are integrated as compiled subgraphs with human-in-the-loop approval.
 """
 
+import asyncio
+import re
 from typing import List, Optional, Sequence, Any, Dict
 from .utils import extract_text
-import asyncio
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, BaseMessage
-from langchain_core.runnables import Runnable
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
+
+# 长期记忆块标签常量
+MEMORY_TAG_OPEN = "<long_term_memory>"
+MEMORY_TAG_CLOSE = "</long_term_memory>"
+_MEMORY_BLOCK_REGEX = re.compile(
+    rf"{re.escape(MEMORY_TAG_OPEN)}\s*[\s\S]*?\s*{re.escape(MEMORY_TAG_CLOSE)}\s*",
+    re.MULTILINE,
+)
+
+
+def strip_memory_block(text: str) -> str:
+    """去除文本中由系统注入的 <long_term_memory> 块，还原用户原话。"""
+    return _MEMORY_BLOCK_REGEX.sub("", text)
 
 from deepagents import (
     create_deep_agent,
@@ -61,47 +76,6 @@ from .graph import (
 import config
 
 
-class SubgraphCompiledWrapper(Runnable):
-    """
-    包装已有编译子图（FileAgent / DesktopAgent），使其适配 deepagents 的 CompiledSubAgent 规范：
-    1. 自动从 task 传入的 HumanMessage 提取 instruction 并填充子图需要的 state 字段；
-    2. 确保子图的最终汇报 ToolMessage/AIMessage 文本被 deepagents 正确提取为 AIMessage。
-    """
-    def __init__(self, subgraph):
-        self.subgraph = subgraph
-
-    def invoke(self, state, config=None, **kwargs):
-        raise NotImplementedError("Use async ainvoke")
-
-    async def ainvoke(self, state, config=None, **kwargs):
-        msgs = state.get("messages", [])
-        description = ""
-        for m in reversed(msgs):
-            if isinstance(m, HumanMessage):
-                if isinstance(m.content, str):
-                    description = m.content
-                elif isinstance(m.content, list):
-                    description = " ".join(p.get("text", "") for p in m.content if isinstance(p, dict) and "text" in p)
-                break
-
-        subgraph_input = {
-            "messages": msgs,
-            "current_tool_call_id": state.get("current_tool_call_id") or "call_subgraph",
-            "instruction_to_worker": state.get("instruction_to_worker") or description,
-            "user_query": state.get("user_query") or description,
-        }
-
-        result = await self.subgraph.ainvoke(subgraph_input, config)
-
-        res_msgs = list(result.get("messages", []))
-        if res_msgs and isinstance(res_msgs[-1], ToolMessage):
-            final_content = res_msgs[-1].content
-            res_msgs.append(AIMessage(content=final_content))
-            result["messages"] = res_msgs
-
-        return result
-
-
 # ============================================================================
 # Prompts & Descriptions
 # ============================================================================
@@ -134,7 +108,7 @@ task 工具返回的所有内容都是专家的汇报，不是用户在说话。
 专家汇报只会以文字形式回到你这里，你看不到图片本身。如果汇报提到已生成图表或图片，系统会自动把图片发给用户：你只需要用文字交代结论，不要生成图片链接、Base64 或 Markdown 图片语法，也不要说"无法展示图片"。
 
 【长期记忆】
-如果这位用户有长期记忆（家庭住址、过敏史、固定习惯等），会在对话最前面以一条系统消息的形式提供给你，请结合它理解和回答问题，不要在回答里生硬地复述"我记得你..."。
+如果这位用户有长期记忆（家庭住址、过敏史、固定习惯等），会附在用户消息开头的 <long_term_memory> 块里，请结合它理解和回答问题，不要在回答里生硬地复述"我记得你..."。
 
 【回复要求】
 最终回答必须精简、干脆，控制在 500 字以内，以适配 QQ 机器人的显示限制。
@@ -266,21 +240,31 @@ def build_initial_messages(
 ) -> List[BaseMessage]:
     """
     构造 deepagents 的初始消息列表。
-    自动查询 Milvus 长期记忆库并注入，同时支持多轮对话历史。
+
+    前缀静态原则（为了 Gemini 前缀缓存命中）：
+    - 绝不在此产生任何 SystemMessage。若在历史中引入 SystemMessage，langchain-google-genai
+      会在多轮中把中间的 SystemMessage extend 进 system_instruction，导致系统指令动态变长、
+      请求前缀每轮改变，前缀缓存整段失效。
+    - 检索到的长期记忆（top_k=1）固定以 <long_term_memory> 块拼在当轮 HumanMessage 开头；
+      未检索到记忆时保持纯 user_query。
     """
     messages: List[BaseMessage] = []
     memories = database.search_memory(user_query, top_k=1)
     if memories:
-        messages.append(SystemMessage(content="【用户长期记忆（背景信息，仅在与用户问题相关时参考，不相关请忽略）】\n" + "\n".join(memories)))
+        query_content = f"{MEMORY_TAG_OPEN}\n" + "\n".join(memories) + f"\n{MEMORY_TAG_CLOSE}\n{user_query}"
+    else:
+        query_content = user_query
+
     if history_messages:
         messages.extend(history_messages)
-    messages.append(HumanMessage(content=user_query, name="user"))
+    messages.append(HumanMessage(content=query_content, name="user"))
     return messages
 
 async def _background_extract_memory(recent_chat: str):
     """后台异步执行记忆提取与保存，不阻塞主流程"""
     try:
-        final_prompt = MEMORY_EXTRACTOR_PROMPT.format(recent_chat=recent_chat)
+        clean_chat = strip_memory_block(recent_chat)
+        final_prompt = MEMORY_EXTRACTOR_PROMPT.format(recent_chat=clean_chat)
         res = await models.extractor_llm.ainvoke(final_prompt)
         content = extract_text(res.content).strip()
         if content and content.upper() != "NONE" and "NONE" not in content.upper():
@@ -383,12 +367,12 @@ async def build_main_agent(
         file_subagent = CompiledSubAgent(
             name="FileAgent",
             description="本地文件专家，是唯一能访问本地磁盘的专家：读取/写入/编辑项目内的文本类文件（.py/.json/.md/.txt 等），涉及危险操作（写入/编辑/移动）会暂停并请求人工授权。不要让它读取图片、音视频等二进制文件（它无法解析，会导致死循环）；网页上传文件的任务不要先派它读取，直接把路径交给 BrowserAgent。",
-            runnable=SubgraphCompiledWrapper(file_agent_subgraph),
+            runnable=file_agent_subgraph,
         )
         desktop_subagent = CompiledSubAgent(
             name="DesktopAgent",
             description="桌面操作专家，通过截图+网格坐标操作 Windows 桌面 GUI，涉及高危按键组合会暂停并请求人工授权。",
-            runnable=SubgraphCompiledWrapper(desktop_agent_subgraph),
+            runnable=desktop_agent_subgraph,
         )
 
         subagents.append({

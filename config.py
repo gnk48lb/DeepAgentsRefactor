@@ -12,9 +12,8 @@ SILICON_FLOW_API_KEY = os.getenv("SILICON_FLOW_API_KEY")
 
 # Workspace / Filesystem MCP 配置
 # 默认为当前工作目录下的 workspace 文件夹，允许通过 .env 中的 WORKSPACE_DIR 覆盖
-WORKSPACE_DIR = os.getenv(
-    "WORKSPACE_DIR",
-    os.path.join(os.path.abspath(os.path.dirname(__file__)), "workspace")
+WORKSPACE_DIR = os.getenv("WORKSPACE_DIR") or os.path.join(
+    os.path.abspath(os.path.dirname(__file__)), "workspace"
 )
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
@@ -25,26 +24,26 @@ if TAVILY_API_KEY:
     os.environ["TAVILY_API_KEY"] = TAVILY_API_KEY
 
 # Milvus Configuration
-KNOWLEDGE_COLLECTION_NAME = os.getenv("MILVUS_COLLECTION_NAME", "knowledge")
-MEDIA_COLLECTION_NAME = os.getenv("MILVUS_MEDIA_COLLECTION_NAME", "av_works")
-MEMORY_COLLECTION_NAME = os.getenv("MILVUS_MEMORY_COLLECTION_NAME", "user_memory")
+KNOWLEDGE_COLLECTION_NAME = os.getenv("MILVUS_COLLECTION_NAME") or "knowledge"
+MEDIA_COLLECTION_NAME = os.getenv("MILVUS_MEDIA_COLLECTION_NAME") or "av_works"
+MEMORY_COLLECTION_NAME = os.getenv("MILVUS_MEMORY_COLLECTION_NAME") or "user_memory"
 
 # Milvus Local DB Path (Reads from MILVUS_DB_PATH to avoid environment variable naming conflict with PyMilvus legacy system)
-MILVUS_DB_PATH = os.getenv("MILVUS_DB_PATH", "storage/gnk48_agent_collection.db")
+MILVUS_DB_PATH = os.getenv("MILVUS_DB_PATH") or "storage/gnk48_agent_collection.db"
 
 # MySQL Configuration (Pre-configured for future Text-to-SQL integration)
-MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
-MYSQL_PORT = os.getenv("MYSQL_PORT", "8964")
-MYSQL_USER = os.getenv("MYSQL_USER", "root")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "8964")
-MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "my_database")
+MYSQL_HOST = os.getenv("MYSQL_HOST") or "localhost"
+MYSQL_PORT = os.getenv("MYSQL_PORT") or "8964"
+MYSQL_USER = os.getenv("MYSQL_USER") or "root"
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD") or "8964"
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE") or "av_db"
 
 MYSQL_URL = f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}"
 
 # Neo4j Configuration
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
+NEO4J_URI = os.getenv("NEO4J_URI") or "bolt://localhost:7687"
+NEO4J_USER = os.getenv("NEO4J_USER") or "neo4j"
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD") or "password"
 
 # Model Configuration
 EMBEDDING_MODEL = "BAAI/bge-m3"
@@ -66,7 +65,7 @@ BROWSER_VLM_MODEL = "gemini-3.5-flash-lite"
 DESKTOP_VLM_MODEL = "gemini-3.5-flash-lite"
 
 # 记忆提取模型 (Memory Extraction)
-EXTRACTOR_LLM_MODEL = os.getenv("EXTRACTOR_LLM_MODEL", "gemini-3.1-flash-lite")
+EXTRACTOR_LLM_MODEL = os.getenv("EXTRACTOR_LLM_MODEL") or "gemini-3.1-flash-lite"
 
 # SiliconFlow 相关配置 (暂时注释)
 SILICON_FLOW_BASE_URL = "https://api.siliconflow.cn/v1"
@@ -87,5 +86,5 @@ CLEAR_MEMORY_ON_STARTUP = False # 是否在启动时清空长期记忆集合
 REFRESH_BM25 = False # 手动触发 BM25 模型的重新拟合与旧数据稀疏向量的局部更新
 
 # 权限配置：主人 QQ 号列表（英文逗号分隔）
-OWNER_QQ_IDS = {x.strip() for x in os.getenv("OWNER_QQ_IDS", "").split(",") if x.strip()}
+OWNER_QQ_IDS = {x.strip() for x in (os.getenv("OWNER_QQ_IDS") or "").split(",") if x.strip()}
 

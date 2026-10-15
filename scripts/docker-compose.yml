@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   # --- Neo4j 核心数据库 ---
   neo4j:
@@ -9,7 +7,7 @@ services:
       - "7474:7474"
       - "7687:7687"
     environment:
-      NEO4J_AUTH: neo4j/2501342338
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?请在 .env 中设置}
       NEO4J_server_memory_heap_initial__size: 256M
       NEO4J_server_memory_heap_max__size: 512M
       NEO4J_server_memory_pagecache_size: 256M
@@ -23,7 +21,7 @@ services:
       - neo4j_plugins:/plugins
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "2501342338", "RETURN 1"]
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:?请在 .env 中设置}", "RETURN 1"]
       interval: 10s
       timeout: 5s
       retries: 10

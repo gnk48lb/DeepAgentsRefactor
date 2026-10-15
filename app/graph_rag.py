@@ -1,5 +1,7 @@
+import atexit
 import logging
-from typing import List, Dict
+import threading
+from typing import List, Dict, Optional
 from .database import get_client, execute_hybrid_search, rerank_candidates
 from .transforms import MediaQueryTranslator
 import config
@@ -11,6 +13,7 @@ class MediaGraphRetriever:
     def __init__(self):
         from neo4j import GraphDatabase
         self.neo4j_driver = GraphDatabase.driver(config.NEO4J_URI, auth=(config.NEO4J_USER, config.NEO4J_PASSWORD))
+        atexit.register(self.close)
         self.client = get_client()
         self.collection_name = config.MEDIA_COLLECTION_NAME
         self.initialized = False
@@ -30,6 +33,16 @@ class MediaGraphRetriever:
                 logger.warning(f"Failed to load av_bm25_model.json: {e}")
 
         self.translator = MediaQueryTranslator()
+
+    def close(self):
+        """关闭 Neo4j 驱动连接"""
+        if getattr(self, "neo4j_driver", None) is not None:
+            try:
+                self.neo4j_driver.close()
+            except Exception as e:
+                logger.warning(f"Failed to close Neo4j driver: {e}")
+            finally:
+                self.neo4j_driver = None
 
     def search(self, query: str) -> str:
         if not self.initialized:
@@ -137,6 +150,30 @@ class MediaGraphRetriever:
                 "text": entity.get("text", "")
             })
         return candidates
+
+
+_retriever_lock = threading.Lock()
+_cached_media_retriever: Optional[MediaGraphRetriever] = None
+
+
+def get_media_retriever() -> MediaGraphRetriever:
+    """获取 MediaGraphRetriever 单例。
+
+    只有 initialized 为 True 才缓存，未初始化时每次新建以支持重试。
+    """
+    global _cached_media_retriever
+    if _cached_media_retriever is not None:
+        return _cached_media_retriever
+
+    with _retriever_lock:
+        if _cached_media_retriever is not None:
+            return _cached_media_retriever
+
+        retriever = MediaGraphRetriever()
+        if retriever.initialized:
+            _cached_media_retriever = retriever
+        return retriever
+
 
 if __name__ == "__main__":
     from .database import MediaDataBuilder
