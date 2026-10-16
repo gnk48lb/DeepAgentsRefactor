@@ -109,3 +109,8 @@ MCP_CALL_TIMEOUT_SECONDS = 60
 # 各服务启动时拉取工具的最大允许等待时间，超时按启动失败处理
 MCP_STARTUP_TIMEOUT_SECONDS = 180
 
+# 网页抓取与 B 站个人主页抓取文本上限
+# 依据：deepagents 中间件会对超过约 8 万字符的工具结果落盘到 state['files'] 导致 checkpoint 膨胀
+WEBPAGE_MAX_CHARS = 30000
+BILI_PROFILE_MAX_CHARS = 8000
+

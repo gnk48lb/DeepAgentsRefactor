@@ -275,12 +275,20 @@ from .browser_service import fetch_generic_webpage_content, fetch_bilibili_profi
 @tool
 async def read_webpage_content(url: str) -> str:
     """用于分析普通网页、读取新闻/文章内容、总结网页。当用户扔来一个网页链接并要求“总结这个网页”、“这个网页说了什么”时，必须优先调用此工具。注意：输入必须是完整的 URL。"""
-    return await fetch_generic_webpage_content(url)
+    content = await fetch_generic_webpage_content(url)
+    max_chars = getattr(config, "WEBPAGE_MAX_CHARS", 30000)
+    if len(content) > max_chars:
+        return f"{content[:max_chars]}\n…（内容过长，已截断至前 {max_chars} 字符）"
+    return content
 
 @tool
 async def get_bilibili_profile(uid: str) -> str:
     """专门用于获取B站(bilibili)用户的个人主页资料和近期动态。当用户要求“总结这个B站个人主页”、“分析这个B站UP主”时调用。输入必须是从链接中提取的纯数字 UID。"""
-    return await fetch_bilibili_profile_data(uid)
+    content = await fetch_bilibili_profile_data(uid)
+    max_chars = getattr(config, "BILI_PROFILE_MAX_CHARS", 8000)
+    if len(content) > max_chars:
+        return f"{content[:max_chars]}\n…（内容过长，已截断至前 {max_chars} 字符）"
+    return content
 
 @tool
 async def execute_complex_browser_action(instruction: str) -> str:
