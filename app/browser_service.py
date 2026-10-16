@@ -38,6 +38,15 @@ async def init_browser():
 
 # browser_service.py
 
+BROWSER_ACTION_RULES = (
+    "【⚠️ 动态网页操作红线准则】：\n"
+    "1. 【严禁原地复读】：如果执行 click 或 input 工具后提示 Element index not available（索引不可用）或没有任何反应，绝对禁止在下一步重复尝试同一个 index！\n"
+    "2. 【自救策略】：一旦遇到索引失效、网页无响应或被弹窗遮挡，你必须立即采取以下行动之一：\n"
+    "   - 尝试使用 scroll_to_element 或主动滚动页面刷新视图。\n"
+    "   - 放弃盲目点击 index，直接改用 evaluate 动作编写一小段强力的 JavaScript 代码进行文本精准匹配点击（例如：document.querySelectorAll('span').find(el => el.textContent.includes('原创')).click()）。\n"
+    "3. 【处理弹窗】：上传完封面或勾选协议时，网页常会弹出“确认/确定”的蒙版遮罩弹窗。你必须优先寻找并点击该弹窗中的“确定”按钮（若点击失效，用 JS evaluate 强行清除或点击），直到弹窗彻底消失，才能去操作底部的后续按钮（如“提交稿件”）。"
+)
+
 async def run_browser_task(task_description: str, llm) -> str:
     """
     运行 BrowserAgent 任务
@@ -50,7 +59,6 @@ async def run_browser_task(task_description: str, llm) -> str:
             browser_llm = ChatGoogle(
                 model=config.BROWSER_VLM_MODEL,
                 api_key=config.GEMINI_API_KEY,
-                temperature=0
             )
         else:
             raise ValueError("BROWSER_VLM_MODEL 必须是 Gemini 模型")
@@ -62,13 +70,12 @@ async def run_browser_task(task_description: str, llm) -> str:
         workspace_raw = config.WORKSPACE_DIR
         workspace_abs = os.path.abspath(workspace_raw)
         
-        # ⭐【核心修复】：直接在任务文本中，把所有相对路径强行替换为绝对路径！
-        # 这样 AI 读到的指令就是“上传 d:\code\...”，调用工具时也会用绝对路径，彻底根治浏览器文件读取失败
-        task_description_abs = task_description
-        if "workspace\\" in task_description_abs:
-            task_description_abs = task_description_abs.replace("workspace\\", workspace_abs + "\\")
-        if "workspace/" in task_description_abs:
-            task_description_abs = task_description_abs.replace("workspace/", workspace_abs + "/")
+        # ⭐【核心修复】：仅将相对路径形式的 workspace 替换为绝对路径
+        task_description_abs = re.sub(
+            r"(?<![\w:/\\.])workspace([\\/])",
+            lambda m: workspace_abs + m.group(1),
+            task_description,
+        )
 
         print(f"[BrowserService] 📝 任务描述中的路径已全自动绝对化:\n-> {task_description_abs}")
 
@@ -87,12 +94,13 @@ async def run_browser_task(task_description: str, llm) -> str:
                 
         final_whitelist = list(set(cleaned_paths))
 
-        # 实例化 Agent，传入被绝对化后的任务文本
+        # 实例化 Agent，传入被绝对化后的任务文本与底层操作规则
         agent = Agent(
             task=task_description_abs,  # 👈 完美的绝对路径任务
             llm=browser_llm,
             browser=browser,
-            available_file_paths=final_whitelist
+            available_file_paths=final_whitelist,
+            extend_system_message=BROWSER_ACTION_RULES,
         )
         
         result = await agent.run()

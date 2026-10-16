@@ -19,6 +19,8 @@ logging.getLogger("google").setLevel(logging.WARNING)
 logging.getLogger("google_genai").setLevel(logging.WARNING)
 logging.getLogger("langchain_google_genai").setLevel(logging.WARNING)
 
+logger = logging.getLogger(__name__)
+
 # --- Embedding & Reranking Models ---
 
 SILICONFLOW_EMBEDDING_TIMEOUT = 60
@@ -102,11 +104,17 @@ class SiliconFlowReranker:
             timeout=SILICONFLOW_RERANK_TIMEOUT,
         )
         data = resp.json()
+        if "results" not in data:
+            logger.warning(
+                f"[SiliconFlowReranker] API 未返回 results (状态码 {resp.status_code}): "
+                f"{data.get('message', '未知错误')}"
+            )
+            return [0.0] * len(pairs)
         
         # SiliconFlow 返回格式: {"results": [{"index": 0, "relevance_score": 0.9}, ...]}
         # 需要还原到原始 list 的顺序
         scores = [0.0] * len(pairs)
-        for item in data.get("results", []):
+        for item in data["results"]:
             scores[item["index"]] = item["relevance_score"]
         return scores
 
@@ -120,42 +128,36 @@ if not config.GEMINI_API_KEY:
 worker_llm = ChatGoogleGenerativeAI(
     model=config.WORKER_LLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
-    temperature=0
 )
 
 # Initialize Supervisor LLM (Text only)
 supervisor_llm = ChatGoogleGenerativeAI(
     model=config.SUPERVISOR_LLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
-    temperature=0
 )
 
 # Initialize Browser VLM
 browser_vlm = ChatGoogleGenerativeAI(
     model=config.BROWSER_VLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
-    temperature=0
 )
 
 # Initialize Desktop VLM
 desktop_llm = ChatGoogleGenerativeAI(
     model=config.DESKTOP_VLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
-    temperature=0
 )
 
 # Initialize VLM (Multimodal)
 vlm = ChatGoogleGenerativeAI(
     model=config.VLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
-    temperature=0
 )
 
 # Initialize Extractor LLM (Memory Extraction)
 extractor_llm = ChatGoogleGenerativeAI(
     model=config.EXTRACTOR_LLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
-    temperature=0
 )
 
 # --- Pydantic Models for Structured Output & RAG ---

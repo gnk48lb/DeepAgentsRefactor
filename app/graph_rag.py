@@ -172,6 +172,8 @@ def get_media_retriever() -> MediaGraphRetriever:
         retriever = MediaGraphRetriever()
         if retriever.initialized:
             _cached_media_retriever = retriever
+        else:
+            retriever.close()
         return retriever
 
 

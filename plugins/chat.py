@@ -1,4 +1,5 @@
 import base64
+import re
 import traceback
 from nonebot import on_message, get_driver
 from nonebot.adapters.qq.event import DirectMessageCreateEvent, MessageEvent
@@ -7,6 +8,14 @@ from nonebot.matcher import Matcher
 from nonebot.exception import FinishedException
 
 from app import chat_service
+
+_URL_REGEX = re.compile(r"(?:https?://|www\.)[^\s<>\"'）)】」》，。；、！？]+", re.IGNORECASE)
+
+def _strip_urls(text: str) -> str:
+    """对文本中的显式 URL 进行脱敏替换，避免 QQ 官方平台因域名白名单拒收消息"""
+    if not text:
+        return text
+    return _URL_REGEX.sub("（链接已省略）", text)
 
 driver = get_driver()
 
@@ -68,7 +77,7 @@ async def handle_chat(matcher: Matcher, event: MessageEvent | DirectMessageCreat
 
         out_msg = Message()
         if reply.text:
-            out_msg += MessageSegment.text(reply.text)
+            out_msg += MessageSegment.text(_strip_urls(reply.text))
         for img_item in reply.images:
             url = img_item.get("image_url", {}).get("url", "")
             if url:

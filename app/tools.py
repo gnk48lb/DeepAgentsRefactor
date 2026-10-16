@@ -1,7 +1,7 @@
 import re
 from langchain_core.tools import tool
 from .database import get_client, execute_hybrid_search, rerank_candidates
-from .graph_rag import MediaGraphRetriever, get_media_retriever
+from .graph_rag import get_media_retriever
 from datetime import datetime
 import config
 from . import models
@@ -203,7 +203,10 @@ def execute_sql(sql_query: str) -> str:
         with connection.cursor() as cursor:
             cursor.execute(sql_query)
             result = cursor.fetchall()
-            return str(result)
+            res_str = str(result)
+            if len(res_str) > 4000:
+                res_str = res_str[:4000] + "...（结果过长已截断，请加 LIMIT 或更精确的条件）"
+            return res_str
     except Exception as e:
         return f"Database Error: {type(e).__name__} - {str(e)}"
     finally:

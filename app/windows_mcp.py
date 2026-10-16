@@ -1,3 +1,4 @@
+import sys
 import ctypes
 import io
 import base64
@@ -10,7 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception as e:
-    print(f"DPI 设置失败 (非Windows 8.1+系统): {e}")
+    print(f"DPI 设置失败 (非Windows 8.1+系统): {e}", file=sys.stderr)
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.3 # 给 UI 响应时间

@@ -30,6 +30,7 @@ import traceback
 import json
 from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.types import Command
+from langgraph.errors import GraphRecursionError
 from app.utils import extract_text as _extract_text
 
 
@@ -123,6 +124,9 @@ async def run_agent(query: str, agent, config_dict: dict) -> str:
                             # 其他工具返回
                             print(f"\n🟢 \033[92m[{tool_name} 返回]\033[0m:\n{display}")
 
+    except GraphRecursionError as e:
+        print(f"\n⚠️ \033[93m[执行步骤超限]\033[0m: 这个任务步骤太多，我先停下了，可以拆成几步再试。({e})")
+        return "这个任务步骤太多，我先停下了，可以拆成几步再试。"
     except Exception as e:
         print(f"\n❌ \033[91m[Agent 执行异常/中断]\033[0m: {str(e)}")
         traceback.print_exc()
@@ -195,6 +199,9 @@ async def run_agent(query: str, agent, config_dict: dict) -> str:
                                 print(f"\n🟢 \033[92m[{tool_name} 返回]\033[0m:\n{display}")
 
             state = await agent.aget_state(config_dict)
+    except GraphRecursionError as e:
+        print(f"\n⚠️ \033[93m[执行步骤超限]\033[0m: 这个任务步骤太多，我先停下了，可以拆成几步再试。({e})")
+        return "这个任务步骤太多，我先停下了，可以拆成几步再试。"
     except Exception as hitl_err:
         print(f"⚠️ \033[93m[HITL 检查异常]\033[0m: {hitl_err}")
 
@@ -245,7 +252,7 @@ async def main_loop():
         agent = await deep_agent.build_main_agent()
 
         config_dict = {
-            "recursion_limit": 30,
+            "recursion_limit": config.AGENT_RECURSION_LIMIT,
             "configurable": {"thread_id": "console_deepagent_user"},
         }
 

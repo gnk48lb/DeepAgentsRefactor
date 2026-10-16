@@ -28,9 +28,8 @@ import docker
 import config
 from .loader import compress_image_to_base64
 
-# stdout / stderr 最大保留字符数（防止 LLM 上下文溢出）
+# stdout / stderr 最大保留字符数（保留头尾，防止 LLM 上下文溢出同时确保末尾 traceback 可见）
 _MAX_OUTPUT_CHARS = 1000
-_TRUNCATION_SUFFIX = "\n...(已截断)"
 
 # Docker 容器执行超时（秒）
 _TIMEOUT_SECONDS = 30
@@ -42,10 +41,13 @@ class SandboxResult(TypedDict):
     images: list  # list[str], base64 编码
 
 
-def _truncate(text: str) -> str:
-    """如果文本超过 _MAX_OUTPUT_CHARS，截取前段并附上截断提示。"""
-    if len(text) > _MAX_OUTPUT_CHARS:
-        return text[:_MAX_OUTPUT_CHARS] + _TRUNCATION_SUFFIX
+def _truncate(text: str, max_chars: int = _MAX_OUTPUT_CHARS) -> str:
+    """如果文本超过 max_chars（默认 1000），保留前 600 字符与后 400 字符，确保末尾 Traceback 不丢失。"""
+    if len(text) > max_chars:
+        head_len = int(max_chars * 0.6)
+        tail_len = max_chars - head_len
+        omitted = len(text) - head_len - tail_len
+        return f"{text[:head_len]}\n\n... [已省略中间 {omitted} 字符] ...\n\n{text[-tail_len:]}"
     return text
 
 

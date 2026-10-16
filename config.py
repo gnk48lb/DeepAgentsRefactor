@@ -88,3 +88,11 @@ REFRESH_BM25 = False # 手动触发 BM25 模型的重新拟合与旧数据稀疏
 # 权限配置：主人 QQ 号列表（英文逗号分隔）
 OWNER_QQ_IDS = {x.strip() for x in (os.getenv("OWNER_QQ_IDS") or "").split(",") if x.strip()}
 
+# QQ 回复最大字符数限制
+# 依据：官方未公布字符上限；实测 API 基本不拦，移动客户端折叠阈值最低约 15000（如 HarmonyOS 16000 起折叠），取 10000 留安全余量
+QQ_MAX_REPLY_CHARS = 10000
+
+# Agent 执行 recursion_limit（递归深度/超步限制）
+# 主图每次委派约占 3 个 superstep，子图 llm<->tools 工具调用各占 2 个 superstep；60 允许约 18 次委派或约 29 次子图工具调用
+AGENT_RECURSION_LIMIT = 60
+

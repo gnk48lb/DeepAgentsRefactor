@@ -9,6 +9,7 @@ import httpx
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.types import Command
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.errors import GraphRecursionError
 
 import config
 from app import database, deep_agent, outbox, models
@@ -180,7 +181,7 @@ async def process_message(user_id: str, text: str, image_url: Optional[str] = No
             agent = _select_agent(user_id)
             thread_id = str(user_id).strip()
             agent_config = {
-                "recursion_limit": 30,
+                "recursion_limit": config.AGENT_RECURSION_LIMIT,
                 "configurable": {"thread_id": thread_id},
             }
 
@@ -266,8 +267,8 @@ async def process_message(user_id: str, text: str, image_url: Optional[str] = No
 
             if not final_text:
                 final_text = "（没有生成回复）"
-            elif len(final_text) > 600:
-                final_text = final_text[:600] + "\n（内容过长已截断）"
+            elif len(final_text) > config.QQ_MAX_REPLY_CHARS:
+                final_text = final_text[:config.QQ_MAX_REPLY_CHARS] + "\n（内容过长已截断）"
 
             # 收集本轮发件箱图片
             round_images = outbox.current()
@@ -294,6 +295,13 @@ async def process_message(user_id: str, text: str, image_url: Optional[str] = No
                 awaiting_approval=False,
             )
 
+        except GraphRecursionError as e:
+            print(f"[WARN] 任务步骤超限 (GraphRecursionError): {e}")
+            return ChatReply(
+                text="这个任务步骤太多，我先停下了，可以拆成几步再试。",
+                images=[],
+                awaiting_approval=False,
+            )
         except Exception as e:
             traceback.print_exc()
             return ChatReply("处理时出了点问题，请稍后再试", [])

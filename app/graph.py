@@ -23,14 +23,14 @@ import config
 def _sanitize_messages_for_llm(messages: list) -> list:
     """
     统一脱敏函数：将消息列表中的多模态内容转换为所有 LLM 兼容的稳健格式。
+    保留消息的 additional_kwargs（含 thought_signature）、response_metadata、tool_calls 等关键元数据。
     """
     sanitized = []
     for msg in messages:
         # 提取核心内容
         content = getattr(msg, "content", "")
-        msg_name = getattr(msg, "name", None)
         
-        # 处理内容格式
+        # 处理内容格式（仅对 list 形式的多模态 content 做清洗，非 list 维持原样）
         if isinstance(content, list):
             clean_parts = []
             for item in content:
@@ -42,15 +42,11 @@ def _sanitize_messages_for_llm(messages: list) -> list:
                     clean_parts.append(item)
             content = clean_parts if clean_parts else ""
 
-        # 重构消息对象
-        if isinstance(msg, HumanMessage):
-            sanitized.append(HumanMessage(content=content, name=msg_name))
-        elif isinstance(msg, AIMessage):
-            sanitized.append(AIMessage(content=content, name=msg_name, tool_calls=getattr(msg, "tool_calls", [])))
-        elif isinstance(msg, ToolMessage):
-            sanitized.append(ToolMessage(content=str(content), tool_call_id=getattr(msg, "tool_call_id", ""), name=msg_name))
-        elif isinstance(msg, SystemMessage):
-            sanitized.append(SystemMessage(content=str(content)))
+        # 使用 model_copy 仅更新 content，保留其余所有元数据（thought_signature, tool_calls, id 等）
+        if hasattr(msg, "model_copy"):
+            sanitized.append(msg.model_copy(update={"content": content}))
+        else:
+            sanitized.append(msg)
             
     return sanitized
 
@@ -329,21 +325,28 @@ def _process_desktop_messages_for_llm(messages: list) -> list:
     for idx, msg in enumerate(messages):
         if isinstance(msg, ToolMessage) and getattr(msg, "name", None) == "take_grid_screenshot":
             if idx == last_screenshot_idx:
-                # 最新截图：短文本 ToolMessage + 紧随其后的带图 HumanMessage
-                processed.append(ToolMessage(
-                    content=LATEST_SCREENSHOT_TOOL_MESSAGE,
-                    tool_call_id=getattr(msg, "tool_call_id", ""),
-                    name=msg.name,
-                ))
-                base64_data = str(msg.content).strip()
+                raw_content = str(msg.content).strip()
+                base64_data = raw_content
                 if "base64," in base64_data:
                     base64_data = base64_data.split("base64,")[1]
                 base64_data = re.sub(r"\s+", "", base64_data)
-                img_url = f"data:image/jpeg;base64,{base64_data}"
-                processed.append(HumanMessage(content=[
-                    {"type": "text", "text": "[系统消息：以下是 DesktopAgent 获取的当前 Windows 屏幕带红色网格线坐标的截图，请通过该截图分析并确定你需要点击或操作的图标的 A1-Z16 坐标]"},
-                    {"type": "image_url", "image_url": {"url": img_url}},
-                ]))
+
+                # 判断是否为合法 base64（字母数字+/= 且长度 >= 100）
+                if bool(re.fullmatch(r"[A-Za-z0-9+/=]+", base64_data)) and len(base64_data) >= 100:
+                    # 最新截图且合法：短文本 ToolMessage + 紧随其后的带图 HumanMessage
+                    processed.append(ToolMessage(
+                        content=LATEST_SCREENSHOT_TOOL_MESSAGE,
+                        tool_call_id=getattr(msg, "tool_call_id", ""),
+                        name=msg.name,
+                    ))
+                    img_url = f"data:image/jpeg;base64,{base64_data}"
+                    processed.append(HumanMessage(content=[
+                        {"type": "text", "text": "[系统消息：以下是 DesktopAgent 获取的当前 Windows 屏幕带红色网格线坐标的截图，请通过该截图分析并确定你需要点击或操作的图标的 A1-Z16 坐标]"},
+                        {"type": "image_url", "image_url": {"url": img_url}},
+                    ]))
+                else:
+                    # 截图失败（如报错信息）：保持原 ToolMessage 文本不变，不追加带坏图片的 HumanMessage
+                    processed.append(msg)
             else:
                 # 历史截图：只保留固定占位文案 ToolMessage，不带图片
                 processed.append(ToolMessage(

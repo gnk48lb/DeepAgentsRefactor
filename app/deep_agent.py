@@ -16,9 +16,9 @@ Architecture:
 
 import asyncio
 import re
-from typing import List, Optional, Sequence, Any, Dict
+from typing import List, Optional
 from .utils import extract_text
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
+from langchain_core.messages import HumanMessage, BaseMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -112,6 +112,7 @@ task 工具返回的所有内容都是专家的汇报，不是用户在说话。
 
 【回复要求】
 最终回答必须精简、干脆，控制在 500 字以内，以适配 QQ 机器人的显示限制。
+网址/链接不要原样复制（QQ 会拒收含链接的消息），需要标注来源时只写站点或文章名称。
 最终回答使用纯文本，不要使用 Markdown 语法（不要 **加粗**、# 标题、代码围栏、行首的 * 列表符）；需要分点时写"1. 2. 3."或换行加"- "。专家汇报里的 Markdown 标记要去掉，但数据和数字必须原样保留。
 不要向用户提及内部专家或子 Agent 的名字（如 FileAgent、CodeAgent、MapAgent 等），需要说明时只说"我"或"系统"。
 不要向用户提及沙箱内部的文件路径（如 /workspace/outputs/...）；图片由系统另行发送，你只用文字交代结论。
@@ -170,13 +171,7 @@ BROWSER_AGENT_PROMPT = (
     + "2. 【特定局限】：只有当遇到 B站用户个人主页/空间链接（如含有 UID 或 space.bilibili.com）且任务是纯粹“查询/分析该UP主资料”时，才允许提取UID并调用 get_bilibili_profile。\n"
     + "3. 【强制执行】：当任务涉及“发布动态”、“发帖”、“上传文件/配图”、“点击”、“登录”、“签到”或输入文本等任何需要真人交互、改变网页状态的操作时，**必须且只能**调用 execute_complex_browser_action！\n"
     + "   - 严禁在调用工具前向主管口头汇报你的计划或分析文字！\n"
-    + "   - 直接将整个操作任务（包含用户提供的本地文件路径，如 'workspace/1.png'）作为全局 instruction 传入该工具，由真实的可见浏览器去执行完整的登录和上传流程。"
-    + "【⚠️ 动态网页操作红线准则 - 极端重要】：\n"
-    + "1. 【严禁原地复读】：如果执行 `click` 或 `input` 工具后提示 `Element index not available`（索引不可用）或没有任何反应，**绝对禁止**在下一步重复尝试同一个 index！\n"
-    + "2. 【自救策略】：一旦遇到索引失效、网页无响应或被弹窗遮挡，你必须立即采取以下行动之一：\n"
-    + "   - 尝试使用 `scroll_to_element` 滚动页面刷新视图。\n"
-    + "   - 放弃盲目点击 index，直接改用 `evaluate` 动作编写一小段强力的 JavaScript 代码进行文本精准匹配点击（例如：`document.querySelectorAll('span').find(el => el.textContent.includes('原创')).click()`）。\n"
-    + "3. 【处理弹窗】：上传完封面或勾选协议时，网页会弹出“确认/确定”的蒙版弹窗。你必须先优先寻找并点击这个弹窗里的“确定”按钮（如果点击失效，用 JS evaluate 强行清除或点击），直到弹窗彻底消失，才能去操作底部的“提交稿件”按钮！\n"
+    + "   - 直接将整个操作任务（包含用户提供的本地文件路径，如 'workspace/1.png'）作为全局 instruction 传入该工具，由真实的可见浏览器去执行完整的登录和上传流程。\n"
     + "4. 所有的发帖、配图交互任务必须直接调用 `execute_complex_browser_action` 进去炸街，严禁向主管口头画饼。"
 )
 
