@@ -67,53 +67,56 @@ async def main():
     print("输入 'exit' 或 'quit' 退出。")
     print("=" * 60)
 
-    await chat_service.init_service()
+    try:
+        await chat_service.init_service()
 
-    is_first = True
-    while True:
-        try:
-            prompt_str = f"\n[{user_id}] 请输入消息: "
-            user_input = await asyncio.to_thread(input, prompt_str)
-            user_input = user_input.strip()
+        is_first = True
+        while True:
+            try:
+                prompt_str = f"\n[{user_id}] 请输入消息: "
+                user_input = await asyncio.to_thread(input, prompt_str)
+                user_input = user_input.strip()
 
-            if not user_input:
-                continue
+                if not user_input:
+                    continue
 
-            if user_input.lower() in ("exit", "quit"):
-                print("👋 退出 CLI。")
+                if user_input.lower() in ("exit", "quit"):
+                    print("👋 退出 CLI。")
+                    break
+
+                current_img = first_image if is_first else None
+                is_first = False
+
+                if current_img:
+                    print(f"📷 附带图片: {current_img}")
+                    current_img = _local_image_to_data_uri(current_img)
+
+                reply = await chat_service.process_message(
+                    user_id=user_id,
+                    text=user_input,
+                    image_url=current_img,
+                )
+
+                if reply is None:
+                    print("🤖 [Reply]: (空)")
+                    continue
+
+                print("\n🤖 [Reply]:")
+                print(reply.text)
+                if reply.awaiting_approval:
+                    print("⚠️ [状态: 等待人工授权 (awaiting_approval=True)]")
+
+                if reply.images:
+                    print(f"📦 [收到 {len(reply.images)} 张图片]:")
+                    save_images(reply.images, user_id)
+
+            except (KeyboardInterrupt, EOFError):
+                print("\n👋 退出 CLI。")
                 break
-
-            current_img = first_image if is_first else None
-            is_first = False
-
-            if current_img:
-                print(f"📷 附带图片: {current_img}")
-                current_img = _local_image_to_data_uri(current_img)
-
-            reply = await chat_service.process_message(
-                user_id=user_id,
-                text=user_input,
-                image_url=current_img,
-            )
-
-            if reply is None:
-                print("🤖 [Reply]: (空)")
-                continue
-
-            print("\n🤖 [Reply]:")
-            print(reply.text)
-            if reply.awaiting_approval:
-                print("⚠️ [状态: 等待人工授权 (awaiting_approval=True)]")
-
-            if reply.images:
-                print(f"📦 [收到 {len(reply.images)} 张图片]:")
-                save_images(reply.images, user_id)
-
-        except (KeyboardInterrupt, EOFError):
-            print("\n👋 退出 CLI。")
-            break
-        except Exception as e:
-            print(f"❌ 运行出错: {e}")
+            except Exception as e:
+                print(f"❌ 运行出错: {e}")
+    finally:
+        await chat_service.shutdown_service()
 
 if __name__ == "__main__":
     asyncio.run(main())

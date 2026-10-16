@@ -96,3 +96,16 @@ QQ_MAX_REPLY_CHARS = 10000
 # 主图每次委派约占 3 个 superstep，子图 llm<->tools 工具调用各占 2 个 superstep；60 允许约 18 次委派或约 29 次子图工具调用
 AGENT_RECURSION_LIMIT = 60
 
+# 单轮 Agent 运行总时限（秒，含工具与子 Agent 调用）
+# 依据：防止外部接口卡死导致用户会话锁永不释放；人工授权等待不计入（interrupt 会让 ainvoke 立即返回）
+# 若主要在群聊使用，QQ 群被动回复窗口通常为 5 分钟，可调整为 280 左右
+AGENT_TURN_TIMEOUT_SECONDS = 600
+
+# MCP 单次工具调用超时（秒）
+# 若 MCP 服务进程卡死未返回，超过此时间将触发服务重启回收并报错
+MCP_CALL_TIMEOUT_SECONDS = 60
+
+# MCP 服务启动/连接等待超时（秒）
+# 各服务启动时拉取工具的最大允许等待时间，超时按启动失败处理
+MCP_STARTUP_TIMEOUT_SECONDS = 180
+

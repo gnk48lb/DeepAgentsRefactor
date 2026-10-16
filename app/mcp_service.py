@@ -13,11 +13,15 @@ import json
 import os
 import re
 import sys
+import asyncio
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import anyio
+from mcp.shared.exceptions import McpError
 from langchain_core.tools import BaseTool, StructuredTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
 
 import config
 
@@ -45,10 +49,12 @@ _CONFIG_PATH = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # 允许 FileAgent 访问的根目录（规范化绝对路径，方便前缀比较）
 _WORKSPACE_REAL = os.path.realpath(config.WORKSPACE_DIR)
 
-# ── 全局单例 ─────────────────────────────────────────────────────────────────
+# ── 全局单例与常驻 Runner ─────────────────────────────────────────────────────
 _mcp_client: Optional[MultiServerMCPClient] = None
 # 存储所有工具；每个工具对象均携带 __mcp_server__ 属性
 _all_mcp_tools: Optional[List[BaseTool]] = None
+# 服务名称 -> 专属后台 Runner
+_runners: Dict[str, "_ServerRunner"] = {}
 
 
 # ── 配置加载与占位符替换 ──────────────────────────────────────────────────────
@@ -163,6 +169,109 @@ def _truncate_if_needed(text: str, tool_name: str) -> str:
     return text
 
 
+# ── 常驻会话 Runner 与调用路由 ──────────────────────────────────────────────────
+
+def _format_exception(e: BaseException) -> str:
+    """递归展开 ExceptionGroup 的子异常，生成直观清晰的错误提示。"""
+    if isinstance(e, BaseExceptionGroup):
+        sub_msgs = [_format_exception(sub) for sub in e.exceptions]
+        return f"{type(e).__name__}: {e} [\n    " + "\n    ".join(sub_msgs) + "\n  ]"
+    return f"{type(e).__name__}: {e}"
+
+
+class _ServerRunner:
+    """每个 MCP 服务一个专属后台 task：会话的进入与退出都在同一个 task 内完成。"""
+
+    def __init__(self, name: str, client: MultiServerMCPClient):
+        self.name = name
+        self.client = client
+        self.tools: Dict[str, BaseTool] = {}  # 工具名 -> 绑定在当前活会话上的原始工具
+        self.ready = asyncio.Event()
+        self.last_error: Optional[BaseException] = None
+        self.generation = 0                   # 每次(重新)连接成功 +1
+        self._cmd: asyncio.Queue[str] = asyncio.Queue()  # "restart" / "stop"
+        self._restart_lock = asyncio.Lock()
+        self.task: Optional[asyncio.Task] = None
+
+    def start(self):
+        self.task = asyncio.create_task(self._run(), name=f"mcp-{self.name}")
+
+    async def _run(self):
+        while True:
+            self.ready.clear()
+            cmd = None
+            try:
+                async with self.client.session(self.name) as session:
+                    raw_tools = await load_mcp_tools(session)
+                    self.tools = {t.name: t for t in raw_tools}
+                    self.last_error = None
+                    self.generation += 1
+                    self.ready.set()
+                    cmd = await self._cmd.get()      # 阻塞到收到 restart / stop
+            except asyncio.CancelledError:
+                raise
+            except BaseException as e:               # 连接 / 初始化 / 运行时异常捕获
+                self.tools = {}
+                self.last_error = e
+                self.ready.set()
+                cmd = await self._cmd.get()
+
+            if cmd == "stop":
+                return
+
+    async def restart(self, seen_generation: int, timeout: float = 60.0) -> bool:
+        async with self._restart_lock:
+            if self.generation != seen_generation and self.ready.is_set() and self.tools:
+                return True                          # 别的调用方已抢先完成重连
+            if self.task is None or self.task.done():
+                return False
+            self.ready.clear()
+            await self._cmd.put("restart")
+            await asyncio.wait_for(self.ready.wait(), timeout)
+            return bool(self.tools)
+
+    async def stop(self, timeout: float = 10.0):
+        if self.task and not self.task.done():
+            await self._cmd.put("stop")
+            try:
+                await asyncio.wait_for(self.task, timeout)
+            except asyncio.TimeoutError:
+                self.task.cancel()
+                try:
+                    await self.task
+                except BaseException:
+                    pass
+
+
+async def _call_raw_tool(server_name: str, tool_name: str, tool_input: dict):
+    """从活会话 Runner 中取当前代原始工具执行，并在卡死或连接断开时自动恢复。"""
+    runner = _runners.get(server_name)
+    if runner is None:
+        raise RuntimeError(f"未找到 MCP 服务 '{server_name}' 的 Runner")
+
+    for attempt in (1, 2):
+        gen = runner.generation
+        raw = runner.tools.get(tool_name)
+        if raw is None:
+            err_detail = _format_exception(runner.last_error) if runner.last_error else "服务未就绪"
+            raise RuntimeError(f"MCP 服务 '{server_name}' 当前不可用: {err_detail}")
+        try:
+            return await asyncio.wait_for(raw.ainvoke(tool_input), config.MCP_CALL_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            await runner.restart(gen)        # 回收卡死的进程；本次调用不重试（可能已有副作用）
+            raise RuntimeError(
+                f"MCP 工具 '{tool_name}' 超过 {config.MCP_CALL_TIMEOUT_SECONDS}s 未返回，已重启 {server_name} 服务"
+            )
+        except (anyio.ClosedResourceError, anyio.BrokenResourceError):
+            if attempt == 2:
+                raise
+            await runner.restart(gen)        # 请求根本没发出去：重连后重试一次
+        except McpError as e:
+            if "closed" in str(e).lower():
+                await runner.restart(gen)    # 在途请求遇到连接断开：回收，但不重试
+            raise
+
+
 # ── 工具包装 ──────────────────────────────────────────────────────────────────
 
 def _clean_schema(schema: dict) -> dict:
@@ -247,8 +356,8 @@ def _wrap_tool(t: BaseTool, server_name: str) -> BaseTool:
                 if err:
                     return err
 
-            # ── 调用原始工具 ──────────────────────────────────────────────────
-            res = await t.ainvoke(tool_input)
+            # ── 调用原始工具（通过常驻会话 _call_raw_tool）─────────────────────
+            res = await _call_raw_tool(server_name, t.name, tool_input)
 
             # ── 列表结果展开为文本 ────────────────────────────────────────────
             if isinstance(res, list):
@@ -266,6 +375,8 @@ def _wrap_tool(t: BaseTool, server_name: str) -> BaseTool:
 
             return res
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return f"工具 '{t.name}' 执行出错: {e}"
 
@@ -284,13 +395,13 @@ def _wrap_tool(t: BaseTool, server_name: str) -> BaseTool:
     return wrapped
 
 
-# ── 初始化入口 ────────────────────────────────────────────────────────────────
+# ── 初始化与销毁入口 ─────────────────────────────────────────────────────────
 
 async def initialize_mcp() -> None:
     """初始化所有 MCP 服务并缓存已打标的工具列表。幂等：重复调用仅执行一次。"""
-    global _mcp_client, _all_mcp_tools
+    global _mcp_client, _all_mcp_tools, _runners
 
-    if _mcp_client is not None:
+    if _all_mcp_tools is not None:
         print("  MCP 已初始化，跳过。")
         return
 
@@ -304,25 +415,41 @@ async def initialize_mcp() -> None:
 
     print("  - 正在连接 MCP 服务器并拉取工具列表...")
 
-    # ── 逐服务拉取工具并打标 ──────────────────────────────────────────────────
-    # MultiServerMCPClient 的 get_tools() 返回所有服务工具的混合列表，
-    # 且通过 server_name= 参数可以只拉某个服务的工具，实现精准溯源。
+    # 为所有服务启动专属后台 runner
+    _runners = {}
+    for sname in server_names:
+        runner = _ServerRunner(sname, _mcp_client)
+        _runners[sname] = runner
+        runner.start()
+
+    # 并发等待就绪
+    async def _wait_runner(r: _ServerRunner):
+        try:
+            await asyncio.wait_for(r.ready.wait(), timeout=config.MCP_STARTUP_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            r.last_error = TimeoutError(f"启动连接超时（超过 {config.MCP_STARTUP_TIMEOUT_SECONDS} 秒）")
+            await r.stop()
+
+    await asyncio.gather(*(_wait_runner(r) for r in _runners.values()))
+
+    # 对成功的服务包装第一代工具
     all_wrapped: List[BaseTool] = []
     server_tool_counts: Dict[str, int] = {}
 
     for sname in server_names:
-        try:
-            # 只拉取该服务的工具
-            raw_tools: List[BaseTool] = await _mcp_client.get_tools(server_name=sname)
-            wrapped = [_wrap_tool(t, sname) for t in raw_tools]
+        runner = _runners[sname]
+        if runner.tools:
+            wrapped = [_wrap_tool(t, sname) for t in runner.tools.values()]
             all_wrapped.extend(wrapped)
             server_tool_counts[sname] = len(wrapped)
             print(f"    ✓ [{sname}] 获取到 {len(wrapped)} 个工具")
-        except Exception as e:
-            print(f"    ✗ [{sname}] 工具拉取失败：{e}", file=sys.stderr)
+        else:
+            err_msg = _format_exception(runner.last_error) if runner.last_error else "未知错误"
+            print(f"    ✗ [{sname}] 工具拉取失败：{err_msg}", file=sys.stderr)
             server_tool_counts[sname] = 0
 
     if not all_wrapped:
+        await shutdown_mcp()
         raise RuntimeError("未能从任何 MCP 服务器获取工具，请检查各服务是否正常启动。")
 
     _all_mcp_tools = all_wrapped
@@ -332,6 +459,23 @@ async def initialize_mcp() -> None:
     for sname in server_names:
         tools_of_server = [t for t in _all_mcp_tools if getattr(t, "__mcp_server__", "") == sname]
         print(f"  [{sname}] ({len(tools_of_server)} 个)：{', '.join(t.name for t in tools_of_server)}")
+
+
+async def shutdown_mcp() -> None:
+    """幂等关闭所有 MCP 服务并清空模块级状态。"""
+    global _mcp_client, _all_mcp_tools, _runners
+    if not _runners and _all_mcp_tools is None:
+        return
+
+    print("🛑 正在关闭所有 MCP 服务 Runner...")
+    runners_to_stop = list(_runners.values())
+    if runners_to_stop:
+        await asyncio.gather(*(r.stop() for r in runners_to_stop), return_exceptions=True)
+
+    _runners = {}
+    _all_mcp_tools = None
+    _mcp_client = None
+    print("✅ 所有 MCP 服务已安全关闭。")
 
 
 # ── 公开 API ──────────────────────────────────────────────────────────────────

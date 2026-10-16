@@ -314,6 +314,9 @@ async def main_loop():
     except Exception as e:
         traceback.print_exc()
         print(f"系统启动失败: {e}")
+    finally:
+        from app import mcp_service
+        await mcp_service.shutdown_mcp()
 
 if __name__ == "__main__":
     asyncio.run(main_loop())

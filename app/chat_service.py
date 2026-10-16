@@ -153,6 +153,17 @@ async def init_service() -> None:
 def is_initialized() -> bool:
     return _initialized
 
+async def shutdown_service() -> None:
+    """关闭系统服务并释放 MCP 资源"""
+    global _initialized, _owner_agent, _normal_agent
+    print("🛑 [chat_service] 正在关闭服务...")
+    from app import mcp_service
+    await mcp_service.shutdown_mcp()
+    _owner_agent = None
+    _normal_agent = None
+    _initialized = False
+    print("✅ [chat_service] 服务已关闭。")
+
 def _select_agent(user_id: str):
     owner_ids = getattr(config, "OWNER_QQ_IDS", set())
     if not owner_ids or str(user_id).strip() in owner_ids:
@@ -192,7 +203,10 @@ async def process_message(user_id: str, text: str, image_url: Optional[str] = No
                 if user_reply in ("Y", "N"):
                     resumed_outbox = _pending_outbox.pop(user_id, [])
                     outbox.resume(resumed_outbox)
-                    await agent.ainvoke(Command(resume=user_reply), agent_config)
+                    await asyncio.wait_for(
+                        agent.ainvoke(Command(resume=user_reply), agent_config),
+                        timeout=config.AGENT_TURN_TIMEOUT_SECONDS,
+                    )
                 else:
                     warning = _format_hitl_warning(current_state)
                     return ChatReply(
@@ -241,7 +255,10 @@ async def process_message(user_id: str, text: str, image_url: Optional[str] = No
                     processed_text,
                     user_id,
                 )
-                await agent.ainvoke({"messages": messages}, agent_config)
+                await asyncio.wait_for(
+                    agent.ainvoke({"messages": messages}, agent_config),
+                    timeout=config.AGENT_TURN_TIMEOUT_SECONDS,
+                )
 
             # 4. 一轮 ainvoke 结束后再次检查是否有中断
             after_state = await agent.aget_state(agent_config)
@@ -299,6 +316,14 @@ async def process_message(user_id: str, text: str, image_url: Optional[str] = No
             print(f"[WARN] 任务步骤超限 (GraphRecursionError): {e}")
             return ChatReply(
                 text="这个任务步骤太多，我先停下了，可以拆成几步再试。",
+                images=[],
+                awaiting_approval=False,
+            )
+        except asyncio.TimeoutError:
+            timeout_minutes = max(1, config.AGENT_TURN_TIMEOUT_SECONDS // 60)
+            print(f"[WARN] 任务运行超时 (超过 {config.AGENT_TURN_TIMEOUT_SECONDS} 秒)")
+            return ChatReply(
+                text=f"这次处理超过 {timeout_minutes} 分钟还没完成，我先停下了，可以换个说法或拆成几步再试。",
                 images=[],
                 awaiting_approval=False,
             )

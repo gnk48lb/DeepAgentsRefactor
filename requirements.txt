@@ -34,6 +34,7 @@ anyio==4.12.1
     #   mcp
     #   nonebot2
     #   openai
+    #   qqbot
     #   sse-starlette
     #   starlette
     #   watchfiles
@@ -124,9 +125,7 @@ fastapi==0.136.1
     #   nonebot2
     #   qqbot
 filelock==3.29.0
-    # via
-    #   huggingface-hub
-    #   torch
+    # via huggingface-hub
 filetype==1.2.0
     # via langchain-google-genai
 flatbuffers==25.12.19
@@ -136,9 +135,7 @@ frozenlist==1.8.0
     #   aiohttp
     #   aiosignal
 fsspec==2026.4.0
-    # via
-    #   huggingface-hub
-    #   torch
+    # via huggingface-hub
 google-api-core==2.29.0
     # via
     #   browser-use
@@ -204,7 +201,6 @@ httpx==0.28.1
     #   ollama
     #   openai
     #   qqbot
-    #   tavily-python
 httpx-sse==0.4.3
     # via
     #   langchain-community
@@ -219,7 +215,6 @@ huggingface-hub==1.14.0
     # via
     #   langchain-huggingface
     #   qqbot
-    #   sentence-transformers
     #   tokenizers
     #   transformers
 idna==3.19
@@ -233,16 +228,12 @@ inquirerpy==0.3.4
     # via browser-use
 jieba==0.42.1
     # via qqbot
-jinja2==3.1.6
-    # via torch
 jiter==0.14.0
     # via
     #   anthropic
     #   openai
 joblib==1.5.3
-    # via
-    #   nltk
-    #   scikit-learn
+    # via nltk
 jsonpatch==1.33
     # via langchain-core
 jsonpointer==3.1.1
@@ -271,7 +262,6 @@ langchain-core==1.6.2
     #   langchain-google-genai
     #   langchain-huggingface
     #   langchain-mcp-adapters
-    #   langchain-openai
     #   langchain-text-splitters
     #   langgraph
     #   langgraph-checkpoint
@@ -285,8 +275,6 @@ langchain-google-genai==4.3.7
 langchain-huggingface==1.2.2
     # via qqbot
 langchain-mcp-adapters==0.2.2
-    # via qqbot
-langchain-openai==1.1.9
     # via qqbot
 langchain-protocol==0.0.19
     # via
@@ -326,8 +314,6 @@ markdown-it-py==4.2.0
     # via rich
 markdownify==1.2.2
     # via browser-use
-markupsafe==3.0.3
-    # via jinja2
 marshmallow==3.26.2
     # via dataclasses-json
 mcp==1.26.0
@@ -343,8 +329,6 @@ milvus-lite==3.0
     #   qqbot
 mouseinfo==0.1.3
     # via pyautogui
-mpmath==1.3.0
-    # via sympy
 multidict==6.7.1
     # via
     #   aiohttp
@@ -353,8 +337,6 @@ mypy-extensions==1.1.0
     # via typing-inspect
 neo4j==6.2.0
     # via qqbot
-networkx==3.6.1
-    # via torch
 nltk==3.9.4
     # via qqbot
 nonebot-adapter-qq==1.6.7
@@ -371,10 +353,7 @@ numpy==2.4.4
     #   onnxruntime
     #   pandas
     #   pymilvus-model
-    #   scikit-learn
     #   scipy
-    #   sentence-transformers
-    #   torchvision
     #   transformers
 oauthlib==3.3.1
     # via requests-oauthlib
@@ -383,9 +362,7 @@ ollama==0.6.1
 onnxruntime==1.26.0
     # via pymilvus-model
 openai==2.16.0
-    # via
-    #   browser-use
-    #   langchain-openai
+    # via browser-use
 orjson==3.11.9
     # via
     #   langgraph-sdk
@@ -414,7 +391,6 @@ pillow==12.1.1
     #   qqbot
     #   qrcode-terminal
     #   reportlab
-    #   torchvision
 playwright==1.59.0
     # via qqbot
 portalocker==3.2.0
@@ -475,6 +451,7 @@ pydantic==2.12.5
     #   ollama
     #   openai
     #   pydantic-settings
+    #   qqbot
 pydantic-core==2.41.5
     # via
     #   browser-use-sdk
@@ -1295,7 +1272,6 @@ referencing==0.37.0
 regex==2026.5.9
     # via
     #   nltk
-    #   tiktoken
     #   transformers
 reportlab==4.4.9
     # via browser-use
@@ -1311,10 +1287,9 @@ requests==2.32.5
     #   langsmith
     #   posthog
     #   pymilvus
+    #   qqbot
     #   requests-oauthlib
     #   requests-toolbelt
-    #   tavily-python
-    #   tiktoken
 requests-oauthlib==2.0.0
     # via google-auth-oauthlib
 requests-toolbelt==1.0.0
@@ -1333,24 +1308,14 @@ rubicon-objc==0.5.4 ; sys_platform == 'darwin'
     # via mouseinfo
 safetensors==0.7.0
     # via transformers
-scikit-learn==1.8.0
-    # via
-    #   qqbot
-    #   sentence-transformers
 scipy==1.17.1
     # via
     #   pymilvus-model
     #   qqbot
-    #   scikit-learn
-    #   sentence-transformers
 screeninfo==0.8.1 ; platform_system != 'darwin'
     # via browser-use
-sentence-transformers==5.5.0
-    # via qqbot
 setuptools==81.0.0
-    # via
-    #   pymilvus
-    #   torch
+    # via pymilvus
 shellingham==1.5.4
     # via typer
 six==1.17.0
@@ -1378,50 +1343,23 @@ starlette==1.0.0
     #   fastapi
     #   mcp
     #   sse-starlette
-sympy==1.14.0
-    # via torch
-tavily-python==0.7.24
-    # via qqbot
 tenacity==9.1.4
     # via
     #   google-genai
     #   langchain-community
     #   langchain-core
-threadpoolctl==3.6.0
-    # via scikit-learn
-tiktoken==0.12.0
-    # via
-    #   langchain-openai
-    #   tavily-python
 tokenizers==0.22.2
     # via
     #   langchain-huggingface
     #   transformers
-torch==2.12.0 ; sys_platform == 'darwin'
-    # via
-    #   qqbot
-    #   sentence-transformers
-    #   torchvision
-torch==2.12.0+cpu ; sys_platform != 'darwin'
-    # via
-    #   qqbot
-    #   sentence-transformers
-    #   torchvision
-torchvision==0.27.0 ; sys_platform == 'darwin'
-    # via qqbot
-torchvision==0.27.0+cpu ; sys_platform != 'darwin'
-    # via qqbot
 tqdm==4.67.3
     # via
     #   huggingface-hub
     #   nltk
     #   openai
-    #   sentence-transformers
     #   transformers
 transformers==5.8.1
-    # via
-    #   pymilvus-model
-    #   sentence-transformers
+    # via pymilvus-model
 truststore==0.10.4 ; sys_platform != 'emscripten'
     # via
     #   httpcore2
@@ -1460,11 +1398,10 @@ typing-extensions==4.15.0
     #   pydantic-core
     #   pyee
     #   python-docx
+    #   qqbot
     #   referencing
-    #   sentence-transformers
     #   sqlalchemy
     #   starlette
-    #   torch
     #   typing-inspect
     #   typing-inspection
 typing-inspect==0.9.0

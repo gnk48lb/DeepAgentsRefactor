@@ -44,6 +44,15 @@ async def init_system():
         print(f"[ERROR] chat_service 初始化失败: {e}")
         traceback.print_exc()
 
+@driver.on_shutdown
+async def shutdown_system():
+    """在 NoneBot 关闭时释放 chat_service 与 MCP 资源"""
+    try:
+        await chat_service.shutdown_service()
+    except Exception as e:
+        print(f"[ERROR] chat_service 关闭失败: {e}")
+        traceback.print_exc()
+
 # 注册事件响应器，监听群消息和私聊消息
 chat_matcher = on_message(priority=10, block=False)
 
