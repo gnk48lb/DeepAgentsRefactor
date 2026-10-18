@@ -26,11 +26,51 @@ logger = logging.getLogger(__name__)
 SILICONFLOW_EMBEDDING_TIMEOUT = 60
 SILICONFLOW_RERANK_TIMEOUT = 30
 
-# Initialize HuggingFace Dense Embeddings (API) for GraphRAG
-av_embeddings = HuggingFaceEndpointEmbeddings(
-    model=config.EMBEDDING_MODEL,
-    huggingfacehub_api_token=config.HUGGINGFACEHUB_API_TOKEN
-)
+# Initialize Cloudflare Workers AI Dense Embeddings (Serverless API) for GraphRAG / AV Search
+class CloudflareWorkersAIEmbeddings(BaseModel, Embeddings):
+    account_id: str
+    api_token: str
+    model: str = config.CLOUDFLARE_EMBEDDING_MODEL
+    base_url: str = "https://api.cloudflare.com/client/v4/accounts"
+    timeout: int = 60
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        if not self.account_id:
+            raise ValueError(
+                "未配置 CLOUDFLARE_ACCOUNT_ID！"
+                "请登录 Cloudflare 控制台 (dash.cloudflare.com -> Workers 和 Pages) 获取 32 位的 Account ID，"
+                "并在 .env 文件中填入 CLOUDFLARE_ACCOUNT_ID"
+            )
+        headers = {
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/json"
+        }
+        batch_size = 32
+        all_embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = [t.replace("\n", " ") for t in texts[i : i + batch_size]]
+            url = f"{self.base_url}/{self.account_id}/ai/run/{self.model}"
+            resp = requests.post(url, headers=headers, json={"text": batch}, timeout=self.timeout)
+            data = resp.json()
+            if not data.get("success") or "result" not in data or "data" not in data["result"]:
+                raise Exception(f"Cloudflare Workers AI Embedding Failed: {data}")
+            all_embeddings.extend(data["result"]["data"])
+        return all_embeddings
+
+    def embed_query(self, text: str) -> List[float]:
+        return self.embed_documents([text])[0]
+
+if config.CLOUDFLARE_API_TOKEN:
+    av_embeddings = CloudflareWorkersAIEmbeddings(
+        account_id=config.CLOUDFLARE_ACCOUNT_ID or "",
+        api_token=config.CLOUDFLARE_API_TOKEN,
+        model=config.CLOUDFLARE_EMBEDDING_MODEL
+    )
+else:
+    av_embeddings = HuggingFaceEndpointEmbeddings(
+        model=config.EMBEDDING_MODEL,
+        huggingfacehub_api_token=config.HUGGINGFACEHUB_API_TOKEN
+    )
 
 # Initialize SiliconFlow Dense Embeddings (Custom class to avoid tiktoken SSL errors)
 class SiliconFlowEmbeddings(BaseModel, Embeddings):
