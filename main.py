@@ -24,6 +24,7 @@ if sys.platform == "win32":
 from app import deep_agent
 from app import database
 from app import outbox
+from app import hitl
 import config
 import asyncio
 import traceback
@@ -135,31 +136,12 @@ async def run_agent(query: str, agent, config_dict: dict) -> str:
     # astream 结束后检查 state.next，非空说明子图触发了 interrupt()
     try:
         state = await agent.aget_state(config_dict)
-        while state.next:
-            # 从 state.tasks[].interrupts 提取中断 payload
-            interrupts = []
-            for t in state.tasks:
-                if hasattr(t, "interrupts") and t.interrupts:
-                    interrupts.extend(t.interrupts)
-
-            for intr in interrupts:
-                val = intr.value if hasattr(intr, "value") else intr
-                # val 是 FileAgent 自定义的授权请求消息（字符串或 dict）
-                if isinstance(val, dict):
-                    tool_name_h = val.get("tool_name", "未知操作")
-                    tool_args_h = val.get("tool_args", {})
-                    print(f"\n⚠️  \033[91m[HITL 授权请求]\033[0m: {tool_name_h}")
-                    print(f"    参数: {json.dumps(tool_args_h, ensure_ascii=False)[:300]}")
-                else:
-                    print(f"\n⚠️  \033[91m[HITL 授权请求]\033[0m:\n{val}")
-
-            answer = await asyncio.to_thread(input, "\n✋ 是否授权此操作？[Y/N]: ")
-            answer = answer.strip().upper() or "N"
-            resume_val = "Y" if answer == "Y" else "N"
-
-            print(f"\n▶️  \033[90m[Resume → {resume_val}]\033[0m")
-            # 继续 astream 处理恢复后的事件流
-            async for event in agent.astream(Command(resume=resume_val), config=config_dict):
+        while hitl.has_pending_interrupts(state):
+            print(f"\n  \033[91m[HITL 授权请求]\033[0m:\n{hitl.format_hitl_warning(state)}")
+            answer = await asyncio.to_thread(input, "\n 是否授权此操作？[Y/N]: ")
+            resume_val = "Y" if answer.strip().upper() == "Y" else "N"
+            print(f"\n  \033[90m[Resume → {resume_val}]\033[0m")
+            async for event in agent.astream(Command(resume=hitl.build_resume(state, resume_val)), config=config_dict):
                 if not isinstance(event, dict):
                     continue
                 for node_name, state_update in event.items():

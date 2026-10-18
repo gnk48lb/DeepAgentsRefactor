@@ -3,9 +3,6 @@
 设计要点
 --------
 * 逐服务拉取工具并打上 ``__mcp_server__`` 来源标签，供下游按标签路由。
-* 对 filesystem 工具加两层防护：
-  1. **路径安全检查**：禁止路径跳出 WORKSPACE_DIR（防止 ../../ 逃逸）。
-  2. **大文件截断**：文本内容超过 FILE_CONTENT_LIMIT 字符时自动截断并提示。
 * 高德坐标工具保留原有拦截逻辑（格式校验 + 描述增强）。
 """
 
@@ -29,25 +26,8 @@ import config
 # 高德坐标类工具关键词
 _AMAP_COORD_KEYWORDS = ("around", "coordinates", "regeocode", "distance")
 
-# 文件读取结果的最大允许字符数；超出则截断并附注
-_FILE_CONTENT_LIMIT = 8000
-
-# 文件读取类工具名称前缀/关键词集合
-_FILE_READ_KEYWORDS = ("read_file", "read_text_file", "read_multiple_files")
-
-# ★ 危险工具列表（写入/修改/移动类）——触发 Human-in-the-loop 拦截
-DANGEROUS_FS_TOOLS: set[str] = {
-    "write_file",
-    "edit_file",
-    "create_directory",
-    "move_file",
-}
-
 # mcp_servers.json 所在路径
 _CONFIG_PATH = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "mcp_servers.json"
-
-# 允许 FileAgent 访问的根目录（规范化绝对路径，方便前缀比较）
-_WORKSPACE_REAL = os.path.realpath(config.WORKSPACE_DIR)
 
 # ── 全局单例与常驻 Runner ─────────────────────────────────────────────────────
 _mcp_client: Optional[MultiServerMCPClient] = None
@@ -116,57 +96,6 @@ def _load_mcp_config() -> dict:
     return resolved
 
 
-# ── 安全与限制检查工具函数 ────────────────────────────────────────────────────
-
-def _is_path_safe(path_str: str) -> bool:
-    """判断路径是否在 WORKSPACE_DIR 范围内（防止 ../ 路径逃逸）。
-
-    使用 os.path.realpath 解析符号链接后再通过 commonpath 校验。
-    """
-    try:
-        real = os.path.realpath(os.path.join(_WORKSPACE_REAL, path_str))
-        return os.path.commonpath([_WORKSPACE_REAL, real]) == _WORKSPACE_REAL
-    except (ValueError, Exception):
-        return False
-
-
-def _check_filesystem_args(tool_name: str, tool_input: dict) -> Optional[str]:
-    """对 filesystem 工具的入参做路径安全检查。
-
-    如果发现路径试图逃逸出 WORKSPACE_DIR，返回错误消息字符串；
-    否则返回 None 表示检查通过。
-    """
-    # 可能包含路径的参数名
-    path_fields = ("path", "paths", "source", "destination", "directory", "pattern")
-
-    for field in path_fields:
-        val = tool_input.get(field)
-        if val is None:
-            continue
-        # 支持单个字符串或字符串列表
-        candidates = val if isinstance(val, list) else [val]
-        for candidate in candidates:
-            if not isinstance(candidate, str):
-                continue
-            if not _is_path_safe(candidate):
-                return (
-                    f"⛔ 工具 '{tool_name}' 调用被拒绝：路径 '{candidate}' "
-                    f"超出了允许的工作区范围（{_WORKSPACE_REAL}）。"
-                    f"禁止使用 '../' 或绝对路径跳出工作区！"
-                )
-    return None
-
-
-def _truncate_if_needed(text: str, tool_name: str) -> str:
-    """如果文本超过 _FILE_CONTENT_LIMIT，截断并追加提示。"""
-    if len(text) > _FILE_CONTENT_LIMIT:
-        truncated = text[:_FILE_CONTENT_LIMIT]
-        return (
-            f"{truncated}\n\n"
-            f"... [⚠️ 文件内容过长，已截断至 {_FILE_CONTENT_LIMIT} 字符。"
-            f"原始长度约 {len(text)} 字符。如需查看后续内容，请缩小范围后重新查询。]"
-        )
-    return text
 
 
 # ── 常驻会话 Runner 与调用路由 ──────────────────────────────────────────────────
@@ -324,15 +253,6 @@ def _wrap_tool(t: BaseTool, server_name: str) -> BaseTool:
             "严禁根据自身知识库猜测、编造或幻觉经纬度数字。"
         )
 
-    # ── Filesystem 工具：说明可访问范围 ──────────────────────────────────────
-    is_fs_tool = (server_name == "filesystem")
-    is_read_tool = is_fs_tool and any(kw in t.name for kw in _FILE_READ_KEYWORDS)
-    if is_fs_tool:
-        enhanced_description += (
-            f"\n\n【安全限制】此工具只能在项目工作区内操作：{_WORKSPACE_REAL}。"
-            "严禁使用 '../' 或绝对路径尝试访问工作区以外的文件。"
-        )
-
     async def _coro(*args, **kwargs):
         try:
             tool_input = args[0] if args else kwargs
@@ -350,12 +270,6 @@ def _wrap_tool(t: BaseTool, server_name: str) -> BaseTool:
                                 f"请先调用 'maps_geo' 解析该地址获取坐标后再试。"
                             )
 
-            # ── Filesystem 路径安全检查 ───────────────────────────────────────
-            if is_fs_tool:
-                err = _check_filesystem_args(t.name, tool_input)
-                if err:
-                    return err
-
             # ── 调用原始工具（通过常驻会话 _call_raw_tool）─────────────────────
             res = await _call_raw_tool(server_name, t.name, tool_input)
 
@@ -368,10 +282,6 @@ def _wrap_tool(t: BaseTool, server_name: str) -> BaseTool:
                 )
             else:
                 res = str(res)
-
-            # ── 大文件截断（仅对文件读取类工具生效） ─────────────────────────
-            if is_read_tool:
-                res = _truncate_if_needed(res, t.name)
 
             return res
 

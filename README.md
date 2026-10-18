@@ -24,7 +24,7 @@ GNK48-Agent 采用声明式主智能体配合垂直领域子专家架构。主 A
 4. **CodeAgent**: 代码执行专家，通过 Docker 隔离沙箱安全运行 Python 脚本，支持数据分析与 Matplotlib 绘图。
 5. **SQLAgent**: 关系数据库专家，负责将自然语言转为 SQL 并查询本地 MySQL (`execute_sql`)。
 6. **BrowserAgent**: 浏览器自动化专家，基于 Playwright/browser-use 操控真实或无头浏览器，处理网页端交互。
-7. **FileAgent (HITL)**: 本地文件系统专家，挂载 Filesystem MCP，受项目工作区边界保护。
+7. **FileAgent (HITL)**: 本地文件专家，内置 FilesystemMiddleware + FilesystemBackend + 原生 HITL。提供工具：`ls`/`glob`/`grep`/`read_file` 免授权，`write_file`/`edit_file`/`create_directory`/`move_file` 需授权，删除 = 移动到 archive_trash 归档。只能在 workspace 工作区内操作。
 8. **DesktopAgent (HITL)**: 桌面操作专家，基于网格坐标截屏、模拟点击与键鼠交互。
 
 ### 2.3 特权版 vs 受限版
@@ -33,7 +33,7 @@ GNK48-Agent 采用声明式主智能体配合垂直领域子专家架构。主 A
 - **受限版 (Normal)**: 受限版不挂载 `FileAgent`、`DesktopAgent`、`BrowserAgent`，普通用户仅可使用知识检索、图谱检索、高德地图、代码沙箱执行和数据库查询等非特权专家。
 
 ### 2.4 MCP 常驻会话与容错机制
-系统通过 Model Context Protocol (MCP) 集成外部能力（如高德地图 `amap`、文件系统 `filesystem`、桌面控制 `desktop`）。
+系统通过 Model Context Protocol (MCP) 集成外部能力（如高德地图 `amap`、桌面控制 `desktop`）。
 各 MCP 服务进程在机器人启动时由专属后台 Runner 统一拉起并常驻运行，退出时自动回收，大幅降低工具调用开销。
 运行时支持并发调用与调用超时熔断（默认 60s）；若检测到服务异常断开或进程挂死，将自动触发重连与会话重建，确保长时间运行的稳定性。
 
@@ -49,10 +49,12 @@ DeepAgentsRefactor/
 │   ├── chat_service.py       # 统一对话服务层（处理锁、并发、HITL与发件箱）
 │   ├── database.py           # Milvus 向量库与长期记忆管理
 │   ├── deep_agent.py         # 主 Agent 与声明式专家装配中心
-│   ├── graph.py              # FileAgent 与 DesktopAgent 的 HITL 子图定义与提示词
+│   ├── file_agent.py         # FileAgent 定义（内置 FilesystemMiddleware + 原生 HITL）
+│   ├── graph.py              # DesktopAgent 子图定义与提示词
 │   ├── graph_rag.py          # 媒体图谱检索器 (Neo4j + Milvus Hybrid)
+│   ├── hitl.py               # 人工授权 (HITL) 公共辅助与中断恢复
 │   ├── loader.py             # 文档与多模态数据加载、切片与图片编码
-│   ├── mcp_service.py        # MCP 协议客户端管理 (Amap, Filesystem, Desktop)
+│   ├── mcp_service.py        # MCP 协议客户端管理 (Amap, Desktop)
 │   ├── models.py             # LLM / VLM / 向量模型与重排器单例定义
 │   ├── outbox.py             # 图片跨轮发件箱旁路
 │   ├── sandbox.py            # Docker Python 沙箱代码执行环境
@@ -68,6 +70,8 @@ DeepAgentsRefactor/
 │   ├── login_setup.py        # 浏览器自动化持久化登录引导脚本
 │   ├── manage_memory.py      # Milvus 长期记忆查看与清理工具
 │   └── migrate_to_mysql.py   # 数据迁移至 MySQL
+├── tests/                    # 测试用例
+│   └── smoke_file_agent.py   # FileAgent 离线冒烟测试
 ├── storage/                  # 运行时持久化目录（Milvus DB、浏览器配置等，已忽略）
 ├── workspace/                # FileAgent 操作工作区（已忽略）
 ├── bot.py                    # NoneBot2 QQ 机器人启动入口
@@ -158,6 +162,7 @@ uv run python scripts/chat_cli.py --user 111
 ```
 - **回复 `Y` / `y`**：系统恢复执行并完成敏感工具调用。
 - **回复 `N` / `n`**：阻断该操作，向专家注入明确拒绝信息并由其礼貌告知用户。
+- **多个并行授权**：当主 Agent 在同一步派发多个涉及敏感操作的专家时，系统会统一收集全部中断请求，用户的单次 `Y`/`N` 回复将同时作用于以上全部操作。
 
 ---
 
@@ -175,3 +180,4 @@ uv run python scripts/chat_cli.py --user 111
 1. **DesktopAgent 不稳定**: 桌面操作依赖网格视觉识别，受分辨率和缩放比例影响较大，可能存在点击漂移。
 2. **受限版专家权限**: 受限版不挂载 `FileAgent`、`DesktopAgent`、`BrowserAgent`，普通用户仅可使用知识检索、图谱检索、高德地图、代码沙箱执行和数据库查询等非特权专家。
 3. **MemorySaver 会话重启丢失**: 当前状态保存器为内存级 `MemorySaver`，机器人进程重启后进行中的上下文与未决 HITL 中断会丢失。长期事实依赖 Milvus 后台抽取持久化。
+4. **FileAgent 工具调用步数限制**: 单次 FileAgent 运行串行工具调用上限约 19 次（带 HITL 中间件每次工具调用占 3 个 superstep）；`write_file` 对已存在文件会整体覆盖。

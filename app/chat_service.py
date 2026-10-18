@@ -12,7 +12,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 
 import config
-from app import database, deep_agent, outbox, models
+from app import database, deep_agent, outbox, models, hitl
 from app.utils import extract_text
 
 @dataclass
@@ -68,53 +68,6 @@ async def _load_image_as_data_uri(image_url: str) -> Optional[str]:
         print(f"[ERROR] 读取/下载图片失败: {e}")
         return None
 
-def _format_hitl_warning(state) -> str:
-    """从图状态中提取即将执行的危险工具信息，格式化为用户友好的授权拦截提示。"""
-    try:
-        tasks = getattr(state, "tasks", [])
-        if not tasks:
-            return "⚠️ 请求执行一项敏感操作，请回复 Y 允许或 N 拒绝。"
-
-        item = None
-        for task in reversed(tasks):
-            if hasattr(task, "interrupts") and task.interrupts:
-                interrupt_item = task.interrupts[-1]
-                if isinstance(interrupt_item, str):
-                    return interrupt_item
-
-                val = interrupt_item.value if hasattr(interrupt_item, "value") else interrupt_item
-                if isinstance(val, str):
-                    return val
-
-                item = val[0] if isinstance(val, list) and val else val
-                break
-
-        if not item or not isinstance(item, dict):
-            return "⚠️ 请求执行一项敏感操作，请回复 Y 允许或 N 拒绝。"
-
-        t_name = item.get("tool_name", "未知工具")
-        t_args = item.get("tool_args", {})
-        target = t_args.get("path") or t_args.get("destination") or t_args.get("directory") or str(t_args)
-
-        return (
-            f"⚠️ 敏感操作授权拦截\n"
-            f"──────────────────\n"
-            f"操作: [{t_name}]\n"
-            f"目标: {target}\n"
-            f"──────────────────\n"
-            f"回复 Y 允许，回复 N 拒绝。"
-        )
-    except Exception as e:
-        print(f"⚠️ 格式化警告失败: {e}")
-    return "⚠️ 请求执行一项敏感操作，请回复 Y 允许或 N 拒绝。"
-
-def _has_pending_interrupts(state) -> bool:
-    """判断状态中是否有待处理的中断"""
-    tasks = getattr(state, "tasks", [])
-    for t in tasks:
-        if hasattr(t, "interrupts") and t.interrupts:
-            return True
-    return False
 
 async def init_service() -> None:
     """初始化数据库、MCP服务并构建主 Agent"""
@@ -198,17 +151,17 @@ async def process_message(user_id: str, text: str, image_url: Optional[str] = No
 
             # 2. 检查是否在等授权
             current_state = await agent.aget_state(agent_config)
-            if _has_pending_interrupts(current_state):
+            if hitl.has_pending_interrupts(current_state):
                 user_reply = text.strip().upper()
                 if user_reply in ("Y", "N"):
                     resumed_outbox = _pending_outbox.pop(user_id, [])
                     outbox.resume(resumed_outbox)
                     await asyncio.wait_for(
-                        agent.ainvoke(Command(resume=user_reply), agent_config),
+                        agent.ainvoke(Command(resume=hitl.build_resume(current_state, user_reply)), agent_config),
                         timeout=config.AGENT_TURN_TIMEOUT_SECONDS,
                     )
                 else:
-                    warning = _format_hitl_warning(current_state)
+                    warning = hitl.format_hitl_warning(current_state)
                     return ChatReply(
                         text=f"⚠️ 当前正在等待授权确认，请回复 Y 允许或 N 拒绝。\n\n{warning}",
                         images=[],
@@ -262,10 +215,10 @@ async def process_message(user_id: str, text: str, image_url: Optional[str] = No
 
             # 4. 一轮 ainvoke 结束后再次检查是否有中断
             after_state = await agent.aget_state(agent_config)
-            if _has_pending_interrupts(after_state):
+            if hitl.has_pending_interrupts(after_state):
                 curr_lst = outbox.current()
                 _pending_outbox[user_id] = curr_lst
-                warning = _format_hitl_warning(after_state)
+                warning = hitl.format_hitl_warning(after_state)
                 return ChatReply(
                     text=warning,
                     images=[],

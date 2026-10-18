@@ -11,7 +11,7 @@ Architecture:
   * 特权专家 (Privileged Subagents): FileAgent, DesktopAgent, BrowserAgent
     （仅当 include_privileged=True 时构建并挂载，受限版不挂载这三者）
 - Middleware: ToolCallLimitMiddleware guarding the `task` tool (run_limit=12, exit_behavior="continue").
-- HITL Subgraphs: FileAgent and DesktopAgent are integrated as compiled subgraphs with human-in-the-loop approval.
+- HITL: FileAgent 为 create_agent 编译图（原生 HITL），DesktopAgent 仍为手写子图。
 """
 
 import asyncio
@@ -45,6 +45,7 @@ from deepagents import (
 
 # 确保关掉默认的 general-purpose subagent（由专属专家全面承接任务，避免不可控兜底）
 # 同时隐藏内置的危险/修改工具（write_file, edit_file, delete, execute）
+# 注：FileAgent 由 create_agent 构建，不受此处 excluded_tools 影响
 for _provider in ("google_genai", "openai"):
     try:
         register_harness_profile(
@@ -67,10 +68,9 @@ from . import models
 from . import tools
 from . import mcp_service
 from . import database
+from . import file_agent
 from .graph import (
-    build_file_agent_subgraph,
     build_desktop_agent_subgraph,
-    FILE_AGENT_PROMPT,
     DESKTOP_AGENT_PROMPT,
 )
 import config
@@ -126,6 +126,13 @@ SUBAGENT_DESCRIPTIONS = {
     "SQLAgent": "关系数据库专家，用于精确过滤、统计或多条件检索女优、作品及关联表关系。不涉及精确条件的模糊/综合查询交给 MediaAgent。",
     "BrowserAgent": "浏览器操作专家。处理网页点击、登录、动态数据抓取、文件上传与自动化发帖。它可以直接接收本地文件路径（如 workspace/1.png）完成网页上传，无需先派 FileAgent 读取；只要任务涉及网页端发布/登录/点击等交互，就直接派给它，不要提前结束并让用户手动操作。复杂规划中，需要先派这个拿到地址等信息，再派 MapAgent。",
     "CodeAgent": "代码执行专家，用 Python 解决数学计算、数据处理和绘图任务。只能写代码运行，不能帮你查资料；需要绘图时必须明确指示它绘图。",
+    "FileAgent": (
+        "本地文件专家，是唯一能访问本地磁盘（workspace 工作区）的专家：列目录、搜索、读取文本类文件，"
+        "写入、编辑、新建目录、移动或重命名文件（“删除”一律改为移动到 archive_trash 归档）。"
+        "写入/编辑/新建目录/移动会暂停并请求人工授权。"
+        "不要让它读取图片、音视频等二进制文件（它无法解析，会导致死循环）；"
+        "网页上传文件的任务不要先派它读取，直接把路径交给 BrowserAgent。"
+    ),
 }
 
 WORKER_BASE_PROMPT = (
@@ -134,6 +141,26 @@ WORKER_BASE_PROMPT = (
     "【职能防火墙 - 极端重要】：你只能且必须只回答主管指派给你的具体子任务。严禁利用你的通用知识去回答用户提问中涉及其他领域的子问题！\n"
     "（例如：如果你是 MapAgent，主管让你找菜市场，你只需返回菜市场信息，绝对严禁顺便提供菜谱或食材清单，即使你知道答案也必须闭嘴，让相关领域的专家去处理）。\n"
     "请只返回客观、精确的工具执行结果或数据总结，禁止说客套话，禁止反问主管。\n"
+)
+
+FILE_AGENT_PROMPT = (
+    WORKER_BASE_PROMPT
+    + "你是 FileAgent，负责操作本地工作区（workspace）里的文件。\n"
+    + "【工具】浏览/读取：ls、glob、grep、read_file；写入类（会暂停等待用户授权）：write_file、edit_file、create_directory、move_file。\n"
+    + "【路径规范 - 强制】\n"
+    + "  · 所有路径一律写成 /workspace/xxx（也接受 workspace/xxx）。用户或主管写的 \"workspace/xxx\" 指的就是工作区里的 xxx，原样传给工具，不要去掉前缀。\n"
+    + "  · 只能在工作区内操作：不要使用 ../、Windows 盘符路径（如 C:\\...）或其他系统绝对路径。路径含反斜杠时先改成正斜杠。\n"
+    + "  · ls / glob / grep 必须显式传 path，从 /workspace（或其子目录）开始；不要对 \"/\" 列目录或搜索。\n"
+    + "【效率原则】\n"
+    + "  · 先用 ls 或 glob(pattern=\"**/*\", path=\"/workspace\") 了解目录全貌，再按需 read_file。\n"
+    + "  · 大文件用 read_file 的 offset / limit 分页读取（每次不超过 200 行），不要一次读完整个大文件；找内容优先用 grep。\n"
+    + "  · 只处理文本类文件；遇到图片、音视频、压缩包等二进制文件，直接汇报无法读取，严禁尝试 read_file。\n"
+    + "【写入规范】\n"
+    + "  · write_file 会整体覆盖已存在的文件，并自动创建父目录；覆盖前先 read_file 确认现有内容。局部修改优先 edit_file。\n"
+    + "  · 没有删除工具。主管要求“删除”文件时，用 move_file 把它移动到 /workspace/archive_trash/ 下（目标同名已存在时，在文件名后加序号或时间戳）。\n"
+    + "  · 需要新建空文件夹时用 create_directory。\n"
+    + "【授权被拒】写入类操作会暂停等待用户授权。如果被用户拒绝（收到“用户明确拒绝/权限被拒绝”的提示），你必须立即停止对该操作及类似操作的尝试，严禁循环请求；礼貌地向主管汇报该步骤已被用户取消，并根据情况继续其他安全步骤或直接结束任务。\n"
+    + "【汇报格式】最终回答以“【内部专家汇报 - 来源：FileAgent】”开头，然后给出工具实际返回的结果（路径、文件内容、执行结果等）；没有拿到工具结果时如实说明，禁止把计划当成结果。\n"
 )
 
 KNOWLEDGE_AGENT_PROMPT = (
@@ -347,23 +374,21 @@ async def build_main_agent(
 
     # 特权专家：FileAgent / DesktopAgent / BrowserAgent 仅在 include_privileged=True 时构建并注册
     if include_privileged:
-        filesystem_tools = mcp_service.get_tools_by_server("filesystem")
-        filesystem_tools = [t for t in filesystem_tools if t.name != "read_media_file"]
         desktop_tools = mcp_service.get_tools_by_server("desktop")
 
-        file_agent_subgraph = build_file_agent_subgraph(
-            filesystem_tools=filesystem_tools,
+        file_agent_runnable = file_agent.build_file_agent_runnable(
+            llm=models.worker_llm,
             system_prompt=FILE_AGENT_PROMPT,
+            workspace_dir=config.WORKSPACE_DIR,
+        )
+        file_subagent = CompiledSubAgent(
+            name="FileAgent",
+            description=SUBAGENT_DESCRIPTIONS["FileAgent"],
+            runnable=file_agent_runnable,
         )
         desktop_agent_subgraph = build_desktop_agent_subgraph(
             desktop_tools=desktop_tools,
             system_prompt=DESKTOP_AGENT_PROMPT,
-        )
-
-        file_subagent = CompiledSubAgent(
-            name="FileAgent",
-            description="本地文件专家，是唯一能访问本地磁盘的专家：读取/写入/编辑项目内的文本类文件（.py/.json/.md/.txt 等），涉及危险操作（写入/编辑/移动）会暂停并请求人工授权。不要让它读取图片、音视频等二进制文件（它无法解析，会导致死循环）；网页上传文件的任务不要先派它读取，直接把路径交给 BrowserAgent。",
-            runnable=file_agent_subgraph,
         )
         desktop_subagent = CompiledSubAgent(
             name="DesktopAgent",

@@ -96,7 +96,7 @@ OWNER_QQ_IDS = {x.strip() for x in (os.getenv("OWNER_QQ_IDS") or "").split(",") 
 QQ_MAX_REPLY_CHARS = 10000
 
 # Agent 执行 recursion_limit（递归深度/超步限制）
-# 主图每次委派约占 3 个 superstep，子图 llm<->tools 工具调用各占 2 个 superstep；60 允许约 18 次委派或约 29 次子图工具调用
+# 主图每次委派约占 3 个 superstep；FileAgent 带 HITL 中间件后每次工具调用占 3 个 superstep，约 19 次串行调用
 AGENT_RECURSION_LIMIT = 60
 
 # 单轮 Agent 运行总时限（秒，含工具与子 Agent 调用）

@@ -17,15 +17,6 @@
     },
     "transport": "stdio"
   },
-  "filesystem": {
-    "command": "npx",
-    "args": [
-      "-y",
-      "@modelcontextprotocol/server-filesystem@2026.8.31",
-      "${WORKSPACE_DIR}"
-    ],
-    "transport": "stdio"
-  },
   "desktop": {
     "command": "uv",
     "args": [
