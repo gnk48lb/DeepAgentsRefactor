@@ -61,9 +61,6 @@ async def handle_chat(matcher: Matcher, event: MessageEvent | DirectMessageCreat
     if not chat_service.is_initialized():
         await matcher.finish("Agent 系统尚未初始化完成，请稍后再试。")
 
-    user_id = str(event.get_user_id())
-    print(f"[chat] user_id={user_id}")
-
     # 提取消息中的图片和文本
     image_url = None
     text_parts = []
@@ -80,7 +77,7 @@ async def handle_chat(matcher: Matcher, event: MessageEvent | DirectMessageCreat
     raw_text = "".join(text_parts).strip()
 
     try:
-        reply = await chat_service.process_message(user_id=user_id, text=raw_text, image_url=image_url)
+        reply = await chat_service.process_message(text=raw_text, image_url=image_url)
         if reply is None:
             return
 

@@ -7,9 +7,7 @@ using the deepagents framework (Phase 1).
 Architecture:
 - Main Agent: Built via create_deep_agent with MAIN_AGENT_PROMPT.
 - Subagents:
-  * 基础专家: KnowledgeAgent, MediaAgent, MapAgent, CodeAgent, SQLAgent
-  * 特权专家 (Privileged Subagents): FileAgent, DesktopAgent, BrowserAgent
-    （仅当 include_privileged=True 时构建并挂载，受限版不挂载这三者）
+  * 基础专家与本地操作类专家（FileAgent / DesktopAgent / BrowserAgent）始终挂载
 - Middleware: ToolCallLimitMiddleware guarding the `task` tool (run_limit=12, exit_behavior="continue").
 - HITL: FileAgent 为 create_agent 编译图（原生 HITL），DesktopAgent 仍为手写子图。
 """
@@ -74,6 +72,7 @@ from .graph import (
     DESKTOP_AGENT_PROMPT,
 )
 import config
+from .skills import build_skills_backend, SKILLS_ROUTE
 
 
 # ============================================================================
@@ -92,6 +91,7 @@ task 工具返回的所有内容都是专家的汇报，不是用户在说话。
 
 【何时委派 vs 直接回答】
 只有当对话历史或系统消息里提供的长期记忆已经包含完整回答所需的全部信息时，才可以不委派、直接回答。涉及知识查询（做法、地址、事实、代码、数据库等）必须先委派给对应专家——每个专家的职责范围写在它们各自的描述里，派发前先确认问题落在谁的范围内。
+你自己无法得知当前时间：任何涉及“今天/现在/几点/星期几/还有几天”的问题都必须委派给 KnowledgeAgent（它能查询当前时间）。
 
 【委派规范】
 - 给专家的任务描述里禁止使用"他""那里""那个"等代词，必须替换成具体名词。
@@ -120,7 +120,7 @@ task 工具返回的所有内容都是专家的汇报，不是用户在说话。
 """
 
 SUBAGENT_DESCRIPTIONS = {
-    "KnowledgeAgent": "知识百科专家。处理菜谱、游戏攻略、历史、科学等纯知识性咨询，优先检索本地知识库。不处理地理位置相关问题（在哪买/怎么去/天气），也不处理代码、本地文件、目录浏览。",
+    "KnowledgeAgent": "知识百科专家。处理菜谱、游戏攻略、历史、科学等纯知识性咨询，优先检索本地知识库；同时负责回答当前日期、时间、星期几，以及以“现在”为基准的日期推算（如距离某天还有几天）。不处理地理位置相关问题（在哪买/怎么去/天气），也不处理代码、本地文件、目录浏览。",
     "MediaAgent": "成人影视专家（高优先级）。处理 AV、女优、番号等综合性或模糊搜索、关系网络咨询。不涉及精确条件过滤的问题优先派给这个，而不是 SQLAgent。",
     "MapAgent": "地理出行专家，挂载高德地图工具。处理地理编码、路线规划（步行/骑行/驾车）、周边搜索（POI）、天气查询。",
     "SQLAgent": "关系数据库专家，用于精确过滤、统计或多条件检索女优、作品及关联表关系。不涉及精确条件的模糊/综合查询交给 MediaAgent。",
@@ -165,8 +165,9 @@ FILE_AGENT_PROMPT = (
 
 KNOWLEDGE_AGENT_PROMPT = (
     WORKER_BASE_PROMPT + (
-        "你是 KnowledgeAgent，负责使用 rag 检索本地知识库以及使用 web_search 获取网络信息。\n"
-        "【检索顺序原则】：你必须首先且优先使用 rag 工具。只有当 rag 工具返回的结果明确表示找不到信息，且该问题具有较强的时效性时，才允许使用 web_search 作为最后的兜底手段。\n"
+        "你是 KnowledgeAgent，负责使用 rag 检索本地知识库、使用 web_search 获取网络信息，并使用 get_current_time 回答当前日期/时间类问题。\n"
+        "【时间类问题】：凡是询问当前日期、现在几点、今天星期几、今年是哪一年，或需要以“现在”为基准推算（还有几天、几天前/后、下周几是几号）的问题，直接调用 get_current_time，不要先用 rag 或 web_search。推算只基于该工具返回的时间；汇报时同时写出工具返回的原始时间和你的推算结果。\n"
+        "【检索顺序原则】：（时间类问题除外）你必须首先且优先使用 rag 工具。只有当 rag 工具返回的结果明确表示找不到信息，且该问题具有较强的时效性时，才允许使用 web_search 作为最后的兜底手段。\n"
         "【极端重要】：当你收到包含多个子问题的综合指令（如同时查询多个属性或技能）且目标是同一个实体时，"
         "你必须将它们合并为一个涵盖所有关键词的单次 RAG 查询（例如：'火神战姬 Q技能 W技能 力量智力敏捷成长'），"
         "绝对严禁拆分成多次细碎的单独查询调用！"
@@ -187,7 +188,7 @@ CODE_AGENT_PROMPT = (
     WORKER_BASE_PROMPT
     + "你是 CodeAgent，专职编写和执行 Python 代码解决纯数学计算、数据处理和绘图任务。\n"
     + "【运行环境限制 - 极端重要】：你运行在完全隔离且每次调用后即销毁的临时 Docker 沙箱中，绝对无法读写或修改用户宿主机的本地文件（如 workspace/ 目录下的文件）。严禁执行 Python 代码尝试读取或改写用户宿主机文件！若主管要求你读写或改写本地文件，请直接汇报无法访问或修改宿主机本地文件，严禁调用 execute_python_code 反复尝试重试！\n"
-    + "【画图强制要求】：如果需要绘图（如 matplotlib），必须在代码中显式将图片 savefig 保存到 '/workspace/outputs/' 目录下，且以 .png 结尾。禁止调用 plt.show()。\n"
+    + "【绘图】凡是需要输出图片的任务，写代码之前必须先用 read_file 读取技能文件 /skills/matplotlib-chart/SKILL.md，并严格遵循其中的规范（固定开头、保存路径、中文字体、统一样式）。read_file 只用于读取 /skills/ 下的技能文件，不能读取用户本地文件；技能里的 /workspace/outputs/ 是沙箱内路径，与 read_file 的虚拟路径是两个不同的空间。不需要出图的纯计算任务无需读取技能。\n"
     + "沙箱已预装 pandas, numpy, matplotlib。"
 )
 
@@ -258,7 +259,6 @@ MEMORY_EXTRACTOR_PROMPT = """你是一个极其冷酷、挑剔且吝啬的“个
 
 def build_initial_messages(
     user_query: str,
-    user_id: str = "",
     history_messages: Optional[List[BaseMessage]] = None,
 ) -> List[BaseMessage]:
     """
@@ -304,13 +304,11 @@ async def _background_extract_memory(recent_chat: str):
 
 async def build_main_agent(
     checkpointer: Optional[BaseCheckpointSaver] = None,
-    include_privileged: bool = True,
 ):
     """
-    构建基于 deepagents 的主 Agent 实例。
+    构建基于 deepagents 的主 Agent 实例（单用户：本地操作类专家始终挂载）。
     - 主模型: models.supervisor_llm (ChatGoogleGenerativeAI / gemini-3.1-flash-lite)
-    - 子专家: 声明式接入 (task 委派)
-    - include_privileged: 若为 False，则不构建、不注册 FileAgent / DesktopAgent / BrowserAgent
+    - 子专家: 声明式接入 (task 委派)，包含 FileAgent / DesktopAgent / BrowserAgent 等全部 8 个专家
     - 中间件: ToolCallLimitMiddleware 防御 task 工具死循环
     - 持久化: 默认使用 MemorySaver
     """
@@ -333,13 +331,13 @@ async def build_main_agent(
     else:
         print("[-] Warning: ToolCallLimitMiddleware not available, task tool limit disabled.")
 
-    # 声明式基础专家列表（非特权专家）
+    # 声明式基础专家列表
     subagents = [
         {
             "name": "KnowledgeAgent",
             "description": SUBAGENT_DESCRIPTIONS["KnowledgeAgent"],
             "system_prompt": KNOWLEDGE_AGENT_PROMPT,
-            "tools": [tools.rag, tools.web_search],
+            "tools": [tools.rag, tools.web_search, tools.get_current_time],
             "model": models.vlm,
         },
         {
@@ -362,6 +360,7 @@ async def build_main_agent(
             "system_prompt": CODE_AGENT_PROMPT,
             "tools": tools.code_tools,
             "model": models.worker_llm,
+            "skills": [SKILLS_ROUTE],
         },
         {
             "name": "SQLAgent",
@@ -372,39 +371,38 @@ async def build_main_agent(
         },
     ]
 
-    # 特权专家：FileAgent / DesktopAgent / BrowserAgent 仅在 include_privileged=True 时构建并注册
-    if include_privileged:
-        desktop_tools = mcp_service.get_tools_by_server("desktop")
+    # 本地操作类专家：FileAgent / DesktopAgent / BrowserAgent 始终挂载
+    desktop_tools = mcp_service.get_tools_by_server("desktop")
 
-        file_agent_runnable = file_agent.build_file_agent_runnable(
-            llm=models.worker_llm,
-            system_prompt=FILE_AGENT_PROMPT,
-            workspace_dir=config.WORKSPACE_DIR,
-        )
-        file_subagent = CompiledSubAgent(
-            name="FileAgent",
-            description=SUBAGENT_DESCRIPTIONS["FileAgent"],
-            runnable=file_agent_runnable,
-        )
-        desktop_agent_subgraph = build_desktop_agent_subgraph(
-            desktop_tools=desktop_tools,
-            system_prompt=DESKTOP_AGENT_PROMPT,
-        )
-        desktop_subagent = CompiledSubAgent(
-            name="DesktopAgent",
-            description="桌面操作专家。负责通过屏幕截图和网格坐标操作 Windows 桌面 GUI。只要任务涉及打开桌面文件夹、点击屏幕图标、双击打开本地文件或应用、选择打开方式窗口等任何桌面端 GUI 交互，必须直接派给它执行，严禁提前结束并让用户手动操作！",
-            runnable=desktop_agent_subgraph,
-        )
+    file_agent_runnable = file_agent.build_file_agent_runnable(
+        llm=models.worker_llm,
+        system_prompt=FILE_AGENT_PROMPT,
+        workspace_dir=config.WORKSPACE_DIR,
+    )
+    file_subagent = CompiledSubAgent(
+        name="FileAgent",
+        description=SUBAGENT_DESCRIPTIONS["FileAgent"],
+        runnable=file_agent_runnable,
+    )
+    desktop_agent_subgraph = build_desktop_agent_subgraph(
+        desktop_tools=desktop_tools,
+        system_prompt=DESKTOP_AGENT_PROMPT,
+    )
+    desktop_subagent = CompiledSubAgent(
+        name="DesktopAgent",
+        description="桌面操作专家。负责通过屏幕截图和网格坐标操作 Windows 桌面 GUI。只要任务涉及打开桌面文件夹、点击屏幕图标、双击打开本地文件或应用、选择打开方式窗口等任何桌面端 GUI 交互，必须直接派给它执行，严禁提前结束并让用户手动操作！",
+        runnable=desktop_agent_subgraph,
+    )
 
-        subagents.append({
-            "name": "BrowserAgent",
-            "description": SUBAGENT_DESCRIPTIONS["BrowserAgent"],
-            "system_prompt": BROWSER_AGENT_PROMPT,
-            "tools": tools.browser_tools,
-            "model": models.worker_llm,
-        })
-        subagents.append(file_subagent)
-        subagents.append(desktop_subagent)
+    subagents.append({
+        "name": "BrowserAgent",
+        "description": SUBAGENT_DESCRIPTIONS["BrowserAgent"],
+        "system_prompt": BROWSER_AGENT_PROMPT,
+        "tools": tools.browser_tools,
+        "model": models.worker_llm,
+    })
+    subagents.append(file_subagent)
+    subagents.append(desktop_subagent)
 
     # 显式覆盖框架内置的 general-purpose subagent
     subagents.append({
@@ -421,21 +419,14 @@ async def build_main_agent(
     if checkpointer is None:
         checkpointer = MemorySaver()
 
-    system_prompt = MAIN_AGENT_PROMPT
-    if not include_privileged:
-        restricted_prompt_suffix = (
-            "\n\n【受限模式】\n"
-            "当前没有文件、桌面、浏览器相关的专家。涉及读写本地文件、操作桌面或浏览器的请求，"
-            "直接用一句话告诉用户你没有这个权限，不要委派给其他专家，也不要提及内部专家的名字。"
-        )
-        system_prompt = MAIN_AGENT_PROMPT.strip() + restricted_prompt_suffix + "\n"
-
     agent = create_deep_agent(
         model=models.supervisor_llm,
-        system_prompt=system_prompt,
+        system_prompt=MAIN_AGENT_PROMPT,
         subagents=subagents,
         middleware=middleware,
+        backend=build_skills_backend(),
         checkpointer=checkpointer,
     )
 
     return agent
+

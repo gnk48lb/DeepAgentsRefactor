@@ -19,9 +19,9 @@ async def startup_event():
     await chat_service.init_service()
     print("✅ 系统初始化完成，FastAPI 启动，正在监听微信公众号请求...")
 
-async def get_agent_response(query: str, user_id: str) -> str:
-    reply = await chat_service.handle_message(user_id=user_id, content=query)
-    return reply.text
+async def get_agent_response(query: str) -> str:
+    reply = await chat_service.process_message(text=query)
+    return reply.text if reply else ""
 
 # 👑 【核心修改点】路由 1：处理微信服务器的接入验证 (GET 请求)
 @app.get("/wechat")
@@ -52,7 +52,7 @@ async def receive_message(request: Request):
         content = xml_data.find("Content").text
         print(f"\n📩 [微信] 收到用户 {from_user[-4:]} 消息: {content}")
         
-        reply_text = await get_agent_response(content, from_user)
+        reply_text = await get_agent_response(content)
         print(f"📤 [微信] 返回给用户: {reply_text[:100]}...")
         
         reply_xml = f"""<xml>

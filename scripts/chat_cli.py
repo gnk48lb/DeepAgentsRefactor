@@ -14,7 +14,7 @@ sys.stderr.reconfigure(encoding='utf-8')
 
 from app import chat_service
 
-def save_images(images: list, user_id: str):
+def save_images(images: list):
     if not images:
         return
     debug_dir = os.path.join("storage", "outbox_debug")
@@ -25,7 +25,7 @@ def save_images(images: list, user_id: str):
             try:
                 header, b64data = url.split(",", 1)
                 img_bytes = base64.b64decode(b64data)
-                save_path = os.path.join(debug_dir, f"cli_{user_id}_{idx+1}.png")
+                save_path = os.path.join(debug_dir, f"cli_{idx+1}.png")
                 with open(save_path, "wb") as f:
                     f.write(img_bytes)
                 print(f"  [图片已保存] {save_path} (大小: {len(img_bytes)} 字节)")
@@ -55,15 +55,13 @@ def _local_image_to_data_uri(path_str: str) -> str:
 
 async def main():
     parser = argparse.ArgumentParser(description="GNK48-Agent Chat CLI")
-    parser.add_argument("--user", type=str, default="cli_user", help="User ID")
     parser.add_argument("--image", type=str, default=None, help="图片路径或 URL (附带在第一条消息)")
     args = parser.parse_args()
 
-    user_id = args.user
     first_image = args.image
 
     print("=" * 60)
-    print(f"启动 Chat CLI (User ID: {user_id})...")
+    print("启动 Chat CLI...")
     print("输入 'exit' 或 'quit' 退出。")
     print("=" * 60)
 
@@ -73,7 +71,7 @@ async def main():
         is_first = True
         while True:
             try:
-                prompt_str = f"\n[{user_id}] 请输入消息: "
+                prompt_str = "\n请输入消息: "
                 user_input = await asyncio.to_thread(input, prompt_str)
                 user_input = user_input.strip()
 
@@ -92,7 +90,6 @@ async def main():
                     current_img = _local_image_to_data_uri(current_img)
 
                 reply = await chat_service.process_message(
-                    user_id=user_id,
                     text=user_input,
                     image_url=current_img,
                 )
@@ -108,7 +105,7 @@ async def main():
 
                 if reply.images:
                     print(f"📦 [收到 {len(reply.images)} 张图片]:")
-                    save_images(reply.images, user_id)
+                    save_images(reply.images)
 
             except (KeyboardInterrupt, EOFError):
                 print("\n👋 退出 CLI。")

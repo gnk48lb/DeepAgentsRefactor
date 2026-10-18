@@ -6,7 +6,7 @@ from . import models
 from . import loader as data_loader
 from pymilvus import MilvusClient, AnnSearchRequest, RRFRanker
 from neo4j import GraphDatabase
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import shutil
 
 logger = logging.getLogger(__name__)
@@ -250,7 +250,7 @@ def insert_memory(text: str):
                     top_hit = res[0][0]
                     score = top_hit["distance"]
                     hit_id = top_hit["id"]
-                    if score > 0.92:
+                    if score > config.MEMORY_DEDUP_SCORE:
                         old_text = top_hit["entity"]["text"]
                         print(f"🔄 \033[93m[记忆去重]\033[0m: 发现高度相似记忆 (相似度: {score:.4f})")
                         print(f"  旧记忆: {old_text}")
@@ -270,7 +270,10 @@ def insert_memory(text: str):
     except Exception as e:
         print(f"❌ [插入记忆失败]: {e}")
 
-def search_memory(query: str, top_k=3) -> List[str]:
+def search_memory(query: str, top_k: int = 3, min_score: Optional[float] = None) -> List[str]:
+    """检索长期记忆，只返回相似度 >= 阈值的条目（按相似度从高到低）。"""
+    if min_score is None:
+        min_score = config.MEMORY_MIN_SCORE
     try:
         c = get_client()
         coll_name = config.MEMORY_COLLECTION_NAME
@@ -281,8 +284,7 @@ def search_memory(query: str, top_k=3) -> List[str]:
                 c.load_collection(collection_name=coll_name)
             except Exception:
                 pass
-        
-        # 直接检索，依赖异常处理而非不稳定的 row_count
+
         vector = models.embeddings.embed_query(query)
         res = c.search(
             collection_name=coll_name,
@@ -294,7 +296,13 @@ def search_memory(query: str, top_k=3) -> List[str]:
         memories = []
         for hits in res:
             for hit in hits:
-                memories.append(hit["entity"]["text"])
+                score = hit["distance"]
+                text = hit["entity"]["text"]
+                if score >= min_score:
+                    memories.append(text)
+                    print(f"🧠 \033[96m[记忆检索]\033[0m 采用 (score={score:.3f} ≥ {min_score}): {text}")
+                else:
+                    print(f"🧠 \033[90m[记忆检索]\033[0m 丢弃 (score={score:.3f} < {min_score}): {text}")
         return memories
     except Exception as e:
         print(f"❌ [搜索记忆失败]: {e}")

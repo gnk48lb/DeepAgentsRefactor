@@ -34,6 +34,13 @@ MEMORY_COLLECTION_NAME = os.getenv("MILVUS_MEMORY_COLLECTION_NAME") or "user_mem
 # Milvus Local DB Path (Reads from MILVUS_DB_PATH to avoid environment variable naming conflict with PyMilvus legacy system)
 MILVUS_DB_PATH = os.getenv("MILVUS_DB_PATH") or "storage/gnk48_agent_collection.db"
 
+# 长期记忆相似度阈值（IP 分数；向量归一化时等价于余弦相似度）
+# 检索：低于该分数的记忆视为与当前问题无关，不注入上下文。
+# 初始值是经验估计，需要根据日志里 [记忆检索] 的分数分布调整。
+MEMORY_MIN_SCORE = 0.45
+# 写入去重：与已有记忆相似度高于该值时覆盖旧记忆（原先硬编码在 database.insert_memory 里的 0.92）
+MEMORY_DEDUP_SCORE = 0.92
+
 # MySQL Configuration (Pre-configured for future Text-to-SQL integration)
 MYSQL_HOST = os.getenv("MYSQL_HOST") or "localhost"
 MYSQL_PORT = os.getenv("MYSQL_PORT") or "8964"
@@ -88,8 +95,6 @@ REFRESH_COLLECTION = False # 本次需设为 True 以重建 Schema
 CLEAR_MEMORY_ON_STARTUP = False # 是否在启动时清空长期记忆集合
 REFRESH_BM25 = False # 手动触发 BM25 模型的重新拟合与旧数据稀疏向量的局部更新
 
-# 权限配置：主人 QQ 号列表（英文逗号分隔）
-OWNER_QQ_IDS = {x.strip() for x in (os.getenv("OWNER_QQ_IDS") or "").split(",") if x.strip()}
 
 # QQ 回复最大字符数限制
 # 依据：官方未公布字符上限；实测 API 基本不拦，移动客户端折叠阈值最低约 15000（如 HarmonyOS 16000 起折叠），取 10000 留安全余量

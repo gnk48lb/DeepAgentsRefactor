@@ -3,7 +3,7 @@ import base64
 import os
 import traceback
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Set
+from typing import Optional, List, Set
 import httpx
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
@@ -21,12 +21,12 @@ class ChatReply:
     images: list                  # [{"type": "image_url", "image_url": {"url": "data:image/..."}}]
     awaiting_approval: bool = False
 
-# 全局服务状态与锁
+# ── 单用户模式：全局只有一个 Agent、一把锁、一个固定会话 ──
+THREAD_ID = "main"                       # 固定 thread_id：私聊 / 群聊共用同一份对话上下文
 _initialized: bool = False
-_owner_agent = None
-_normal_agent = None
-_user_locks: Dict[str, asyncio.Lock] = {}
-_pending_outbox: Dict[str, list] = {}
+_agent = None
+_chat_lock = asyncio.Lock()              # 同一时刻只处理一条消息（防止连发消息并发踩同一会话 / HITL 中断状态）
+_pending_outbox: Optional[list] = None   # HITL 中断期间暂存本轮已产生的图片
 _background_tasks: Set[asyncio.Task] = set()
 
 def _guess_mime_type(data: bytes) -> str:
@@ -70,36 +70,11 @@ async def _load_image_as_data_uri(image_url: str) -> Optional[str]:
 
 
 async def init_service() -> None:
-    """初始化数据库、MCP服务并构建主 Agent"""
-    global _initialized, _owner_agent, _normal_agent
+    """初始化数据库、MCP 服务并构建主 Agent（单用户：只构建一个全功能 Agent）"""
+    global _initialized, _agent
     print("🚀 [chat_service] 正在初始化数据环境与 Agent 服务...")
-
-    # 数据库同步初始化放入线程
     await asyncio.to_thread(database.run_global_database_init)
-
-    owner_ids = getattr(config, "OWNER_QQ_IDS", set())
-    shared_checkpointer = MemorySaver()
-
-    if not owner_ids:
-        print("\n" + "!" * 60)
-        print("⚠️ 警告：config.OWNER_QQ_IDS 为空！所有用户均享有特权专家权限！")
-        print("!" * 60 + "\n")
-        _owner_agent = await deep_agent.build_main_agent(
-            checkpointer=shared_checkpointer,
-            include_privileged=True,
-        )
-        _normal_agent = _owner_agent
-    else:
-        print(f"🔒 [chat_service] 主人 QQ 列表配置: {owner_ids}，正在构建特权版与受限版 Agent...")
-        _owner_agent = await deep_agent.build_main_agent(
-            checkpointer=shared_checkpointer,
-            include_privileged=True,
-        )
-        _normal_agent = await deep_agent.build_main_agent(
-            checkpointer=shared_checkpointer,
-            include_privileged=False,
-        )
-
+    _agent = await deep_agent.build_main_agent(checkpointer=MemorySaver())
     _initialized = True
     print("✅ [chat_service] 初始化完成。")
 
@@ -108,45 +83,31 @@ def is_initialized() -> bool:
 
 async def shutdown_service() -> None:
     """关闭系统服务并释放 MCP 资源"""
-    global _initialized, _owner_agent, _normal_agent
+    global _initialized, _agent
     print("🛑 [chat_service] 正在关闭服务...")
     from app import mcp_service
     await mcp_service.shutdown_mcp()
-    _owner_agent = None
-    _normal_agent = None
+    _agent = None
     _initialized = False
     print("✅ [chat_service] 服务已关闭。")
 
-def _select_agent(user_id: str):
-    owner_ids = getattr(config, "OWNER_QQ_IDS", set())
-    if not owner_ids or str(user_id).strip() in owner_ids:
-        return _owner_agent
-    return _normal_agent
+async def process_message(text: str, image_url: Optional[str] = None) -> Optional[ChatReply]:
+    """处理单条用户消息（单用户模式：不区分用户、无权限校验）。不依赖 NoneBot，纯业务逻辑层。"""
+    global _pending_outbox
 
-async def process_message(user_id: str, text: str, image_url: Optional[str] = None) -> Optional[ChatReply]:
-    """
-    处理单条用户消息。
-    不依赖 NoneBot，纯纯的业务逻辑层。
-    """
     if not _initialized:
         return ChatReply("Agent 系统尚未初始化完成，请稍后再试。", [])
 
-    owner_ids = getattr(config, "OWNER_QQ_IDS", set())
-    if owner_ids and str(user_id).strip() not in owner_ids:
-        print(f"[chat] 非主人用户 {user_id}")
-
-    # 1. 每个 user_id 一把锁，并发时直接返回占用提示不排队
-    lock = _user_locks.setdefault(user_id, asyncio.Lock())
-    if lock.locked():
+    # 全局一把锁：上一条还在处理时直接返回占用提示，不排队
+    if _chat_lock.locked():
         return ChatReply("上一条消息还在处理中，请稍候再发。", [])
 
-    async with lock:
+    async with _chat_lock:
         try:
-            agent = _select_agent(user_id)
-            thread_id = str(user_id).strip()
+            agent = _agent
             agent_config = {
                 "recursion_limit": config.AGENT_RECURSION_LIMIT,
-                "configurable": {"thread_id": thread_id},
+                "configurable": {"thread_id": THREAD_ID},
             }
 
             # 2. 检查是否在等授权
@@ -154,7 +115,8 @@ async def process_message(user_id: str, text: str, image_url: Optional[str] = No
             if hitl.has_pending_interrupts(current_state):
                 user_reply = text.strip().upper()
                 if user_reply in ("Y", "N"):
-                    resumed_outbox = _pending_outbox.pop(user_id, [])
+                    resumed_outbox = _pending_outbox or []
+                    _pending_outbox = None
                     outbox.resume(resumed_outbox)
                     await asyncio.wait_for(
                         agent.ainvoke(Command(resume=hitl.build_resume(current_state, user_reply)), agent_config),
@@ -206,7 +168,6 @@ async def process_message(user_id: str, text: str, image_url: Optional[str] = No
                 messages = await asyncio.to_thread(
                     deep_agent.build_initial_messages,
                     processed_text,
-                    user_id,
                 )
                 await asyncio.wait_for(
                     agent.ainvoke({"messages": messages}, agent_config),
@@ -216,8 +177,7 @@ async def process_message(user_id: str, text: str, image_url: Optional[str] = No
             # 4. 一轮 ainvoke 结束后再次检查是否有中断
             after_state = await agent.aget_state(agent_config)
             if hitl.has_pending_interrupts(after_state):
-                curr_lst = outbox.current()
-                _pending_outbox[user_id] = curr_lst
+                _pending_outbox = outbox.current()
                 warning = hitl.format_hitl_warning(after_state)
                 return ChatReply(
                     text=warning,

@@ -62,7 +62,6 @@ async def run_agent(query: str, agent, config_dict: dict) -> str:
     outbox.begin()
     messages = deep_agent.build_initial_messages(
         user_query=query,
-        user_id="console_user",
     )
     inputs = {"messages": messages}
 

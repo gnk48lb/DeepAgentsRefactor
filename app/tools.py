@@ -128,11 +128,16 @@ def rag(query: str):
         return f"Error searching knowledge base: {e}"
 
 
+_WEEKDAYS_CN = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+
+
 @tool
 def get_current_time(placeholder: str = "default") -> str:
-    """Returns the current date and time."""
+    """获取当前的日期、时间和星期（本机时区）。用于回答今天几号、星期几、现在几点、今年是哪一年、距离某个日期还有几天等问题。本工具不需要任何参数，placeholder 可忽略。"""
     print("\n[Tool Call: get_current_time]")
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now().astimezone()
+    off = now.strftime("%z")  # 例如 +0800
+    return f"{now.strftime('%Y-%m-%d %H:%M:%S')} {_WEEKDAYS_CN[now.weekday()]} (UTC{off[:3]}:{off[3:]})"
 
 @tool
 def web_search(query: str) -> str:

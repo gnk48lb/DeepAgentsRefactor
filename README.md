@@ -18,24 +18,44 @@ GNK48-Agent 采用声明式主智能体配合垂直领域子专家架构。主 A
 - **图片发件箱 (Outbox)**: 子 Agent 产出的图片（如代码绘图）通过旁路发件箱系统收集并递交给接入层，避免将海量 Base64 塞入主 Agent 上下文。
 
 ### 2.2 子专家清单
-1. **KnowledgeAgent**: 知识检索专家，优先检索本地 Milvus 知识库 (`rag`)，无果且具时效性时通过 Tavily 全网搜索 (`web_search`)。
+1. **KnowledgeAgent**: 知识检索专家，优先检索本地 Milvus 知识库 (`rag`)，无果且具时效性时通过 Tavily 全网搜索 (`web_search`)；另提供 `get_current_time`，回答当前日期 / 时间 / 星期类问题。
 2. **MediaAgent**: 专有图谱检索专家，基于 Neo4j 知识图谱 (`av_graph_rag`) 进行实体与关系网络查询。
 3. **MapAgent**: 地理与出行专家，挂载高德地图 MCP (`amap`)，支持天气查询、周边检索、路径规划与地理编码。
-4. **CodeAgent**: 代码执行专家，通过 Docker 隔离沙箱安全运行 Python 脚本，支持数据分析与 Matplotlib 绘图。
+4. **CodeAgent**: 代码执行专家，通过 Docker 隔离沙箱安全运行 Python 脚本，支持数据分析与 Matplotlib 绘图（绘图规范由 Skill `matplotlib-chart` 提供）。
 5. **SQLAgent**: 关系数据库专家，负责将自然语言转为 SQL 并查询本地 MySQL (`execute_sql`)。
 6. **BrowserAgent**: 浏览器自动化专家，基于 Playwright/browser-use 操控真实或无头浏览器，处理网页端交互。
 7. **FileAgent (HITL)**: 本地文件专家，内置 FilesystemMiddleware + FilesystemBackend + 原生 HITL。提供工具：`ls`/`glob`/`grep`/`read_file` 免授权，`write_file`/`edit_file`/`create_directory`/`move_file` 需授权，删除 = 移动到 archive_trash 归档。只能在 workspace 工作区内操作。
 8. **DesktopAgent (HITL)**: 桌面操作专家，基于网格坐标截屏、模拟点击与键鼠交互。
 
-### 2.3 特权版 vs 受限版
-系统根据 `config.OWNER_QQ_IDS` 自动为不同权限的用户构建专属 Agent 实例：
-- **特权版 (Owner)**: 挂载全量 8 个子专家（包含具有本地文件读写权限的 `FileAgent`、物理桌面控制的 `DesktopAgent` 以及自动化操作网页的 `BrowserAgent`）。
-- **受限版 (Normal)**: 受限版不挂载 `FileAgent`、`DesktopAgent`、`BrowserAgent`，普通用户仅可使用知识检索、图谱检索、高德地图、代码沙箱执行和数据库查询等非特权专家。
+### 2.3 单用户模式
+系统为单用户专属模式，仅供本人使用：
+- 所有专家（含具有本地文件读写权限的 `FileAgent`、物理桌面控制的 `DesktopAgent` 以及自动化操作网页的 `BrowserAgent` 等全量 8 个专家）始终挂载。
+- 系统内部没有任何用户身份或权限校验逻辑。
+- 对话会话使用固定的 `thread_id`（`"main"`），私聊与群聊共享同一份对话上下文。
+
+> **警告**：机器人必须保持私有；若将来对外开放，需要重新引入用户隔离与权限层。
 
 ### 2.4 MCP 常驻会话与容错机制
 系统通过 Model Context Protocol (MCP) 集成外部能力（如高德地图 `amap`、桌面控制 `desktop`）。
 各 MCP 服务进程在机器人启动时由专属后台 Runner 统一拉起并常驻运行，退出时自动回收，大幅降低工具调用开销。
 运行时支持并发调用与调用超时熔断（默认 60s）；若检测到服务异常断开或进程挂死，将自动触发重连与会话重建，确保长时间运行的稳定性。
+
+### 2.5 长期记忆
+系统基于 Milvus 向量库维护跨会话长期记忆：
+- **检索过滤**：检索时通过 `config.MEMORY_MIN_SCORE` 进行相似度阈值过滤，低于阈值的记忆视为与当前问题无关，不注入对话上下文。
+- **写入去重**：写入时通过 `config.MEMORY_DEDUP_SCORE` 进行语义去重，与已有记忆相似度高于该阈值时自动覆盖旧记忆。
+- **日志审计**：记忆检索阶段输出 `[记忆检索]` 标签日志，明确标注每条命中条目的分数与采用/丢弃状态，便于阈值校准。
+
+### 2.6 Skills
+系统采用 deepagents 官方 Skills 机制扩展专家的专业技能：
+- **组织形式**：技能存放于 `skills/<name>/SKILL.md`，文件采用 YAML frontmatter 定义元数据，其中 `name` 必须与所在目录名完全一致，`description` 明确说明何时使用。
+- **专家装配**：自定义子专家不会自动继承主 Agent 的 skills，需在自身声明式 spec 中显式配置 `skills=[SKILLS_ROUTE]`。
+- **虚拟路由**：由 `app/skills.py` 构建 `CompositeBackend`，将虚拟路径 `/skills/` 路由到本地真实的 `skills/` 磁盘目录；子专家在需要出图时通过内置 `read_file` 按需读取技能规范。
+- **新增技能步骤**：
+  1. 在 `skills/<skill-name>/` 下创建 `SKILL.md`，编写规范的 frontmatter（name 与目录一致，明确 description）及正文；
+  2. 若给子专家使用，在 `app/deep_agent.py` 对应专家的 spec 中添加 `skills: [SKILLS_ROUTE]`，并在其 prompt 中提示触发条件与读取路径；
+  3. 运行 `tests/smoke_skills.py` 进行静态规范与 backend 虚拟路由验证。
+- **编写规范**：`SKILL.md` 保持精简（建议 ≤ 100 行），一次 `read_file` 调用即可完整读完。
 
 ---
 
@@ -58,6 +78,7 @@ DeepAgentsRefactor/
 │   ├── models.py             # LLM / VLM / 向量模型与重排器单例定义
 │   ├── outbox.py             # 图片跨轮发件箱旁路
 │   ├── sandbox.py            # Docker Python 沙箱代码执行环境
+│   ├── skills.py             # Skills 虚拟文件系统 Backend 路由配置
 │   ├── tools.py              # 本地工具集合（RAG, Docker Code, SQL 等）
 │   ├── transforms.py         # 查询转换增强 (HyDE, Step-Back, Multi-Query) 与意图路由
 │   ├── utils.py              # 通用辅助工具 (extract_text)
@@ -70,8 +91,12 @@ DeepAgentsRefactor/
 │   ├── login_setup.py        # 浏览器自动化持久化登录引导脚本
 │   ├── manage_memory.py      # Milvus 长期记忆查看与清理工具
 │   └── migrate_to_mysql.py   # 数据迁移至 MySQL
+├── skills/                   # deepagents 官方 Skills 目录
+│   └── matplotlib-chart/     # Matplotlib 绘图规范技能
+│       └── SKILL.md          # 技能指令与固定模板
 ├── tests/                    # 测试用例
-│   └── smoke_file_agent.py   # FileAgent 离线冒烟测试
+│   ├── smoke_file_agent.py   # FileAgent 离线冒烟测试
+│   └── smoke_skills.py       # Skills 规范与 Backend 路由冒烟测试
 ├── storage/                  # 运行时持久化目录（Milvus DB、浏览器配置等，已忽略）
 ├── workspace/                # FileAgent 操作工作区（已忽略）
 ├── bot.py                    # NoneBot2 QQ 机器人启动入口
@@ -128,30 +153,14 @@ uv run python main.py
 
 ### 5.3 命令行脱离 QQ 测试终端 (Chat CLI)
 ```bash
-# 以特权用户身份测试
-uv run python scripts/chat_cli.py --user 111
+uv run python scripts/chat_cli.py
 ```
 
 ---
 
-## 6. OWNER_QQ_IDS 设置说明
+## 6. HITL 人工授权说明
 
-- QQ 官方机器人体系下给出的用户标识是 **openid**（一串字符哈希），而非传统的 5~10 位纯数字 QQ 号。
-- **单聊**与**不同群聊**中，同一个真实用户对应的 openid 可能各不相同。
-- **设置方法**：
-  1. 启动机器人并先在私聊或群聊中发送任意测试消息。
-  2. 观察控制台输出的日志：`[chat] user_id=<id>`。
-  3. 将该 `<id>` 填入 `.env` 中的 `OWNER_QQ_IDS`（多个 ID 用半角逗号分隔），例如：
-     ```bash
-     OWNER_QQ_IDS="ABCD1234EFGH,IJKL5678MNOP"
-     ```
-  4. 重启机器人即可生效。
-
----
-
-## 7. HITL 人工授权说明
-
-在特权模式下，当 `FileAgent` 或 `DesktopAgent` 尝试执行高危操作（如写文件、编辑文件、移动文件、执行高危系统按键）时，系统会自动挂起并弹出授权请求：
+当 `FileAgent` 或 `DesktopAgent` 尝试执行高危操作（如写文件、编辑文件、移动文件、执行高危系统按键）时，系统会自动挂起并弹出授权请求：
 ```text
 ⚠️ 敏感操作授权拦截
 ──────────────────
@@ -166,7 +175,7 @@ uv run python scripts/chat_cli.py --user 111
 
 ---
 
-## 8. 工具与测试脚本说明
+## 7. 工具与测试脚本说明
 
 - `scripts/chat_cli.py`：命令行多轮对话终端，脱离 QQ 测试 Agent 交互与 HITL 授权流程。
 - `scripts/manage_memory.py`：管理 Milvus 长期记忆库，支持 `list` 查看与 `delete <id>` 删除。
@@ -175,9 +184,8 @@ uv run python scripts/chat_cli.py --user 111
 
 ---
 
-## 9. 已知限制
+## 8. 已知限制
 
 1. **DesktopAgent 不稳定**: 桌面操作依赖网格视觉识别，受分辨率和缩放比例影响较大，可能存在点击漂移。
-2. **受限版专家权限**: 受限版不挂载 `FileAgent`、`DesktopAgent`、`BrowserAgent`，普通用户仅可使用知识检索、图谱检索、高德地图、代码沙箱执行和数据库查询等非特权专家。
-3. **MemorySaver 会话重启丢失**: 当前状态保存器为内存级 `MemorySaver`，机器人进程重启后进行中的上下文与未决 HITL 中断会丢失。长期事实依赖 Milvus 后台抽取持久化。
-4. **FileAgent 工具调用步数限制**: 单次 FileAgent 运行串行工具调用上限约 19 次（带 HITL 中间件每次工具调用占 3 个 superstep）；`write_file` 对已存在文件会整体覆盖。
+2. **MemorySaver 会话重启丢失**: 当前状态保存器为内存级 `MemorySaver`，机器人进程重启后进行中的上下文与未决 HITL 中断会丢失。长期事实依赖 Milvus 后台抽取持久化。
+3. **FileAgent 工具调用步数限制**: 单次 FileAgent 运行串行工具调用上限约 19 次（带 HITL 中间件每次工具调用占 3 个 superstep）；`write_file` 对已存在文件会整体覆盖。
