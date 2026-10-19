@@ -62,6 +62,8 @@ try:
 except ImportError:
     ToolCallLimitMiddleware = None
 
+from . import amap
+from . import markitdown_tool
 from . import models
 from . import tools
 from . import mcp_service
@@ -128,9 +130,10 @@ SUBAGENT_DESCRIPTIONS = {
     "CodeAgent": "代码执行专家，用 Python 解决数学计算、数据处理和绘图任务。只能写代码运行，不能帮你查资料；需要绘图时必须明确指示它绘图。",
     "FileAgent": (
         "本地文件专家，是唯一能访问本地磁盘（workspace 工作区）的专家：列目录、搜索、读取文本类文件，"
+        "支持用 convert_to_markdown 读取 PDF、Word、PPT、Excel、HTML、EPub、CSV、ZIP 等文档，"
         "写入、编辑、新建目录、移动或重命名文件（“删除”一律改为移动到 archive_trash 归档）。"
         "写入/编辑/新建目录/移动会暂停并请求人工授权。"
-        "不要让它读取图片、音视频等二进制文件（它无法解析，会导致死循环）；"
+        "不要让它读取纯图片、音视频等媒体文件；"
         "网页上传文件的任务不要先派它读取，直接把路径交给 BrowserAgent。"
     ),
 }
@@ -154,13 +157,20 @@ FILE_AGENT_PROMPT = (
     + "【效率原则】\n"
     + "  · 先用 ls 或 glob(pattern=\"**/*\", path=\"/workspace\") 了解目录全貌，再按需 read_file。\n"
     + "  · 大文件用 read_file 的 offset / limit 分页读取（每次不超过 200 行），不要一次读完整个大文件；找内容优先用 grep。\n"
-    + "  · 只处理文本类文件；遇到图片、音视频、压缩包等二进制文件，直接汇报无法读取，严禁尝试 read_file。\n"
+    + "  · 纯文本与代码文件用 read_file（严禁对二进制或富文档调用 read_file）；遇到图片、音视频等媒体文件直接汇报无法读取。\n"
     + "【写入规范】\n"
     + "  · write_file 会整体覆盖已存在的文件，并自动创建父目录；覆盖前先 read_file 确认现有内容。局部修改优先 edit_file。\n"
     + "  · 没有删除工具。主管要求“删除”文件时，用 move_file 把它移动到 /workspace/archive_trash/ 下（目标同名已存在时，在文件名后加序号或时间戳）。\n"
     + "  · 需要新建空文件夹时用 create_directory。\n"
     + "【授权被拒】写入类操作会暂停等待用户授权。如果被用户拒绝（收到“用户明确拒绝/权限被拒绝”的提示），你必须立即停止对该操作及类似操作的尝试，严禁循环请求；礼貌地向主管汇报该步骤已被用户取消，并根据情况继续其他安全步骤或直接结束任务。\n"
     + "【汇报格式】最终回答以“【内部专家汇报 - 来源：FileAgent】”开头，然后给出工具实际返回的结果（路径、文件内容、执行结果等）；没有拿到工具结果时如实说明，禁止把计划当成结果。\n"
+)
+
+FILE_AGENT_MARKITDOWN_PROMPT = (
+    "【文档转换】PDF、Word、PowerPoint、Excel、HTML、EPub、CSV、ZIP 等需要转成 Markdown 才能阅读的文件，"
+    "调用 convert_to_markdown；纯文本、代码文件直接用 read_file 更省 token。图片、音视频仍不要读取。\n"
+    "【转换路径】convert_to_markdown 的 uri 直接写成 /workspace/<相对路径>（或 file:///workspace/<相对路径>），"
+    "例如 /workspace/报告/a.pdf。不要传 http(s) 链接，不要传工作区外的路径。\n"
 )
 
 KNOWLEDGE_AGENT_PROMPT = (
@@ -312,11 +322,14 @@ async def build_main_agent(
     - 中间件: ToolCallLimitMiddleware 防御 task 工具死循环
     - 持久化: 默认使用 MemorySaver
     """
-    # 确保 MCP 服务已初始化
-    await mcp_service.initialize_mcp()
-    amap_tools = mcp_service.get_tools_by_server("amap")
+    # 校验高德配置并获取本地工具
+    amap.validate_config()
+    amap_tools = amap.get_tools()
     if not amap_tools:
         print("⚠️ 警告：MapAgent 没有任何高德工具，地图/天气查询将不可用！")
+
+    # 确保 MCP 服务已初始化
+    await mcp_service.initialize_mcp()
 
     # 配置中间件
     middleware = []
@@ -374,10 +387,16 @@ async def build_main_agent(
     # 本地操作类专家：FileAgent / DesktopAgent / BrowserAgent 始终挂载
     desktop_tools = mcp_service.get_tools_by_server("desktop")
 
+    markitdown_tools = mcp_service.get_tools_by_server("markitdown")
+    file_extra = markitdown_tool.build_tools(markitdown_tools, config.WORKSPACE_DIR)
+    if not file_extra:
+        print("⚠️ 警告：FileAgent 未获取到 convert_to_markdown 工具，请检查 uvx 与 markitdown-mcp 环境！")
+
     file_agent_runnable = file_agent.build_file_agent_runnable(
         llm=models.worker_llm,
-        system_prompt=FILE_AGENT_PROMPT,
+        system_prompt=FILE_AGENT_PROMPT + (FILE_AGENT_MARKITDOWN_PROMPT if file_extra else ""),
         workspace_dir=config.WORKSPACE_DIR,
+        extra_tools=file_extra,
     )
     file_subagent = CompiledSubAgent(
         name="FileAgent",
@@ -415,6 +434,14 @@ async def build_main_agent(
         "tools": [],
         "model": models.worker_llm,
     })
+
+    # 断言除 FileAgent 外，任何声明式子 Agent 的工具列表都不得包含 convert_to_markdown
+    for sa in subagents:
+        if isinstance(sa, dict) and sa.get("name") != "FileAgent":
+            tool_names = [getattr(t, "name", str(t)) for t in sa.get("tools", [])]
+            assert "convert_to_markdown" not in tool_names, (
+                f"子 Agent '{sa.get('name')}' 违规持有 convert_to_markdown 工具！"
+            )
 
     if checkpointer is None:
         checkpointer = MemorySaver()

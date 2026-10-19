@@ -20,11 +20,11 @@ GNK48-Agent 采用声明式主智能体配合垂直领域子专家架构。主 A
 ### 2.2 子专家清单
 1. **KnowledgeAgent**: 知识检索专家，优先检索本地 Milvus 知识库 (`rag`)，无果且具时效性时通过 Tavily 全网搜索 (`web_search`)；另提供 `get_current_time`，回答当前日期 / 时间 / 星期类问题。
 2. **MediaAgent**: 专有图谱检索专家，基于 Neo4j 知识图谱 (`av_graph_rag`) 进行实体与关系网络查询。
-3. **MapAgent**: 地理与出行专家，挂载高德地图 MCP (`amap`)，支持天气查询、周边检索、路径规划与地理编码。
+3. **MapAgent**: 地理与出行专家，挂载高德地图本地工具（原 MCP 已平滑迁移为本地 Tool），支持天气查询、周边检索、路径规划与地理编码。
 4. **CodeAgent**: 代码执行专家，通过 Docker 隔离沙箱安全运行 Python 脚本，支持数据分析与 Matplotlib 绘图（绘图规范由 Skill `matplotlib-chart` 提供）。
 5. **SQLAgent**: 关系数据库专家，负责将自然语言转为 SQL 并查询本地 MySQL (`execute_sql`)。
 6. **BrowserAgent**: 浏览器自动化专家，基于 Playwright/browser-use 操控真实或无头浏览器，处理网页端交互。
-7. **FileAgent (HITL)**: 本地文件专家，内置 FilesystemMiddleware + FilesystemBackend + 原生 HITL。提供工具：`ls`/`glob`/`grep`/`read_file` 免授权，`write_file`/`edit_file`/`create_directory`/`move_file` 需授权，删除 = 移动到 archive_trash 归档。只能在 workspace 工作区内操作。
+7. **FileAgent (HITL)**: 本地文件专家，内置 FilesystemMiddleware + FilesystemBackend + 原生 HITL。提供工具：`ls`/`glob`/`grep`/`read_file` 免授权，`convert_to_markdown`（由 markitdown-mcp 提供，支持富文档转 Markdown），`write_file`/`edit_file`/`create_directory`/`move_file` 需授权，删除 = 移动到 archive_trash 归档。只能在 workspace 工作区内操作。
 8. **DesktopAgent (HITL)**: 桌面操作专家，基于网格坐标截屏、模拟点击与键鼠交互。
 
 ### 2.3 单用户模式
@@ -36,7 +36,7 @@ GNK48-Agent 采用声明式主智能体配合垂直领域子专家架构。主 A
 > **警告**：机器人必须保持私有；若将来对外开放，需要重新引入用户隔离与权限层。
 
 ### 2.4 MCP 常驻会话与容错机制
-系统通过 Model Context Protocol (MCP) 集成外部能力（如高德地图 `amap`、桌面控制 `desktop`）。
+系统通过 Model Context Protocol (MCP) 集成外部能力（如文档转换 `markitdown`、桌面控制 `desktop`）。
 各 MCP 服务进程在机器人启动时由专属后台 Runner 统一拉起并常驻运行，退出时自动回收，大幅降低工具调用开销。
 运行时支持并发调用与调用超时熔断（默认 60s）；若检测到服务异常断开或进程挂死，将自动触发重连与会话重建，确保长时间运行的稳定性。
 
@@ -64,7 +64,7 @@ GNK48-Agent 采用声明式主智能体配合垂直领域子专家架构。主 A
 ```text
 DeepAgentsRefactor/
 ├── app/                      # 核心业务逻辑
-│   ├── amap_wrapper.py       # 高德地图工具包装与坐标校验
+│   ├── amap/                 # 高德地图本地 Tool 实现与契约快照
 │   ├── browser_service.py    # 浏览器自动化控制封装 (Playwright)
 │   ├── chat_service.py       # 统一对话服务层（处理锁、并发、HITL与发件箱）
 │   ├── database.py           # Milvus 向量库与长期记忆管理
@@ -74,7 +74,8 @@ DeepAgentsRefactor/
 │   ├── graph_rag.py          # 媒体图谱检索器 (Neo4j + Milvus Hybrid)
 │   ├── hitl.py               # 人工授权 (HITL) 公共辅助与中断恢复
 │   ├── loader.py             # 文档与多模态数据加载、切片与图片编码
-│   ├── mcp_service.py        # MCP 协议客户端管理 (Amap, Desktop)
+│   ├── markitdown_tool.py    # FileAgent 专属 MarkItDown 工具包装与工作区路径映射
+│   ├── mcp_service.py        # MCP 协议客户端管理 (MarkItDown, Desktop)
 │   ├── models.py             # LLM / VLM / 向量模型与重排器单例定义
 │   ├── outbox.py             # 图片跨轮发件箱旁路
 │   ├── sandbox.py            # Docker Python 沙箱代码执行环境
@@ -95,7 +96,12 @@ DeepAgentsRefactor/
 │   └── matplotlib-chart/     # Matplotlib 绘图规范技能
 │       └── SKILL.md          # 技能指令与固定模板
 ├── tests/                    # 测试用例
-│   ├── smoke_file_agent.py   # FileAgent 离线冒烟测试
+│   ├── fixtures/amap/        # 高德工具契约与 Golden 样本数据
+│   ├── live_amap_golden.py   # 高德工具在线 Golden 结构对比测试
+│   ├── smoke_amap_contract.py # 高德工具快照与契约冒烟测试
+│   ├── smoke_amap_http.py     # 高德工具 HTTP 异常与密钥脱敏测试
+│   ├── smoke_file_agent.py   # FileAgent 离线冒烟测试（含 MarkItDown 路径拦截）
+│   ├── smoke_markitdown_e2e.py # MarkItDown MCP 端到端验证测试
 │   └── smoke_skills.py       # Skills 规范与 Backend 路由冒烟测试
 ├── storage/                  # 运行时持久化目录（Milvus DB、浏览器配置等，已忽略）
 ├── workspace/                # FileAgent 操作工作区（已忽略）

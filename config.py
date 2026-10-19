@@ -113,6 +113,14 @@ AGENT_TURN_TIMEOUT_SECONDS = 600
 # 若 MCP 服务进程卡死未返回，超过此时间将触发服务重启回收并报错
 MCP_CALL_TIMEOUT_SECONDS = 60
 
+# MarkItDown MCP 配置（无 Docker，本地工作区隔离）
+# 是否允许转换 http(s) URL。默认 False，仅允许转换 WORKSPACE_DIR 内的本地文件（网页读取交由 BrowserAgent）。
+MARKITDOWN_ALLOW_HTTP = os.getenv("MARKITDOWN_ALLOW_HTTP", "false").lower() in ("1", "true", "yes")
+# 单文件大小上限（MB），防止无容器内存限制下解析超大文件耗尽宿主机内存
+MARKITDOWN_MAX_FILE_MB = 50
+# 按 MCP 服务名覆盖单次调用超时（秒）：大 PDF/Office 文档转换可能超过默认 60s
+MCP_CALL_TIMEOUT_SECONDS_BY_SERVER = {"markitdown": 180}
+
 # MCP 服务启动/连接等待超时（秒）
 # 各服务启动时拉取工具的最大允许等待时间，超时按启动失败处理
 MCP_STARTUP_TIMEOUT_SECONDS = 180

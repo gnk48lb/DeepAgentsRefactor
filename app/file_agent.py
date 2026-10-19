@@ -103,12 +103,13 @@ def make_workspace_tools(workspace_dir: str) -> list:
     return [move_file, create_directory]
 
 
-def build_file_agent_runnable(llm, system_prompt: str, workspace_dir: str, checkpointer=None):
+def build_file_agent_runnable(llm, system_prompt: str, workspace_dir: str, checkpointer=None, extra_tools=None):
     """返回可直接放进 CompiledSubAgent(runnable=...) 的已编译图。
     checkpointer 保持 None：由主图的 checkpointer 统一接管（与旧子图一致）。"""
+    tools = make_workspace_tools(workspace_dir) + list(extra_tools or [])
     return create_agent(
         model=llm,
-        tools=make_workspace_tools(workspace_dir),
+        tools=tools,
         system_prompt=system_prompt,
         middleware=[
             FilesystemMiddleware(backend=build_workspace_backend(workspace_dir), tools=FS_TOOLS),

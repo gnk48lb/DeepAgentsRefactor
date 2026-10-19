@@ -1,19 +1,17 @@
 {
-  "amap": {
+  "markitdown": {
     "command": "uvx",
     "args": [
       "--quiet",
+      "--from",
+      "markitdown-mcp==0.0.1a7",
       "--with",
-      "amap-mcp-server==0.1.11",
-      "--with",
-      "mcp==1.8.1",
-      "--with",
-      "pydantic==2.10.6",
-      "python",
-      "app/amap_wrapper.py"
+      "markitdown[all]",
+      "markitdown-mcp"
     ],
     "env": {
-      "AMAP_MAPS_API_KEY": "${AMAP_API_KEY}"
+      "PYTHONUTF8": "1",
+      "PYTHONIOENCODING": "utf-8"
     },
     "transport": "stdio"
   },

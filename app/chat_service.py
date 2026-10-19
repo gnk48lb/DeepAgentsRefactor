@@ -85,8 +85,9 @@ async def shutdown_service() -> None:
     """关闭系统服务并释放 MCP 资源"""
     global _initialized, _agent
     print("🛑 [chat_service] 正在关闭服务...")
-    from app import mcp_service
+    from app import mcp_service, amap
     await mcp_service.shutdown_mcp()
+    await amap.aclose()
     _agent = None
     _initialized = False
     print("✅ [chat_service] 服务已关闭。")

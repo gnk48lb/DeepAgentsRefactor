@@ -296,8 +296,9 @@ async def main_loop():
         traceback.print_exc()
         print(f"系统启动失败: {e}")
     finally:
-        from app import mcp_service
+        from app import mcp_service, amap
         await mcp_service.shutdown_mcp()
+        await amap.aclose()
 
 if __name__ == "__main__":
     asyncio.run(main_loop())

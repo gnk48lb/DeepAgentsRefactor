@@ -3,7 +3,6 @@
 设计要点
 --------
 * 逐服务拉取工具并打上 ``__mcp_server__`` 来源标签，供下游按标签路由。
-* 高德坐标工具保留原有拦截逻辑（格式校验 + 描述增强）。
 """
 
 import json
@@ -23,8 +22,6 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 import config
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
-# 高德坐标类工具关键词
-_AMAP_COORD_KEYWORDS = ("around", "coordinates", "regeocode", "distance")
 
 # mcp_servers.json 所在路径
 _CONFIG_PATH = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "mcp_servers.json"
@@ -84,15 +81,6 @@ def _load_mcp_config() -> dict:
         raw: dict = json.load(f)
 
     resolved = _resolve_config_node(raw)
-
-    # 校验 amap 必须有有效的 API Key
-    if "amap" in resolved:
-        amap_key = resolved["amap"].get("env", {}).get("AMAP_MAPS_API_KEY", "")
-        if not amap_key or amap_key.startswith("${"):
-            raise ValueError(
-                "AMAP_API_KEY 未配置或替换失败，请在 .env 中设置 AMAP_API_KEY。"
-            )
-
     return resolved
 
 
@@ -178,6 +166,9 @@ async def _call_raw_tool(server_name: str, tool_name: str, tool_input: dict):
     if runner is None:
         raise RuntimeError(f"未找到 MCP 服务 '{server_name}' 的 Runner")
 
+    timeout = getattr(config, "MCP_CALL_TIMEOUT_SECONDS_BY_SERVER", {}).get(
+        server_name, config.MCP_CALL_TIMEOUT_SECONDS
+    )
     for attempt in (1, 2):
         gen = runner.generation
         raw = runner.tools.get(tool_name)
@@ -185,11 +176,11 @@ async def _call_raw_tool(server_name: str, tool_name: str, tool_input: dict):
             err_detail = _format_exception(runner.last_error) if runner.last_error else "服务未就绪"
             raise RuntimeError(f"MCP 服务 '{server_name}' 当前不可用: {err_detail}")
         try:
-            return await asyncio.wait_for(raw.ainvoke(tool_input), config.MCP_CALL_TIMEOUT_SECONDS)
+            return await asyncio.wait_for(raw.ainvoke(tool_input), timeout)
         except asyncio.TimeoutError:
             await runner.restart(gen)        # 回收卡死的进程；本次调用不重试（可能已有副作用）
             raise RuntimeError(
-                f"MCP 工具 '{tool_name}' 超过 {config.MCP_CALL_TIMEOUT_SECONDS}s 未返回，已重启 {server_name} 服务"
+                f"MCP 工具 '{tool_name}' 超过 {timeout}s 未返回，已重启 {server_name} 服务"
             )
         except (anyio.ClosedResourceError, anyio.BrokenResourceError):
             if attempt == 2:
@@ -221,7 +212,7 @@ def _wrap_tool(t: BaseTool, server_name: str) -> BaseTool:
 
     Args:
         t: 原始 MCP 工具对象。
-        server_name: 该工具所属的 MCP 服务名称（如 'amap'、'filesystem'）。
+        server_name: 该工具所属的 MCP 服务名称（如 'desktop'、'markitdown'）。
 
     Returns:
         包装后的 StructuredTool，携带 ``__mcp_server__`` 属性。
@@ -240,37 +231,9 @@ def _wrap_tool(t: BaseTool, server_name: str) -> BaseTool:
         )
         cleaned_args_schema = _clean_schema(schema_dict)
 
-    # ── Amap 坐标工具增强 ────────────────────────────────────────────────────
-
-    # ── Amap 坐标工具增强 ────────────────────────────────────────────────────
-    is_coord_tool = (server_name == "amap") and any(
-        kw in t.name for kw in _AMAP_COORD_KEYWORDS
-    )
-    if is_coord_tool:
-        enhanced_description += (
-            "\n\n【重要说明】该工具要求传入精确的经纬度坐标（格式：'经度,纬度'）。"
-            "如果你只有文字地址（如 '文化东路42号'），你必须先调用 maps_geo 获取坐标，"
-            "严禁根据自身知识库猜测、编造或幻觉经纬度数字。"
-        )
-
     async def _coro(*args, **kwargs):
         try:
             tool_input = args[0] if args else kwargs
-
-            # ── Amap 坐标格式运行时校验 ──────────────────────────────────────
-            if is_coord_tool:
-                for field in ("location", "origin", "destination", "origins"):
-                    if field in tool_input and isinstance(tool_input[field], str):
-                        val = tool_input[field]
-                        if not re.match(r"^[0-9.]+,[0-9.]+$", val.strip()):
-                            return (
-                                f"工具 '{t.name}' 调用失败：参数 '{field}' 格式错误。"
-                                f"该字段必须是 '经度,纬度' 格式的数字字符串（如 '117.05,36.65'）。"
-                                f"你直接传入了地址文本 '{val}'。"
-                                f"请先调用 'maps_geo' 解析该地址获取坐标后再试。"
-                            )
-
-            # ── 调用原始工具（通过常驻会话 _call_raw_tool）─────────────────────
             res = await _call_raw_tool(server_name, t.name, tool_input)
 
             # ── 列表结果展开为文本 ────────────────────────────────────────────
@@ -401,7 +364,7 @@ def get_tools_by_server(server_name: str) -> List[BaseTool]:
     """按服务名称过滤工具，利用 __mcp_server__ 属性精准分流。
 
     Args:
-        server_name: mcp_servers.json 中的顶层 key，如 'amap' 或 'filesystem'。
+        server_name: mcp_servers.json 中的顶层 key，如 'desktop' 或 'markitdown'。
 
     Returns:
         属于该服务的工具列表；若未初始化则返回空列表。
@@ -409,7 +372,3 @@ def get_tools_by_server(server_name: str) -> List[BaseTool]:
     if _all_mcp_tools is None:
         return []
     return [t for t in _all_mcp_tools if getattr(t, "__mcp_server__", "") == server_name]
-
-
-# 向后兼容别名
-get_amap_tools = get_all_mcp_tools

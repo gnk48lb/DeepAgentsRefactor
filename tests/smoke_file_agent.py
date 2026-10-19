@@ -22,8 +22,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-# 仅导入 app.file_agent 与 app.hitl，严禁导入 app.models / app.deep_agent / app.graph
-from app import file_agent, hitl
+import asyncio
+
+# 仅导入 app.file_agent, app.hitl 与 app.markitdown_tool，严禁导入 app.models / app.deep_agent / app.graph
+from app import file_agent, hitl, markitdown_tool
+from langchain_core.tools import StructuredTool
 
 from deepagents import (
     create_deep_agent,
@@ -613,6 +616,117 @@ def test_b9_global_profile_isolation():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Group C: MarkItDown 工具包装与路径/安全校验
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_c1_markitdown_normalize_uri():
+    """C1: markitdown normalize_uri 合法映射与安全越界拦截。"""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td).resolve()
+        sub = root / "报告"
+        sub.mkdir(parents=True, exist_ok=True)
+        sample_file = sub / "a.pdf"
+        sample_file.write_bytes(b"%PDF-1.4 dummy content")
+        expected_uri = sample_file.as_uri()
+
+        # 合法路径映射测试
+        valid_cases = [
+            "/workspace/报告/a.pdf",
+            "workspace/报告/a.pdf",
+            "报告/a.pdf",
+            "file:///workspace/报告/a.pdf",
+            str(sample_file),
+            expected_uri,
+        ]
+        for v in valid_cases:
+            res = asyncio.run(markitdown_tool.normalize_uri(v, workspace_dir=root))
+            assert res == expected_uri, f"合法路径映射不符: {v} -> {res} (expected: {expected_uri})"
+
+        # 拒绝输入测试
+        rejected_cases = [
+            "file:///etc/passwd",
+            "file:///C:/Windows/win.ini",
+            "C:\\Windows\\win.ini",
+            "file:///workspace/../../etc/passwd",
+            "/workspace/../../etc/passwd",
+            "workspace/../../etc/passwd",
+            "http://127.0.0.1/",
+            "http://169.254.169.254/",
+            "data:text/plain;base64,SGVsbG8=",
+            "file://evil.com/a.pdf",
+            "",
+            "   ",
+            "/workspace",
+            "workspace",
+            "/workspace/不存在的文件.pdf",
+        ]
+        for r in rejected_cases:
+            try:
+                asyncio.run(markitdown_tool.normalize_uri(r, workspace_dir=root))
+                assert False, f"未被拦截的非法输入: {r}"
+            except ValueError as e:
+                assert str(e).strip(), f"拒绝原因不能为空: {r}"
+
+
+def test_c2_markitdown_build_tools_and_mounting():
+    """C2: markitdown build_tools 工具挂载、执行包装与 FileAgent 隔离性验证。"""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td).resolve()
+        test_file = root / "doc.pdf"
+        test_file.write_bytes(b"%PDF-1.4 dummy")
+
+        called_with = []
+        async def mock_convert(uri: str) -> str:
+            called_with.append(uri)
+            return "# Mocked Markdown Content"
+
+        mock_tool = StructuredTool(
+            name="convert_to_markdown",
+            description="Converts document to markdown",
+            args_schema={"type": "object", "properties": {"uri": {"type": "string"}}, "required": ["uri"]},
+            coroutine=mock_convert,
+        )
+
+        wrapped_tools = markitdown_tool.build_tools([mock_tool], workspace_dir=root)
+        assert len(wrapped_tools) == 1
+        wrapped = wrapped_tools[0]
+        assert wrapped.name == "convert_to_markdown"
+        assert wrapped.description == "Converts document to markdown"
+
+        # 成功调用
+        res = asyncio.run(wrapped.ainvoke({"uri": "/workspace/doc.pdf"}))
+        assert res == "# Mocked Markdown Content"
+        assert called_with == [test_file.as_uri()]
+
+        # 被拒绝的调用返回错误字符串而非未捕获异常
+        rej_res = asyncio.run(wrapped.ainvoke({"uri": "file:///etc/passwd"}))
+        assert rej_res.startswith("convert_to_markdown 调用被拒绝："), f"拒绝文案前缀不符: {rej_res}"
+
+        # 挂载到 FileAgent
+        fam = ScriptedModel(script=[AIMessage(content="ok")])
+        runnable = file_agent.build_file_agent_runnable(
+            llm=fam,
+            system_prompt="prompt",
+            workspace_dir=str(root),
+            extra_tools=wrapped_tools,
+        )
+        runnable.invoke({"messages": [HumanMessage(content="hi")]})
+        assert fam.seen_tools, "未绑定工具"
+        fa_tools = set(fam.seen_tools[0])
+        assert "convert_to_markdown" in fa_tools, f"FileAgent 应持有 convert_to_markdown: {fa_tools}"
+
+        # 默认不传 extra_tools 时不包含 convert_to_markdown
+        fam_default = ScriptedModel(script=[AIMessage(content="ok")])
+        runnable_default = file_agent.build_file_agent_runnable(
+            llm=fam_default,
+            system_prompt="prompt",
+            workspace_dir=str(root),
+        )
+        runnable_default.invoke({"messages": [HumanMessage(content="hi")]})
+        assert "convert_to_markdown" not in fam_default.seen_tools[0]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Runner
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -630,6 +744,8 @@ SCENARIOS = [
     ("B7 hitl.format_hitl_warning 文案格式", test_b7_hitl_warning_formatting),
     ("B8 并行中断与多 id 恢复", test_b8_parallel_interrupts),
     ("B9 全局 profile 隔离性验证", test_b9_global_profile_isolation),
+    ("C1 markitdown 路径映射与安全越界拦截", test_c1_markitdown_normalize_uri),
+    ("C2 markitdown build_tools 工具挂载与隔离", test_c2_markitdown_build_tools_and_mounting),
 ]
 
 
