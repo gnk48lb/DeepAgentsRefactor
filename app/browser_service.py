@@ -115,15 +115,64 @@ async def run_browser_task(task_description: str, llm) -> str:
         print(f"\n[BrowserAgent Error]\n{traceback.format_exc()}")
         return error_msg
         
+def _extract_text_from_html(html: str) -> str:
+    """从 HTML 中剥离无用标签，提取干净的正文文本"""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    # 移除噪音标签
+    for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside"]):
+        tag.decompose()
+
+    # 优先提取主内容区（role=main, main, article, 或 body）
+    main_content = (
+        soup.find(attrs={"role": "main"})
+        or soup.find("main")
+        or soup.find("article")
+        or soup.find("div", class_=lambda c: c and any(k in str(c).lower() for k in ["content", "article", "post", "main", "body"]))
+        or soup.body
+        or soup
+    )
+    text = main_content.get_text(separator="\n", strip=True)
+    import re
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
 async def fetch_generic_webpage_content(url: str) -> str:
     import httpx
+    import os
+
+    default_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        )
+    }
+
+    # 1. 优先尝试 Jina Reader（若配置了 JINA_API_KEY 或未被风控）
+    jina_key = os.getenv("JINA_API_KEY")
+    jina_headers = dict(default_headers)
+    if jina_key:
+        jina_headers["Authorization"] = f"Bearer {jina_key}"
+
     try:
         jina_url = f"https://r.jina.ai/{url}"
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(jina_url)
-            if response.status_code == 200:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            response = await client.get(jina_url, headers=jina_headers)
+            if response.status_code == 200 and response.text.strip():
                 return response.text
-            return f"Error: Received status code {response.status_code} from Jina API."
+            # 若 Jina 出现 401（匿名 IP 风控）/ 402 / 403 / 429 等，输出提示并自动回退为本地直连抓取
+            print(f"[BrowserService] ℹ️ Jina API 返回状态码 {response.status_code}，自动降级为本地直接抓取: {url}")
+    except Exception as e:
+        print(f"[BrowserService] ℹ️ Jina API 请求异常 ({e})，自动降级为本地直接抓取: {url}")
+
+    # 2. 本地直接抓取降级方案（Direct HTTP Fetch + BeautifulSoup Text Extraction）
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, headers=default_headers) as client:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                return _extract_text_from_html(resp.text)
+            return f"Error: 抓取网页失败，目标网站响应状态码 HTTP {resp.status_code}。"
     except Exception as e:
         return f"Error fetching webpage: {str(e)}"
 

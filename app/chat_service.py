@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import os
+import re
+import time
 import traceback
 from dataclasses import dataclass
 from typing import Optional, List, Set
@@ -12,7 +14,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 
 import config
-from app import database, deep_agent, outbox, models, hitl
+from app import database, deep_agent, outbox, models, hitl, cli_logger
 from app.utils import extract_text
 
 @dataclass
@@ -108,17 +110,21 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
         return ChatReply("上一条消息还在处理中，请稍候再发。", [])
 
     async with _chat_lock:
+        turn_start = time.perf_counter()
+        cli_logger.log_turn_start(text, image_url)
         try:
             # 清空固定会话：放在 HITL 判断之前，这样挂起中的授权也能被一并丢弃
             if text.strip().lower() in RESET_COMMANDS:
                 await _checkpointer.adelete_thread(THREAD_ID)
                 _pending_outbox = None
+                cli_logger.log_turn_end("已清空对话上下文，开始新的对话。", 0, False, time.perf_counter() - turn_start)
                 return ChatReply("已清空对话上下文，开始新的对话。", [])
 
             agent = _agent
             agent_config = {
                 "recursion_limit": config.AGENT_RECURSION_LIMIT,
                 "configurable": {"thread_id": THREAD_ID},
+                "callbacks": [cli_logger.CLIDebugCallbackHandler()],
             }
 
             # 2. 检查是否在等授权
@@ -126,6 +132,7 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
             if hitl.has_pending_interrupts(current_state):
                 user_reply = text.strip().upper()
                 if user_reply in ("Y", "N"):
+                    cli_logger.log_hitl_status("RESUMED", user_reply)
                     resumed_outbox = _pending_outbox or []
                     _pending_outbox = None
                     outbox.resume(resumed_outbox)
@@ -135,6 +142,8 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
                     )
                 else:
                     warning = hitl.format_hitl_warning(current_state)
+                    cli_logger.log_hitl_status("REMIND", text)
+                    cli_logger.log_turn_end(warning, 0, True, time.perf_counter() - turn_start)
                     return ChatReply(
                         text=f"⚠️ 当前正在等待授权确认，请回复 Y 允许或 N 拒绝。\n\n{warning}",
                         images=[],
@@ -146,6 +155,7 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
                 if image_url:
                     data_uri = await _load_image_as_data_uri(image_url)
                     if not data_uri:
+                        cli_logger.log_turn_end("图片处理失败，请稍后重试。", 0, False, time.perf_counter() - turn_start)
                         return ChatReply("图片处理失败，请稍后重试。", [])
 
                     sys_prompt = (
@@ -161,18 +171,25 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
                         content.append({"type": "text", "text": "请分析这张图片，提取其中的核心实体或需求"})
                     content.append({"type": "image_url", "image_url": {"url": data_uri}})
 
+                    vlm_start = time.perf_counter()
                     try:
-                        vlm_res = await models.vlm.ainvoke([
-                            SystemMessage(content=sys_prompt),
-                            HumanMessage(content=content)
-                        ])
+                        vlm_res = await models.vlm.ainvoke(
+                            [
+                                SystemMessage(content=sys_prompt),
+                                HumanMessage(content=content)
+                            ],
+                            config={"callbacks": [cli_logger.CLIDebugCallbackHandler()]},
+                        )
                         processed_text = extract_text(vlm_res.content).strip()
+                        cli_logger.log_vlm_translation(processed_text, time.perf_counter() - vlm_start)
                     except Exception as e:
                         print(f"[ERROR] VLM 意图翻译失败: {e}")
                         traceback.print_exc()
+                        cli_logger.log_turn_end("图片理解失败，请稍后重试。", 0, False, time.perf_counter() - turn_start)
                         return ChatReply("图片理解失败，请稍后重试。", [])
 
                 if not processed_text.strip():
+                    cli_logger.log_turn_end("（空消息）", 0, False, time.perf_counter() - turn_start)
                     return None
 
                 outbox.begin()
@@ -180,6 +197,17 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
                     deep_agent.build_initial_messages,
                     processed_text,
                 )
+                try:
+                    first_content = getattr(messages[-1], "content", "") if messages else ""
+                    if isinstance(first_content, str) and "<long_term_memory>" in first_content:
+                        mem_m = re.search(r"<long_term_memory>([\s\S]*?)</long_term_memory>", first_content)
+                        mem_text = mem_m.group(1).strip() if mem_m else ""
+                        cli_logger.log_memory_status(True, mem_text)
+                    else:
+                        cli_logger.log_memory_status(False)
+                except Exception:
+                    pass
+
                 await asyncio.wait_for(
                     agent.ainvoke({"messages": messages}, agent_config),
                     timeout=config.AGENT_TURN_TIMEOUT_SECONDS,
@@ -190,6 +218,8 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
             if hitl.has_pending_interrupts(after_state):
                 _pending_outbox = outbox.current()
                 warning = hitl.format_hitl_warning(after_state)
+                cli_logger.log_hitl_status("SUSPEND", warning)
+                cli_logger.log_turn_end(warning, len(_pending_outbox or []), True, time.perf_counter() - turn_start)
                 return ChatReply(
                     text=warning,
                     images=[],
@@ -230,6 +260,7 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
             except Exception as bg_err:
                 print(f"⚠️ [记忆提取调度异常]: {bg_err}")
 
+            cli_logger.log_turn_end(final_text, len(round_images), False, time.perf_counter() - turn_start)
             return ChatReply(
                 text=final_text,
                 images=round_images,
@@ -238,19 +269,24 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
 
         except GraphRecursionError as e:
             print(f"[WARN] 任务步骤超限 (GraphRecursionError): {e}")
+            msg = "这个任务步骤太多，我先停下了，可以拆成几步再试。"
+            cli_logger.log_turn_end(msg, 0, False, time.perf_counter() - turn_start)
             return ChatReply(
-                text="这个任务步骤太多，我先停下了，可以拆成几步再试。",
+                text=msg,
                 images=[],
                 awaiting_approval=False,
             )
         except asyncio.TimeoutError:
             timeout_minutes = max(1, config.AGENT_TURN_TIMEOUT_SECONDS // 60)
             print(f"[WARN] 任务运行超时 (超过 {config.AGENT_TURN_TIMEOUT_SECONDS} 秒)")
+            msg = f"这次处理超过 {timeout_minutes} 分钟还没完成，我先停下了，可以换个说法或拆成几步再试。"
+            cli_logger.log_turn_end(msg, 0, False, time.perf_counter() - turn_start)
             return ChatReply(
-                text=f"这次处理超过 {timeout_minutes} 分钟还没完成，我先停下了，可以换个说法或拆成几步再试。",
+                text=msg,
                 images=[],
                 awaiting_approval=False,
             )
         except Exception as e:
             traceback.print_exc()
+            cli_logger.log_turn_end("处理时出了点问题，请稍后再试", 0, False, time.perf_counter() - turn_start)
             return ChatReply("处理时出了点问题，请稍后再试", [])

@@ -1,7 +1,7 @@
 from typing import Optional, List
 from pydantic import BaseModel, Field
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import ChatGoogleGenerativeAI, HarmCategory, HarmBlockThreshold
 from pymilvus.model.sparse import BM25EmbeddingFunction
 from langchain_core.embeddings import Embeddings
 from pymilvus.model.sparse.bm25.tokenizers import build_default_analyzer
@@ -164,40 +164,55 @@ reranker = SiliconFlowReranker(config.RERANKER_MODEL, config.SILICON_FLOW_API_KE
 if not config.GEMINI_API_KEY:
     raise ValueError("未配置 GEMINI_API_KEY（或 GOOGLE_API_KEY）")
 
+# 默认宽松安全设置（放开成人影视领域涉及的关键词，防止触发静默拦截或 0 token 阻断）
+DEFAULT_SAFETY_SETTINGS = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY: HarmBlockThreshold.BLOCK_NONE,
+}
+
 # Initialize Worker LLM (Text only)
 worker_llm = ChatGoogleGenerativeAI(
     model=config.WORKER_LLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
+    safety_settings=DEFAULT_SAFETY_SETTINGS,
 )
 
 # Initialize Supervisor LLM (Text only)
 supervisor_llm = ChatGoogleGenerativeAI(
     model=config.SUPERVISOR_LLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
+    safety_settings=DEFAULT_SAFETY_SETTINGS,
 )
 
 # Initialize Browser VLM
 browser_vlm = ChatGoogleGenerativeAI(
     model=config.BROWSER_VLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
+    safety_settings=DEFAULT_SAFETY_SETTINGS,
 )
 
 # Initialize Desktop VLM
 desktop_llm = ChatGoogleGenerativeAI(
     model=config.DESKTOP_VLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
+    safety_settings=DEFAULT_SAFETY_SETTINGS,
 )
 
 # Initialize VLM (Multimodal)
 vlm = ChatGoogleGenerativeAI(
     model=config.VLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
+    safety_settings=DEFAULT_SAFETY_SETTINGS,
 )
 
 # Initialize Extractor LLM (Memory Extraction)
 extractor_llm = ChatGoogleGenerativeAI(
     model=config.EXTRACTOR_LLM_MODEL,
     google_api_key=config.GEMINI_API_KEY,
+    safety_settings=DEFAULT_SAFETY_SETTINGS,
 )
 
 # --- Pydantic Models for Structured Output & RAG ---
