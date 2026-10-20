@@ -27,3 +27,8 @@ storage/
 workspace/
 .sandbox_tmp/
 scratch/
+
+# 缓存目录
+.uv-cache/
+.uv_cache/
+.pytest_cache/

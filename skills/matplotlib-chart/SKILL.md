@@ -29,11 +29,15 @@ else:
 plt.rcParams["axes.unicode_minus"] = False
 
 COLORS = ["#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#B279A2"]
+
+def T(zh, en):
+    """图内文字一律走 T()：有中文字体用中文，没有就用英文。"""
+    return zh if HAS_CJK else en
 ```
-`HAS_CJK` 为 False 时，标题、坐标轴、图例等图内文字一律改用英文，并在汇报里说明原因。
+图内所有文字（标题、坐标轴、图例、数据标注）一律写成 `T("中文", "English")`，不要直接写中文字面量；沙箱没有中文字体时 `T()` 会自动返回英文，此时要在汇报里说明图里为何是英文。
 
 ## 统一样式
-- `fig, ax = plt.subplots(figsize=(10, 6))`；标题字号 16，坐标轴标签字号 12。
+- `fig, ax = plt.subplots(figsize=(10, 6))`；标题字号 16，坐标轴标签字号 12。例如 `ax.set_title(T("年度营收", "Annual revenue"), fontsize=16)`。
 - 按 `COLORS` 顺序取色；`ax.grid(True, alpha=0.3)`；隐藏上、右边框：`ax.spines[["top", "right"]].set_visible(False)`。
 - 柱状图在柱顶标注数值（`ax.bar_label(bars)`）；单系列折线图标出最大值点和最小值点；多系列必须有图例。
 - 饼图用 `autopct="%1.1f%%"`，不要 explode。

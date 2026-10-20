@@ -726,6 +726,67 @@ def test_c2_markitdown_build_tools_and_mounting():
         assert "convert_to_markdown" not in fam_default.seen_tools[0]
 
 
+def test_c3_markitdown_edge_and_ssrf():
+    """C3: normalize_uri 的额外边界输入 + allow_http=True 时的内网/元数据地址拦截。
+    只用字面量 IP / localhost / .invalid 域名，不依赖外网。"""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td).resolve()
+        (root / "报告").mkdir()
+        (root / "报告" / "a.pdf").write_bytes(b"x")
+        (root / "dir_only").mkdir()
+        expected_uri = (root / "报告" / "a.pdf").as_uri()
+
+        async def run(raw, **kw):
+            try:
+                return await markitdown_tool.normalize_uri(raw, workspace_dir=root, **kw)
+            except ValueError as e:
+                return e
+
+        allowed = [
+            "file://localhost/workspace/报告/a.pdf", "file:/workspace/报告/a.pdf", "FILE:///workspace/报告/a.pdf",
+            "/WORKSPACE/报告/a.pdf", "workspace\\报告\\a.pdf", "  /workspace/报告/a.pdf  ",
+            "file:///workspace/%E6%8A%A5%E5%91%8A/a.pdf",
+        ]
+        for raw in allowed:
+            res = asyncio.run(run(raw))
+            assert res == expected_uri, f"应放行: {raw!r} -> {res!r}"
+
+        denied = [
+            "file:///workspace/%2e%2e/%2e%2e/etc/passwd", "workspace\\..\\..\\etc\\passwd",
+            "C:win.ini", "javascript:alert(1)", "ftp://x/a.pdf",
+            "/workspace/dir_only", "workspace/不存在的文件.pdf",
+        ]
+        for raw in denied:
+            res = asyncio.run(run(raw))
+            assert isinstance(res, ValueError), f"应拒绝: {raw!r} -> {res!r}"
+
+        # UNC / 设备路径必须在 resolve() 之前就被拒绝（错误信息里要有 UNC 字样，证明走的是早期拦截）
+        for raw in ["//evil.com/share/a.pdf", "\\\\evil.com\\share\\a.pdf", "file:////evil.com/share/a.pdf",
+                    "\\\\?\\C:\\Windows\\win.ini", "//workspace/a.pdf"]:
+            res = asyncio.run(run(raw))
+            assert isinstance(res, ValueError) and "UNC" in str(res), f"UNC/设备路径应被早期拦截: {raw!r} -> {res!r}"
+
+        # 符号链接逃逸（Windows 上创建符号链接可能需要开发者模式/管理员权限，失败则跳过此小项）
+        with tempfile.TemporaryDirectory() as out_td:
+            outside = Path(out_td).resolve()
+            (outside / "secret.txt").write_text("s", encoding="utf-8")
+            try:
+                os.symlink(outside, root / "link_out", target_is_directory=True)
+            except (OSError, NotImplementedError):
+                print("    (跳过符号链接小项：当前环境无法创建符号链接)")
+            else:
+                res = asyncio.run(run("/workspace/link_out/secret.txt"))
+                assert isinstance(res, ValueError), f"符号链接逃逸未被拦截: {res!r}"
+
+        # allow_http=True：内网 / 本机 / 元数据 / 混淆写法 / 带账号密码 / 无法解析的域名，全部应以 ValueError 拒绝
+        for raw in ["http://127.0.0.1/", "http://169.254.169.254/latest/meta-data/", "http://10.0.0.5/", "http://[::1]/",
+                    "http://localhost:8000/x", "http://user:pw@example.com/", "http://[::ffff:127.0.0.1]/",
+                    "http://0.0.0.0/", "http://2130706433/", "http://0x7f.0.0.1/",
+                    "http://nonexistent-host.invalid/a.pdf"]:
+            res = asyncio.run(run(raw, allow_http=True))
+            assert isinstance(res, ValueError), f"allow_http=True 时应以 ValueError 拒绝: {raw!r} -> {res!r}"
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Runner
 # ══════════════════════════════════════════════════════════════════════════════
@@ -746,6 +807,7 @@ SCENARIOS = [
     ("B9 全局 profile 隔离性验证", test_b9_global_profile_isolation),
     ("C1 markitdown 路径映射与安全越界拦截", test_c1_markitdown_normalize_uri),
     ("C2 markitdown build_tools 工具挂载与隔离", test_c2_markitdown_build_tools_and_mounting),
+    ("C3 markitdown 边界输入与 SSRF 分支", test_c3_markitdown_edge_and_ssrf),
 ]
 
 

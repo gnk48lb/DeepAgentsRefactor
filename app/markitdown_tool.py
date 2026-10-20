@@ -54,7 +54,10 @@ async def normalize_uri(
                 raise ValueError("URL 缺少主机名")
             port = u.port or (443 if scheme == "https" else 80)
             loop = asyncio.get_running_loop()
-            infos = await loop.getaddrinfo(host, port)
+            try:
+                infos = await loop.getaddrinfo(host, port)
+            except OSError as e:
+                raise ValueError(f"无法解析主机名 {host}: {e}")
             for info in infos:
                 ip = ipaddress.ip_address(info[4][0])
                 if (
@@ -82,6 +85,10 @@ async def normalize_uri(
 
     norm = p.replace("\\", "/").strip()
     low = norm.lower()
+
+    # Windows 上对 UNC（\\host\share）/ 设备路径（\\?\、\\.\）做 resolve() 会尝试连接对应主机（可能带上 NTLM 凭据），必须在 resolve 之前拒绝
+    if norm.startswith("//"):
+        raise ValueError("不允许 UNC / 设备路径")
 
     if low in ("workspace", "/workspace"):
         raise ValueError("不能转换工作区根目录，请指定具体文件路径")

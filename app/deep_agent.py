@@ -171,6 +171,9 @@ FILE_AGENT_MARKITDOWN_PROMPT = (
     "调用 convert_to_markdown；纯文本、代码文件直接用 read_file 更省 token。图片、音视频仍不要读取。\n"
     "【转换路径】convert_to_markdown 的 uri 直接写成 /workspace/<相对路径>（或 file:///workspace/<相对路径>），"
     "例如 /workspace/报告/a.pdf。不要传 http(s) 链接，不要传工作区外的路径。\n"
+    "【转换结果过大】结果超过阈值时，系统不会直接返回正文，而是把它存到 /_artifacts/large_tool_results/<id> 并告诉你这个路径。"
+    "这个路径是合法的（前面“路径一律写成 /workspace/xxx”的规则对它不适用）：原样传给 read_file"
+    "（用 offset / limit 分页，每次不超过 200 行）或 grep，不要改写成 /workspace/...，也不要去掉 /_artifacts 前缀。\n"
 )
 
 KNOWLEDGE_AGENT_PROMPT = (

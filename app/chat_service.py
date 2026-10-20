@@ -27,6 +27,8 @@ _initialized: bool = False
 _agent = None
 _chat_lock = asyncio.Lock()              # 同一时刻只处理一条消息（防止连发消息并发踩同一会话 / HITL 中断状态）
 _pending_outbox: Optional[list] = None   # HITL 中断期间暂存本轮已产生的图片
+_checkpointer = None                     # init_service 里保存，/reset 时用它清空固定会话
+RESET_COMMANDS = {"/reset", "/new", "/新对话"}
 _background_tasks: Set[asyncio.Task] = set()
 
 def _guess_mime_type(data: bytes) -> str:
@@ -71,10 +73,11 @@ async def _load_image_as_data_uri(image_url: str) -> Optional[str]:
 
 async def init_service() -> None:
     """初始化数据库、MCP 服务并构建主 Agent（单用户：只构建一个全功能 Agent）"""
-    global _initialized, _agent
+    global _initialized, _agent, _checkpointer
     print("🚀 [chat_service] 正在初始化数据环境与 Agent 服务...")
     await asyncio.to_thread(database.run_global_database_init)
-    _agent = await deep_agent.build_main_agent(checkpointer=MemorySaver())
+    _checkpointer = MemorySaver()
+    _agent = await deep_agent.build_main_agent(checkpointer=_checkpointer)
     _initialized = True
     print("✅ [chat_service] 初始化完成。")
 
@@ -83,12 +86,13 @@ def is_initialized() -> bool:
 
 async def shutdown_service() -> None:
     """关闭系统服务并释放 MCP 资源"""
-    global _initialized, _agent
+    global _initialized, _agent, _checkpointer
     print("🛑 [chat_service] 正在关闭服务...")
     from app import mcp_service, amap
     await mcp_service.shutdown_mcp()
     await amap.aclose()
     _agent = None
+    _checkpointer = None
     _initialized = False
     print("✅ [chat_service] 服务已关闭。")
 
@@ -105,6 +109,12 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
 
     async with _chat_lock:
         try:
+            # 清空固定会话：放在 HITL 判断之前，这样挂起中的授权也能被一并丢弃
+            if text.strip().lower() in RESET_COMMANDS:
+                await _checkpointer.adelete_thread(THREAD_ID)
+                _pending_outbox = None
+                return ChatReply("已清空对话上下文，开始新的对话。", [])
+
             agent = _agent
             agent_config = {
                 "recursion_limit": config.AGENT_RECURSION_LIMIT,
