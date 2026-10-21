@@ -4,7 +4,7 @@ from typing import Optional, List
 import logging
 import threading
 import requests
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI, HarmCategory, HarmBlockThreshold
 from pymilvus.model.sparse import BM25EmbeddingFunction
@@ -285,16 +285,4 @@ def __getattr__(name):
         return _cache[name]
 
 
-# --- Pydantic Models for Structured Output & RAG ---
 
-
-class ExtractedEntities(BaseModel):
-    works: List[str] = Field(default_factory=list, description="Extracted work codes or titles")
-    people: List[str] = Field(default_factory=list, description="Extracted actor or actress names")
-    tags: List[str] = Field(default_factory=list, description="Extracted tag names")
-    target_person_type: Optional[str] = Field(None, description="The specific type of person the user is looking for (e.g., 'Actress' or 'Actor'). If not specified, leave as null.")
-
-
-class QueryIntent(BaseModel):
-    search_mode: str = Field(..., description="Either 'vector_only' or 'hybrid_graph'")
-    extracted_entities: ExtractedEntities

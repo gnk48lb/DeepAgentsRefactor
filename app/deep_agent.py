@@ -68,7 +68,7 @@ from app import markitdown_tool
 from app.infra import models
 from app import tools
 from app.infra import mcp_service
-from app import database
+from app.memory import store as memory_store
 from app import file_agent
 from app.graph import (
     build_desktop_agent_subgraph,
@@ -299,7 +299,7 @@ def build_initial_messages(
       未检索到记忆时保持纯 user_query。
     """
     messages: List[BaseMessage] = []
-    memories = database.search_memory(user_query, top_k=1)
+    memories = memory_store.search_memory(user_query, top_k=1)
     if memories:
         query_content = f"{MEMORY_TAG_OPEN}\n" + "\n".join(memories) + f"\n{MEMORY_TAG_CLOSE}\n{user_query}"
     else:
@@ -324,7 +324,7 @@ async def _background_extract_memory(recent_chat: str):
         mem_elapsed = time.perf_counter() - mem_start
         content = extract_text(res.content).strip()
         if content and content.upper() != "NONE" and "NONE" not in content.upper():
-            await asyncio.to_thread(database.insert_memory, content)
+            await asyncio.to_thread(memory_store.insert_memory, content)
             print(f"--- \033[92m[后台记忆保存] (耗时 {mem_elapsed:.2f}s)\033[0m: {content} ---", flush=True)
         else:
             print(f"--- \033[90m[后台记忆跳过] (耗时 {mem_elapsed:.2f}s): 未发现长期价值信息\033[0m ---", flush=True)

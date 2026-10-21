@@ -4,8 +4,9 @@ from datetime import datetime
 from langchain_core.tools import tool
 from app import config
 from app.infra import models
-from app.database import get_client, execute_hybrid_search, rerank_candidates
-from app.graph_rag import get_media_retriever
+from app.infra.milvus_client import get_client
+from app.knowledge.search import execute_hybrid_search, rerank_candidates
+from app.knowledge.media.retriever import get_media_retriever
 
 
 @tool
@@ -21,7 +22,7 @@ def rag(query: str):
         # 1. 查询转换路由
         queries_to_search = [query]
         if getattr(config, "ENABLE_QUERY_TRANSFORM", False):
-            from app import transforms as query_transforms
+            from app.knowledge import query_transform as query_transforms
             strategy = query_transforms.route_query(query)
             print(f"--> [Query Transform] Strategy selected: {strategy}")
             

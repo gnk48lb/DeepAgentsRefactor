@@ -5,10 +5,10 @@ import argparse
 from pathlib import Path
 
 from app import config
-from app import database
+from app.infra.milvus_client import get_client
 
 def list_memories():
-    c = database.get_client()
+    c = get_client()
     coll_name = config.MEMORY_COLLECTION_NAME
     if not c.has_collection(coll_name):
         print(f"集合 '{coll_name}' 不存在或尚未初始化。")
@@ -42,7 +42,7 @@ def delete_memories(ids):
     if not ids:
         print("未指定要删除的 ID。")
         return
-    c = database.get_client()
+    c = get_client()
     coll_name = config.MEMORY_COLLECTION_NAME
     if not c.has_collection(coll_name):
         print(f"集合 '{coll_name}' 不存在。")

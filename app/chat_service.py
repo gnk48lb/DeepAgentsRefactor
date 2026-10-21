@@ -14,7 +14,8 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 
 from app import config
-from app import database, deep_agent
+from app import deep_agent
+from app.services import startup
 from app.runtime import outbox, hitl, cli_logger
 from app.infra import models
 from app.utils.text import extract_text
@@ -73,7 +74,7 @@ async def init_service() -> None:
     global _initialized, _agent, _checkpointer
     models.validate_required_keys()
     print("🚀 [chat_service] 正在初始化数据环境与 Agent 服务...")
-    await asyncio.to_thread(database.run_global_database_init)
+    await asyncio.to_thread(startup.run_global_database_init)
     _checkpointer = MemorySaver()
     _agent = await deep_agent.build_main_agent(checkpointer=_checkpointer)
     _initialized = True

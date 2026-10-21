@@ -1,37 +1,25 @@
+"""多模态文档解析与切分加载器 (所在层: L2)"""
+
 import os
+import shutil
+import hashlib
 import fitz  # PyMuPDF
-from PIL import Image
-import base64
-from io import BytesIO
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_core.messages import HumanMessage
 from app import config
 from app.infra import models
 from app.utils.text import extract_text
-import hashlib
+from app.utils.images import compress_image_to_base64
+
 
 def get_file_sha256(byte_data: bytes) -> str:
     return hashlib.sha256(byte_data).hexdigest()
 
-def compress_image_to_base64(image_path: str, max_size=(1024, 1024), quality=80) -> str:
-    """压缩图片并转换为 base64"""
-    try:
-        with Image.open(image_path) as img:
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-            img.thumbnail(max_size, Image.Resampling.LANCZOS)
-            buffered = BytesIO()
-            img.save(buffered, format="JPEG", quality=quality)
-            return base64.b64encode(buffered.getvalue()).decode('utf-8')
-    except Exception as e:
-        print(f"Error compressing image {image_path}: {e}")
-        return ""
 
 def process_pdfs_and_images(source_dir=None, is_incremental=False):
     """扫描目录下的 PDF 和图片，提取页面并调用 VLM 生成小作文缓存"""
     if source_dir is None:
         source_dir = config.SOURCE_DIR
-    import shutil
     os.makedirs(config.PIPELINE_IMAGES_DIR, exist_ok=True)
     os.makedirs(config.PIPELINE_SUMMARIES_DIR, exist_ok=True)
     

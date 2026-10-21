@@ -1,17 +1,22 @@
+"""专有媒体库图谱检索与双路召回 (所在层: L2)"""
+
+import os
 import atexit
 import logging
 import threading
 from typing import List, Dict, Optional
-from app.database import get_client, execute_hybrid_search, rerank_candidates
-from app.transforms import MediaQueryTranslator
+from neo4j import GraphDatabase
 from app import config
 from app.infra import models
+from app.infra.milvus_client import get_client
+from app.knowledge.search import execute_hybrid_search, rerank_candidates
+from app.knowledge.media.intent import MediaQueryTranslator
 
 logger = logging.getLogger(__name__)
 
+
 class MediaGraphRetriever:
     def __init__(self):
-        from neo4j import GraphDatabase
         self.neo4j_driver = GraphDatabase.driver(config.NEO4J_URI, auth=(config.NEO4J_USER, config.NEO4J_PASSWORD))
         atexit.register(self.close)
         self.client = get_client()
@@ -24,7 +29,6 @@ class MediaGraphRetriever:
         else:
             logger.warning(f"Collection {self.collection_name} not found. MediaAgent search disabled.")
 
-        import os
         bm25_path = config.AV_BM25_MODEL_PATH
         if os.path.exists(bm25_path):
             try:
@@ -177,7 +181,4 @@ def get_media_retriever() -> MediaGraphRetriever:
         return retriever
 
 
-if __name__ == "__main__":
-    from app.database import MediaDataBuilder
-    builder = MediaDataBuilder()
-    builder.build_from_file(config.MEDIA_SOURCE_FILE)
+
