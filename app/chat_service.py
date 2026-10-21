@@ -88,7 +88,7 @@ async def shutdown_service() -> None:
     global _initialized, _agent, _checkpointer
     print("🛑 [chat_service] 正在关闭服务...")
     from app.infra import mcp_service
-    from app import amap
+    from app.tools import amap
     await mcp_service.shutdown_mcp()
     await amap.aclose()
     _agent = None

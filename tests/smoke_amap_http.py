@@ -23,8 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 from app import config
-import app.amap as amap
-import app.amap.client as amap_client
+import app.tools.amap as amap
+import app.tools.amap.client as amap_client
 
 
 def setup_mock_client(handler):

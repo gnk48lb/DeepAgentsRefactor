@@ -5,7 +5,7 @@ import re
 from typing import Callable, List
 from langchain_core.tools import BaseTool, StructuredTool
 
-from app.amap import impl
+from app.tools.amap import impl
 
 _SNAPSHOT_PATH = Path(__file__).resolve().parent / "tools_snapshot.json"
 
@@ -63,7 +63,7 @@ def get_tools() -> List[BaseTool]:
 
         fn = getattr(impl, name, None)
         if fn is None:
-            raise AttributeError(f"未在 app.amap.impl 中找到工具实现：{name}")
+            raise AttributeError(f"未在 app.tools.amap.impl 中找到工具实现：{name}")
 
         tool = StructuredTool(
             name=name,

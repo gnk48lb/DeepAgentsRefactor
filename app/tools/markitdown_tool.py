@@ -1,5 +1,4 @@
-"""
-app/markitdown_tool.py
+"""多格式文档转换与挂载工具 (所在层: L3)
 
 为 FileAgent 包装 markitdown-mcp 的 convert_to_markdown 工具：
 完成 /workspace 虚拟路径 -> 宿主机真实路径 file:/// URI 转换，并实施严格的工作区边界与协议校验。

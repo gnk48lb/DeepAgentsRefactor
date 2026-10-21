@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 from app import config
-import app.amap as amap
+import app.tools.amap as amap
 
 GOLDEN_DIR = ROOT / "tests/fixtures/amap/golden"
 

@@ -5,7 +5,7 @@ tests/smoke_amap_contract.py
 1. 验证 get_tools() 返回 16 个工具，名称集合与 tests/fixtures/amap/tools_snapshot.json 完全一致。
 2. 每个工具的 description 与快照逐字相等。
 3. 每个工具的 args_schema 与快照的 inputSchema 完全相等。
-4. app/amap/tools_snapshot.json 与 tests/fixtures/amap/tools_snapshot.json 内容完全一致。
+4. app/tools/amap/tools_snapshot.json 与 tests/fixtures/amap/tools_snapshot.json 内容完全一致。
 5. 坐标校验规则：
    - 对 maps_around_search(location="文化东路42号") 返回固定错误文案；
    - 对 maps_bicycling_by_coordinates(origin_coordinates="文化东路42号", ...) 不触发校验（因参数名为 origin_coordinates）。
@@ -20,16 +20,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-import app.amap as amap
+import app.tools.amap as amap
 
 SNAPSHOT_FIXTURE_PATH = ROOT / "tests/fixtures/amap/tools_snapshot.json"
-SNAPSHOT_RUNTIME_PATH = ROOT / "app/amap/tools_snapshot.json"
+SNAPSHOT_RUNTIME_PATH = ROOT / "app/tools/amap/tools_snapshot.json"
 
 
 async def test_snapshot_file_consistency():
     fixture_text = SNAPSHOT_FIXTURE_PATH.read_text(encoding="utf-8")
     runtime_text = SNAPSHOT_RUNTIME_PATH.read_text(encoding="utf-8")
-    assert fixture_text == runtime_text, "app/amap/tools_snapshot.json 与 tests/fixtures/amap/tools_snapshot.json 内容不一致！"
+    assert fixture_text == runtime_text, "app/tools/amap/tools_snapshot.json 与 tests/fixtures/amap/tools_snapshot.json 内容不一致！"
     fixture_json = json.loads(fixture_text)
     assert len(fixture_json) == 16, f"快照中工具数量应为 16，实际为 {len(fixture_json)}"
 

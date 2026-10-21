@@ -63,10 +63,14 @@ try:
 except ImportError:
     ToolCallLimitMiddleware = None
 
-from app import amap
-from app import markitdown_tool
+from app.tools import amap
+from app.tools import markitdown_tool
+from app.tools import knowledge_tools
+from app.tools import media_tools
+from app.tools import sql_tools
+from app.tools import code_tools
+from app.tools import browser_tools
 from app.infra import models
-from app import tools
 from app.infra import mcp_service
 from app.memory import store as memory_store
 from app import file_agent
@@ -373,14 +377,14 @@ async def build_main_agent(
             "name": "KnowledgeAgent",
             "description": SUBAGENT_DESCRIPTIONS["KnowledgeAgent"],
             "system_prompt": KNOWLEDGE_AGENT_PROMPT,
-            "tools": [tools.rag, tools.web_search, tools.get_current_time],
+            "tools": knowledge_tools.TOOLS,
             "model": models.vlm,
         },
         {
             "name": "MediaAgent",
             "description": SUBAGENT_DESCRIPTIONS["MediaAgent"],
             "system_prompt": MEDIA_AGENT_PROMPT,
-            "tools": [tools.av_graph_rag],
+            "tools": media_tools.TOOLS,
             "model": models.worker_llm,
         },
         {
@@ -394,7 +398,7 @@ async def build_main_agent(
             "name": "CodeAgent",
             "description": SUBAGENT_DESCRIPTIONS["CodeAgent"],
             "system_prompt": CODE_AGENT_PROMPT,
-            "tools": tools.code_tools,
+            "tools": code_tools.TOOLS,
             "model": models.worker_llm,
             "skills": [SKILLS_ROUTE],
         },
@@ -402,7 +406,7 @@ async def build_main_agent(
             "name": "SQLAgent",
             "description": SUBAGENT_DESCRIPTIONS["SQLAgent"],
             "system_prompt": SQL_AGENT_PROMPT,
-            "tools": [tools.execute_sql],
+            "tools": sql_tools.TOOLS,
             "model": models.worker_llm,
         },
     ]
@@ -440,7 +444,7 @@ async def build_main_agent(
         "name": "BrowserAgent",
         "description": SUBAGENT_DESCRIPTIONS["BrowserAgent"],
         "system_prompt": BROWSER_AGENT_PROMPT,
-        "tools": tools.browser_tools,
+        "tools": browser_tools.TOOLS,
         "model": models.worker_llm,
     })
     subagents.append(file_subagent)
