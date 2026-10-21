@@ -1,4 +1,9 @@
+"""模型客户端惰性单例与校验管理 (L1)"""
+
 from typing import Optional, List
+import logging
+import threading
+import requests
 from pydantic import BaseModel, Field
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI, HarmCategory, HarmBlockThreshold
@@ -6,8 +11,6 @@ from pymilvus.model.sparse import BM25EmbeddingFunction
 from langchain_core.embeddings import Embeddings
 from pymilvus.model.sparse.bm25.tokenizers import build_default_analyzer
 from app import config
-import logging
-import requests
 
 # 屏蔽无用的 HTTP 请求日志
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -25,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 SILICONFLOW_EMBEDDING_TIMEOUT = 60
 SILICONFLOW_RERANK_TIMEOUT = 30
+
 
 # Initialize Cloudflare Workers AI Dense Embeddings (Serverless API) for GraphRAG / AV Search
 class CloudflareWorkersAIEmbeddings(BaseModel, Embeddings):
@@ -60,17 +64,6 @@ class CloudflareWorkersAIEmbeddings(BaseModel, Embeddings):
     def embed_query(self, text: str) -> List[float]:
         return self.embed_documents([text])[0]
 
-if config.CLOUDFLARE_API_TOKEN:
-    av_embeddings = CloudflareWorkersAIEmbeddings(
-        account_id=config.CLOUDFLARE_ACCOUNT_ID or "",
-        api_token=config.CLOUDFLARE_API_TOKEN,
-        model=config.CLOUDFLARE_EMBEDDING_MODEL
-    )
-else:
-    av_embeddings = HuggingFaceEndpointEmbeddings(
-        model=config.EMBEDDING_MODEL,
-        huggingfacehub_api_token=config.HUGGINGFACEHUB_API_TOKEN
-    )
 
 # Initialize SiliconFlow Dense Embeddings (Custom class to avoid tiktoken SSL errors)
 class SiliconFlowEmbeddings(BaseModel, Embeddings):
@@ -95,7 +88,6 @@ class SiliconFlowEmbeddings(BaseModel, Embeddings):
             )
             data = resp.json()
             if "data" not in data or data["data"] is None:
-                # 记录详细错误，判断是否被模型网关拦截 (内容审核)
                 error_msg = data.get("error", data.get("message", "Unknown error"))
                 raise Exception(f"SiliconFlow Embedding Failed (Possible Censorship?): {error_msg}\nFull Response: {data}")
             all_embeddings.extend([item["embedding"] for item in data["data"]])
@@ -105,16 +97,6 @@ class SiliconFlowEmbeddings(BaseModel, Embeddings):
     def embed_query(self, text: str) -> List[float]:
         return self.embed_documents([text])[0]
 
-embeddings = SiliconFlowEmbeddings(
-    model=config.EMBEDDING_MODEL,
-    api_key=config.SILICON_FLOW_API_KEY
-)
-
-# Initialize BM25 Sparse Embeddings (Local)
-# Note: BM25 needs to be fitted with the corpus before calling encode()
-analyzer = build_default_analyzer(language="zh")
-bm25_ef = BM25EmbeddingFunction(analyzer=analyzer)
-av_bm25_ef = BM25EmbeddingFunction(analyzer=analyzer)
 
 # Initialize SiliconFlow Reranker
 class SiliconFlowReranker:
@@ -125,12 +107,12 @@ class SiliconFlowReranker:
         
     def predict(self, pairs):
         """兼容 CrossEncoder 的接口"""
-        if not pairs: return []
+        if not pairs:
+            return []
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
-        # 假设 pairs 格式为 [[query, doc1], [query, doc2], ...]
         payload = {
             "model": self.model_name,
             "query": pairs[0][0],
@@ -151,20 +133,13 @@ class SiliconFlowReranker:
             )
             return [0.0] * len(pairs)
         
-        # SiliconFlow 返回格式: {"results": [{"index": 0, "relevance_score": 0.9}, ...]}
-        # 需要还原到原始 list 的顺序
         scores = [0.0] * len(pairs)
         for item in data["results"]:
             scores[item["index"]] = item["relevance_score"]
         return scores
 
-reranker = SiliconFlowReranker(config.RERANKER_MODEL, config.SILICON_FLOW_API_KEY)
 
-# --- Gemini Models Initialization ---
-if not config.GEMINI_API_KEY:
-    raise ValueError("未配置 GEMINI_API_KEY（或 GOOGLE_API_KEY）")
-
-# 默认宽松安全设置（放开成人影视领域涉及的关键词，防止触发静默拦截或 0 token 阻断）
+# 默认宽松安全设置
 DEFAULT_SAFETY_SETTINGS = {
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -173,55 +148,152 @@ DEFAULT_SAFETY_SETTINGS = {
     HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY: HarmBlockThreshold.BLOCK_NONE,
 }
 
-# Initialize Worker LLM (Text only)
-worker_llm = ChatGoogleGenerativeAI(
-    model=config.WORKER_LLM_MODEL,
-    google_api_key=config.GEMINI_API_KEY,
-    safety_settings=DEFAULT_SAFETY_SETTINGS,
-)
 
-# Initialize Supervisor LLM (Text only)
-supervisor_llm = ChatGoogleGenerativeAI(
-    model=config.SUPERVISOR_LLM_MODEL,
-    google_api_key=config.GEMINI_API_KEY,
-    safety_settings=DEFAULT_SAFETY_SETTINGS,
-)
+def _require_gemini_key():
+    if not config.GEMINI_API_KEY:
+        raise ValueError("未配置 GEMINI_API_KEY（或 GOOGLE_API_KEY）")
 
-# Initialize Browser VLM
-browser_vlm = ChatGoogleGenerativeAI(
-    model=config.BROWSER_VLM_MODEL,
-    google_api_key=config.GEMINI_API_KEY,
-    safety_settings=DEFAULT_SAFETY_SETTINGS,
-)
 
-# Initialize Desktop VLM
-desktop_llm = ChatGoogleGenerativeAI(
-    model=config.DESKTOP_VLM_MODEL,
-    google_api_key=config.GEMINI_API_KEY,
-    safety_settings=DEFAULT_SAFETY_SETTINGS,
-)
+def validate_required_keys():
+    if not config.GEMINI_API_KEY:
+        raise ValueError("未配置 GEMINI_API_KEY（或 GOOGLE_API_KEY）")
+    if not config.SILICON_FLOW_API_KEY:
+        raise ValueError("未配置 SILICON_FLOW_API_KEY（知识库/记忆的嵌入与重排依赖它）")
 
-# Initialize VLM (Multimodal)
-vlm = ChatGoogleGenerativeAI(
-    model=config.VLM_MODEL,
-    google_api_key=config.GEMINI_API_KEY,
-    safety_settings=DEFAULT_SAFETY_SETTINGS,
-)
 
-# Initialize Extractor LLM (Memory Extraction)
-extractor_llm = ChatGoogleGenerativeAI(
-    model=config.EXTRACTOR_LLM_MODEL,
-    google_api_key=config.GEMINI_API_KEY,
-    safety_settings=DEFAULT_SAFETY_SETTINGS,
-)
+_analyzer = None
+
+
+def _get_analyzer():
+    global _analyzer
+    if _analyzer is None:
+        _analyzer = build_default_analyzer(language="zh")
+    return _analyzer
+
+
+def _make_av_embeddings():
+    if config.CLOUDFLARE_API_TOKEN:
+        return CloudflareWorkersAIEmbeddings(
+            account_id=config.CLOUDFLARE_ACCOUNT_ID or "",
+            api_token=config.CLOUDFLARE_API_TOKEN,
+            model=config.CLOUDFLARE_EMBEDDING_MODEL,
+        )
+    else:
+        return HuggingFaceEndpointEmbeddings(
+            model=config.EMBEDDING_MODEL,
+            huggingfacehub_api_token=config.HUGGINGFACEHUB_API_TOKEN,
+        )
+
+
+def _make_embeddings():
+    return SiliconFlowEmbeddings(
+        model=config.EMBEDDING_MODEL,
+        api_key=config.SILICON_FLOW_API_KEY or "",
+    )
+
+
+def _make_bm25_ef():
+    return BM25EmbeddingFunction(analyzer=_get_analyzer())
+
+
+def _make_av_bm25_ef():
+    return BM25EmbeddingFunction(analyzer=_get_analyzer())
+
+
+def _make_reranker():
+    return SiliconFlowReranker(config.RERANKER_MODEL, config.SILICON_FLOW_API_KEY or "")
+
+
+def _make_worker_llm():
+    _require_gemini_key()
+    return ChatGoogleGenerativeAI(
+        model=config.WORKER_LLM_MODEL,
+        google_api_key=config.GEMINI_API_KEY,
+        safety_settings=DEFAULT_SAFETY_SETTINGS,
+    )
+
+
+def _make_supervisor_llm():
+    _require_gemini_key()
+    return ChatGoogleGenerativeAI(
+        model=config.SUPERVISOR_LLM_MODEL,
+        google_api_key=config.GEMINI_API_KEY,
+        safety_settings=DEFAULT_SAFETY_SETTINGS,
+    )
+
+
+def _make_browser_vlm():
+    _require_gemini_key()
+    return ChatGoogleGenerativeAI(
+        model=config.BROWSER_VLM_MODEL,
+        google_api_key=config.GEMINI_API_KEY,
+        safety_settings=DEFAULT_SAFETY_SETTINGS,
+    )
+
+
+def _make_desktop_llm():
+    _require_gemini_key()
+    return ChatGoogleGenerativeAI(
+        model=config.DESKTOP_VLM_MODEL,
+        google_api_key=config.GEMINI_API_KEY,
+        safety_settings=DEFAULT_SAFETY_SETTINGS,
+    )
+
+
+def _make_vlm():
+    _require_gemini_key()
+    return ChatGoogleGenerativeAI(
+        model=config.VLM_MODEL,
+        google_api_key=config.GEMINI_API_KEY,
+        safety_settings=DEFAULT_SAFETY_SETTINGS,
+    )
+
+
+def _make_extractor_llm():
+    _require_gemini_key()
+    return ChatGoogleGenerativeAI(
+        model=config.EXTRACTOR_LLM_MODEL,
+        google_api_key=config.GEMINI_API_KEY,
+        safety_settings=DEFAULT_SAFETY_SETTINGS,
+    )
+
+
+_lock = threading.RLock()
+_cache: dict = {}
+_FACTORIES = {
+    "av_embeddings": _make_av_embeddings,
+    "embeddings": _make_embeddings,
+    "bm25_ef": _make_bm25_ef,
+    "av_bm25_ef": _make_av_bm25_ef,
+    "reranker": _make_reranker,
+    "worker_llm": _make_worker_llm,
+    "supervisor_llm": _make_supervisor_llm,
+    "browser_vlm": _make_browser_vlm,
+    "desktop_llm": _make_desktop_llm,
+    "vlm": _make_vlm,
+    "extractor_llm": _make_extractor_llm,
+}
+
+
+def __getattr__(name):
+    f = _FACTORIES.get(name)
+    if f is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    with _lock:
+        if name not in _cache:
+            _cache[name] = f()
+        return _cache[name]
+
 
 # --- Pydantic Models for Structured Output & RAG ---
+
 
 class ExtractedEntities(BaseModel):
     works: List[str] = Field(default_factory=list, description="Extracted work codes or titles")
     people: List[str] = Field(default_factory=list, description="Extracted actor or actress names")
     tags: List[str] = Field(default_factory=list, description="Extracted tag names")
     target_person_type: Optional[str] = Field(None, description="The specific type of person the user is looking for (e.g., 'Actress' or 'Actor'). If not specified, leave as null.")
+
 
 class QueryIntent(BaseModel):
     search_mode: str = Field(..., description="Either 'vector_only' or 'hybrid_graph'")

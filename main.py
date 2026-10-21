@@ -15,6 +15,7 @@ logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s -
 
 from app import chat_service
 from app import config
+from app.utils.images import guess_mime_type
 
 
 def save_images(images: list):
@@ -44,15 +45,7 @@ def _local_image_to_data_uri(path_str: str) -> str:
     if os.path.exists(path_str):
         with open(path_str, "rb") as f:
             data = f.read()
-        mime = "image/png"
-        if data.startswith(b"\x89PNG"):
-            mime = "image/png"
-        elif data.startswith(b"\xff\xd8"):
-            mime = "image/jpeg"
-        elif data.startswith(b"GIF8"):
-            mime = "image/gif"
-        elif data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
-            mime = "image/webp"
+        mime = guess_mime_type(data, default="image/png")
         b64 = base64.b64encode(data).decode("utf-8")
         return f"data:{mime};base64,{b64}"
     return path_str

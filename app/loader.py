@@ -6,8 +6,8 @@ from io import BytesIO
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_core.messages import HumanMessage
 from app import config
-from app import models
-from app.utils import extract_text
+from app.infra import models
+from app.utils.text import extract_text
 import hashlib
 
 def get_file_sha256(byte_data: bytes) -> str:

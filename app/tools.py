@@ -3,7 +3,7 @@ import re
 from datetime import datetime
 from langchain_core.tools import tool
 from app import config
-from app import models
+from app.infra import models
 from app.database import get_client, execute_hybrid_search, rerank_candidates
 from app.graph_rag import get_media_retriever
 
@@ -93,7 +93,7 @@ def rag(query: str):
         
         # 4. 根据是否包含图片决定返回类型
         if image_paths:
-            from app.loader import compress_image_to_base64
+            from app.utils.images import compress_image_to_base64
             
             multimodal_content = []
             
@@ -235,7 +235,7 @@ def execute_python_code(code: str) -> any:
     """
     print(f"\n[Tool Call: execute_python_code] 代码长度: {len(code)} 字符")
     try:
-        from app.sandbox import run_code_in_sandbox
+        from app.infra.sandbox import run_code_in_sandbox
         res = run_code_in_sandbox(code)
 
         # 记录终端日志（仅 stdout 前 200 字符，避免刷屏）
@@ -246,7 +246,7 @@ def execute_python_code(code: str) -> any:
 
         # 【多模态组装】：有图片时返回 list，与现有拦截器无缝对接
         if res["images"]:
-            from app import outbox
+            from app.runtime import outbox
             content = [
                 {
                     "type": "text",
@@ -276,7 +276,7 @@ code_tools = [execute_python_code]
 
 # ── BrowserAgent 专用工具 ───────────────────────────────────────────────────────
 
-from app.browser_service import fetch_generic_webpage_content, fetch_bilibili_profile_data, run_browser_task
+from app.infra.browser_service import fetch_generic_webpage_content, fetch_bilibili_profile_data, run_browser_task
 
 @tool
 async def read_webpage_content(url: str) -> str:

@@ -1,5 +1,5 @@
 """
-app/hitl.py
+app/runtime/hitl.py - 人工授权（HITL）公共辅助 (L1)
 
 人工授权（HITL）公共辅助。同时兼容两种中断 payload：
   1. deepagents / langchain 原生：{"action_requests": [...], "review_configs": [...]}（FileAgent）

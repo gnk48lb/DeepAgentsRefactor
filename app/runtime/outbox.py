@@ -1,3 +1,5 @@
+"""发件箱队列与多模态消息缓存 (L1)"""
+
 import contextvars
 from typing import Optional
 

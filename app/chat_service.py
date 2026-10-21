@@ -14,8 +14,11 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 
 from app import config
-from app import database, deep_agent, outbox, models, hitl, cli_logger
-from app.utils import extract_text
+from app import database, deep_agent
+from app.runtime import outbox, hitl, cli_logger
+from app.infra import models
+from app.utils.text import extract_text
+from app.utils.images import guess_mime_type
 
 @dataclass
 class ChatReply:
@@ -35,15 +38,7 @@ _background_tasks: Set[asyncio.Task] = set()
 
 def _guess_mime_type(data: bytes) -> str:
     """根据字节头判断图片的 MIME 类型"""
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    elif data.startswith(b"\xff\xd8"):
-        return "image/jpeg"
-    elif data.startswith(b"GIF8"):
-        return "image/gif"
-    elif data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
-        return "image/webp"
-    return "image/jpeg"
+    return guess_mime_type(data)
 
 async def _load_image_as_data_uri(image_url: str) -> Optional[str]:
     """
@@ -76,6 +71,7 @@ async def _load_image_as_data_uri(image_url: str) -> Optional[str]:
 async def init_service() -> None:
     """初始化数据库、MCP 服务并构建主 Agent（单用户：只构建一个全功能 Agent）"""
     global _initialized, _agent, _checkpointer
+    models.validate_required_keys()
     print("🚀 [chat_service] 正在初始化数据环境与 Agent 服务...")
     await asyncio.to_thread(database.run_global_database_init)
     _checkpointer = MemorySaver()
@@ -90,7 +86,8 @@ async def shutdown_service() -> None:
     """关闭系统服务并释放 MCP 资源"""
     global _initialized, _agent, _checkpointer
     print("🛑 [chat_service] 正在关闭服务...")
-    from app import mcp_service, amap
+    from app.infra import mcp_service
+    from app import amap
     await mcp_service.shutdown_mcp()
     await amap.aclose()
     _agent = None

@@ -1,8 +1,4 @@
-﻿"""
-app/utils.py
-
-Shared utility functions for the GNK48-Agent project.
-"""
+"""文本提取与处理工具 (L0)"""
 
 
 def extract_text(content) -> str:

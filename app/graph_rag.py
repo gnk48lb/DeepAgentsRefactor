@@ -5,7 +5,7 @@ from typing import List, Dict, Optional
 from app.database import get_client, execute_hybrid_search, rerank_candidates
 from app.transforms import MediaQueryTranslator
 from app import config
-from app import models
+from app.infra import models
 
 logger = logging.getLogger(__name__)
 

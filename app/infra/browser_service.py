@@ -1,3 +1,5 @@
+"""Playwright 浏览器自动化与网页抓取服务 (L1)"""
+
 import os
 from browser_use import Agent, Browser
 from app import config

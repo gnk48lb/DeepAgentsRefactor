@@ -16,7 +16,7 @@ Architecture:
 import asyncio
 import re
 from typing import List, Optional
-from app.utils import extract_text
+from app.utils.text import extract_text
 from langchain_core.messages import HumanMessage, BaseMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
@@ -65,9 +65,9 @@ except ImportError:
 
 from app import amap
 from app import markitdown_tool
-from app import models
+from app.infra import models
 from app import tools
-from app import mcp_service
+from app.infra import mcp_service
 from app import database
 from app import file_agent
 from app.graph import (
@@ -315,7 +315,7 @@ async def _background_extract_memory(recent_chat: str):
     try:
         clean_chat = strip_memory_block(recent_chat)
         final_prompt = MEMORY_EXTRACTOR_PROMPT.format(recent_chat=clean_chat)
-        from app import cli_logger
+        from app.runtime import cli_logger
         mem_start = time.perf_counter()
         res = await models.extractor_llm.ainvoke(
             final_prompt,

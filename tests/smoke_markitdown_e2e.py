@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 from app import config
-import app.mcp_service as mcp_service
+import app.infra.mcp_service as mcp_service
 import app.markitdown_tool as markitdown_tool
 
 

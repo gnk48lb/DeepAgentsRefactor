@@ -18,6 +18,8 @@ app/sandbox.py
   }
 """
 
+"""Docker 隔离代码执行沙箱服务 (L1)"""
+
 import os
 import tempfile
 import shutil
@@ -26,7 +28,7 @@ from typing import TypedDict
 
 import docker
 from app import config
-from app.loader import compress_image_to_base64
+from app.utils.images import compress_image_to_base64
 
 # stdout / stderr 最大保留字符数（保留头尾，防止 LLM 上下文溢出同时确保末尾 traceback 可见）
 _MAX_OUTPUT_CHARS = 1000

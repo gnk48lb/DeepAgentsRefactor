@@ -1,5 +1,5 @@
 """
-app/cli_logger.py
+app/runtime/cli_logger.py - 终端调试日志与回调 (L1)
 
 Terminal debug logger and LangChain callback handler for GNK48-Agent.
 Provides colored, framed, and hierarchical visual traces of LLM invocations,
@@ -17,7 +17,7 @@ from uuid import UUID
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
 from app import config
-from app.utils import extract_text
+from app.utils.text import extract_text
 
 # 确保 Windows 控制台启用 ANSI 与 UTF-8 编码
 if sys.platform == "win32":

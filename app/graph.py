@@ -14,8 +14,8 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMe
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt
 
-from app import models
-from app.utils import extract_text
+from app.infra import models
+from app.utils.text import extract_text
 
 
 def _sanitize_messages_for_llm(messages: list) -> list:

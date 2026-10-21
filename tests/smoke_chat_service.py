@@ -46,7 +46,6 @@ import app
 
 _db = types.ModuleType("app.database")
 _da = types.ModuleType("app.deep_agent")
-_md = types.ModuleType("app.models")
 _da.mem_calls = []
 _da.build_initial_messages = lambda user_query, history_messages=None: [HumanMessage(content=user_query, name="user")]
 
@@ -56,13 +55,13 @@ async def _fake_extract_memory(recent_chat):
 
 
 _da._background_extract_memory = _fake_extract_memory
-_md.vlm = None
-for _n, _m in (("database", _db), ("deep_agent", _da), ("models", _md)):
+for _n, _m in (("database", _db), ("deep_agent", _da)):
     sys.modules[f"app.{_n}"] = _m
     setattr(app, _n, _m)
 
 from app import config
-from app import chat_service as cs, file_agent, hitl, outbox
+from app import chat_service as cs, file_agent
+from app.runtime import hitl, outbox
 
 
 class ScriptedModel(BaseChatModel):

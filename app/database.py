@@ -2,7 +2,7 @@ import os
 import json
 import logging
 from app import config
-from app import models
+from app.infra import models
 from app import loader as data_loader
 from pymilvus import MilvusClient, AnnSearchRequest, RRFRanker
 from neo4j import GraphDatabase
