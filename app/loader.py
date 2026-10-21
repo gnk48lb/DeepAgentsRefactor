@@ -5,8 +5,9 @@ import base64
 from io import BytesIO
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_core.messages import HumanMessage
-from . import models
-from .utils import extract_text
+from app import config
+from app import models
+from app.utils import extract_text
 import hashlib
 
 def get_file_sha256(byte_data: bytes) -> str:
@@ -26,15 +27,13 @@ def compress_image_to_base64(image_path: str, max_size=(1024, 1024), quality=80)
         print(f"Error compressing image {image_path}: {e}")
         return ""
 
-SOURCE_DIR = "data/source"
-PIPELINE_IMAGES_DIR = "data/pipeline/images"
-PIPELINE_SUMMARIES_DIR = "data/pipeline/summaries"
-
-def process_pdfs_and_images(source_dir=SOURCE_DIR, is_incremental=False):
+def process_pdfs_and_images(source_dir=None, is_incremental=False):
     """扫描目录下的 PDF 和图片，提取页面并调用 VLM 生成小作文缓存"""
+    if source_dir is None:
+        source_dir = config.SOURCE_DIR
     import shutil
-    os.makedirs(PIPELINE_IMAGES_DIR, exist_ok=True)
-    os.makedirs(PIPELINE_SUMMARIES_DIR, exist_ok=True)
+    os.makedirs(config.PIPELINE_IMAGES_DIR, exist_ok=True)
+    os.makedirs(config.PIPELINE_SUMMARIES_DIR, exist_ok=True)
     
     active_hashes = set()
     newly_created_hashes = set()
@@ -55,8 +54,8 @@ def process_pdfs_and_images(source_dir=SOURCE_DIR, is_incremental=False):
                         img_hash = get_file_sha256(img_bytes)
                         
                         img_name = f"{img_hash}.png"
-                        img_path = os.path.join(PIPELINE_IMAGES_DIR, img_name)
-                        summary_path = os.path.join(PIPELINE_SUMMARIES_DIR, f"{img_hash}.md")
+                        img_path = os.path.join(config.PIPELINE_IMAGES_DIR, img_name)
+                        summary_path = os.path.join(config.PIPELINE_SUMMARIES_DIR, f"{img_hash}.md")
                         
                         is_new = not os.path.exists(summary_path)
                         if is_new:
@@ -74,8 +73,8 @@ def process_pdfs_and_images(source_dir=SOURCE_DIR, is_incremental=False):
                     img_bytes = f.read()
                 img_hash = get_file_sha256(img_bytes)
                 
-                img_path = os.path.join(PIPELINE_IMAGES_DIR, f"{img_hash}{ext}")
-                summary_path = os.path.join(PIPELINE_SUMMARIES_DIR, f"{img_hash}.md")
+                img_path = os.path.join(config.PIPELINE_IMAGES_DIR, f"{img_hash}{ext}")
+                summary_path = os.path.join(config.PIPELINE_SUMMARIES_DIR, f"{img_hash}.md")
                 
                 is_new = not os.path.exists(summary_path)
                 if is_new:
@@ -88,7 +87,7 @@ def process_pdfs_and_images(source_dir=SOURCE_DIR, is_incremental=False):
                     print(f"Copied image to {img_path}")
 
     # VLM 扫描 PIPELINE_IMAGES_DIR 中活跃的图片
-    for root, _, files in os.walk(PIPELINE_IMAGES_DIR):
+    for root, _, files in os.walk(config.PIPELINE_IMAGES_DIR):
         for file in files:
             file_path = os.path.join(root, file)
             file_base, ext = os.path.splitext(file)
@@ -98,7 +97,7 @@ def process_pdfs_and_images(source_dir=SOURCE_DIR, is_incremental=False):
                 if file_base not in active_hashes:
                     continue
                 
-                summary_path = os.path.join(PIPELINE_SUMMARIES_DIR, f"{file_base}.md")
+                summary_path = os.path.join(config.PIPELINE_SUMMARIES_DIR, f"{file_base}.md")
                 if os.path.exists(summary_path):
                     continue
                 
@@ -125,7 +124,7 @@ def process_pdfs_and_images(source_dir=SOURCE_DIR, is_incremental=False):
                 try:
                     res = models.vlm.invoke([msg])
                     content_res = extract_text(res.content)
-                    rel_img_path = os.path.relpath(file_path, "data")
+                    rel_img_path = os.path.relpath(file_path, config.DATA_DIR)
                     with open(summary_path, "w", encoding="utf-8") as f:
                         f.write(f"<!-- image_path: {rel_img_path} -->\n\n")
                         f.write(content_res)
@@ -136,10 +135,12 @@ def process_pdfs_and_images(source_dir=SOURCE_DIR, is_incremental=False):
                     
     return newly_created_hashes if is_incremental else active_hashes
 
-def load_and_split_markdown(data_dir="data/source", is_incremental=False):
+def load_and_split_markdown(data_dir=None, is_incremental=False):
     """
     递归读取目录下的所有 markdown 文件，并根据标题进行切分
     """
+    if data_dir is None:
+        data_dir = config.SOURCE_DIR
     active_hashes = process_pdfs_and_images(data_dir, is_incremental=is_incremental)
 
     headers_to_split_on = [
@@ -172,12 +173,12 @@ def load_and_split_markdown(data_dir="data/source", is_incremental=False):
                     
     # 2. 仅扫描本批次活跃图片所生成的 VLM 摘要
     for img_hash in active_hashes:
-        summary_path = os.path.join(PIPELINE_SUMMARIES_DIR, f"{img_hash}.md")
+        summary_path = os.path.join(config.PIPELINE_SUMMARIES_DIR, f"{img_hash}.md")
         if os.path.exists(summary_path):
             files_to_process.append((summary_path, True))
         
     for file_path, is_summary in files_to_process:
-        rel_path = os.path.relpath(file_path, "data")
+        rel_path = os.path.relpath(file_path, config.DATA_DIR)
         source_id = rel_path.replace("\\", "_").replace("/", "_").replace(".", "_")
         
         content_type = "image_description" if is_summary else "text"
@@ -191,9 +192,9 @@ def load_and_split_markdown(data_dir="data/source", is_incremental=False):
                 base_name = os.path.splitext(os.path.basename(file_path))[0]
                 found_image = False
                 for img_ext in [".png", ".jpg", ".jpeg"]:
-                    potential_img = os.path.join(PIPELINE_IMAGES_DIR, f"{base_name}{img_ext}")
+                    potential_img = os.path.join(config.PIPELINE_IMAGES_DIR, f"{base_name}{img_ext}")
                     if os.path.exists(potential_img):
-                        image_path = os.path.relpath(potential_img, "data")
+                        image_path = os.path.relpath(potential_img, config.DATA_DIR)
                         found_image = True
                         break
                 

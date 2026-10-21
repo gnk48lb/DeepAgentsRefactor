@@ -4,10 +4,10 @@ import sys
 from pathlib import Path
 
 # Add project root to sys.path
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_PROJECT_ROOT))
+import os
 
-import config
+
+from app import config
 
 # 1. MySQL 连接配置（复用 config 配置）
 DB_CONFIG = {
@@ -141,8 +141,8 @@ if __name__ == "__main__":
     # 执行一键迁移
     init_mysql_tables()
 
-    actresses_path = _PROJECT_ROOT / "data" / "graphrag" / "actresses.jsonl"
-    works_path = _PROJECT_ROOT / "data" / "graphrag" / "work.jsonl"
+    actresses_path = os.path.join(config.DATA_DIR, "graphrag", "actresses.jsonl")
+    works_path = config.MEDIA_SOURCE_FILE
 
     import_actresses(str(actresses_path))
     import_works_and_relations(str(works_path))

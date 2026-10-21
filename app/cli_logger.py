@@ -16,6 +16,7 @@ from uuid import UUID
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
+from app import config
 from app.utils import extract_text
 
 # 确保 Windows 控制台启用 ANSI 与 UTF-8 编码
@@ -63,14 +64,14 @@ BASE64_LONG_REGEX = re.compile(r"^[A-Za-z0-9+/=\r\n\s]{200,}$")
 
 def is_debug_enabled() -> bool:
     """检查是否开启命令行调试输出（通过环境变量 CLI_DEBUG 控制，默认开启）"""
-    val = os.getenv("CLI_DEBUG", "1").strip().lower()
+    val = str(getattr(config, "CLI_DEBUG", "1")).strip().lower()
     return val not in ("0", "false", "no", "off")
 
 
 def get_max_chars() -> int:
     """获取单条输出截断字符数上限（默认 600）"""
     try:
-        return int(os.getenv("CLI_DEBUG_MAX_CHARS", "600"))
+        return int(getattr(config, "CLI_DEBUG_MAX_CHARS", "600"))
     except Exception:
         return 600
 

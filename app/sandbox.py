@@ -25,8 +25,8 @@ import glob
 from typing import TypedDict
 
 import docker
-import config
-from .loader import compress_image_to_base64
+from app import config
+from app.loader import compress_image_to_base64
 
 # stdout / stderr 最大保留字符数（保留头尾，防止 LLM 上下文溢出同时确保末尾 traceback 可见）
 _MAX_OUTPUT_CHARS = 1000

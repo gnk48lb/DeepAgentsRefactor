@@ -18,9 +18,9 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 # 确保项目根目录在 sys.path
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+# _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# if str(_PROJECT_ROOT) not in sys.path:
+
 
 import asyncio
 

@@ -1,18 +1,15 @@
 import os
 import json
 import logging
-import config
-from . import models
-from . import loader as data_loader
+from app import config
+from app import models
+from app import loader as data_loader
 from pymilvus import MilvusClient, AnnSearchRequest, RRFRanker
 from neo4j import GraphDatabase
 from typing import List, Dict, Any, Optional
 import shutil
 
 logger = logging.getLogger(__name__)
-
-PENDING_DIR = "data/pending"
-SOURCE_DIR = "data/source"
 
 client = None
 
@@ -28,12 +25,14 @@ def get_client() -> MilvusClient:
         client = MilvusClient(uri=config.MILVUS_DB_PATH, keep_alive=False)
     return client
 
-def init_knowledge_base(data_dir="data/source"):
+def init_knowledge_base(data_dir=None):
     """
     初始化知识库：
     1. 检查集合是否存在，若开启 REFRESH_COLLECTION 则用物理清理规避 Windows 文件锁 Bug。
     2. 使用新版自适应 Schema 一键混合检索建表并建索引，100% 避开 Windows [WinError 183] 锁机制。
     """
+    if data_dir is None:
+        data_dir = config.SOURCE_DIR
     try:
         coll_name = config.KNOWLEDGE_COLLECTION_NAME
         
@@ -93,7 +92,7 @@ def init_knowledge_base(data_dir="data/source"):
         
         if not is_empty:
             # 必须加载本地保存稀疏向量编码的 BM25 模型，否则无法对新 Query 进行编码
-            bm25_path = "storage/bm25_model.json"
+            bm25_path = config.BM25_MODEL_PATH
             if os.path.exists(bm25_path):
                 models.bm25_ef.load(bm25_path)
                 print(f"✅ 知识库 '{coll_name}' 已有数据且 BM25 词频模型就绪，跳过文档加载与向量化。")
@@ -121,8 +120,8 @@ def init_knowledge_base(data_dir="data/source"):
             # 训练并生成稀疏向量
             print(f"正在进行 BM25 词频统计拟合...")
             models.bm25_ef.fit(texts)
-            os.makedirs("storage", exist_ok=True)
-            models.bm25_ef.save("storage/bm25_model.json")
+            os.makedirs(config.STORAGE_DIR, exist_ok=True)
+            models.bm25_ef.save(config.BM25_MODEL_PATH)
             sparse_vectors = models.bm25_ef.encode_documents(texts)
             
             data = []
@@ -170,7 +169,7 @@ def init_av_graph_rag():
                 pass
         
         if is_empty:
-            data_file = "data/graphrag/work.jsonl"
+            data_file = config.MEDIA_SOURCE_FILE
             if os.path.exists(data_file):
                 print(f"--- [初始化] 专有媒体库 '{coll_name}' 为空，正在从 {data_file} 构建数据... ---")
                 db_builder.build_from_file(data_file)
@@ -312,12 +311,12 @@ def process_incremental_knowledge():
     """
     处理 pending 目录下的增量知识
     """
-    os.makedirs(PENDING_DIR, exist_ok=True)
-    os.makedirs(SOURCE_DIR, exist_ok=True)
+    os.makedirs(config.PENDING_DIR, exist_ok=True)
+    os.makedirs(config.SOURCE_DIR, exist_ok=True)
     
     # 检查 PENDING_DIR 是否有文件
     has_files = False
-    for root, _, files in os.walk(PENDING_DIR):
+    for root, _, files in os.walk(config.PENDING_DIR):
         if files:
             has_files = True
             break
@@ -332,17 +331,17 @@ def process_incremental_knowledge():
         print("--- [重构模式] 检测到 REFRESH_BM25=True，开始全量拟合 BM25 并更新稀疏向量 ---")
         # 1. 扫描 source + pending 的所有文本进行 fit 并在本地 save
         all_docs = []
-        if os.path.exists(SOURCE_DIR):
-            all_docs.extend(data_loader.load_and_split_markdown(data_dir=SOURCE_DIR))
-        if os.path.exists(PENDING_DIR):
-            all_docs.extend(data_loader.load_and_split_markdown(data_dir=PENDING_DIR))
+        if os.path.exists(config.SOURCE_DIR):
+            all_docs.extend(data_loader.load_and_split_markdown(data_dir=config.SOURCE_DIR))
+        if os.path.exists(config.PENDING_DIR):
+            all_docs.extend(data_loader.load_and_split_markdown(data_dir=config.PENDING_DIR))
         
         all_texts = [doc.page_content for doc in all_docs]
         if all_texts:
             print(f"正在进行 BM25 词频统计全量拟合 (共 {len(all_texts)} 个片段)...")
             models.bm25_ef.fit(all_texts)
-            os.makedirs("storage", exist_ok=True)
-            models.bm25_ef.save("storage/bm25_model.json")
+            os.makedirs(config.STORAGE_DIR, exist_ok=True)
+            models.bm25_ef.save(config.BM25_MODEL_PATH)
         
         # 2. 从 Milvus 捞出旧数据（只捞 id 和 text，规避内存问题）
         is_empty = True
@@ -380,8 +379,8 @@ def process_incremental_knowledge():
     if not has_files:
         return
         
-    print(f"--- [增量入库] 检测到 {PENDING_DIR} 中有新文件，开始处理增量知识 ---")
-    docs = data_loader.load_and_split_markdown(data_dir=PENDING_DIR, is_incremental=True)
+    print(f"--- [增量入库] 检测到 {config.PENDING_DIR} 中有新文件，开始处理增量知识 ---")
+    docs = data_loader.load_and_split_markdown(data_dir=config.PENDING_DIR, is_incremental=True)
     
     if docs:
         print(f"提取到 {len(docs)} 个片段，开始双路向量化并入库...")
@@ -390,7 +389,7 @@ def process_incremental_knowledge():
         
         vectors = models.embeddings.embed_documents(texts)
         
-        bm25_path = "storage/bm25_model.json"
+        bm25_path = config.BM25_MODEL_PATH
         if os.path.exists(bm25_path):
             models.bm25_ef.load(bm25_path)
         else:
@@ -416,12 +415,12 @@ def process_incremental_knowledge():
         c.load_collection(collection_name=coll_name)
         print(f"✅ 成功插入 {res.get('insert_count', len(data))} 条增量数据。")
         
-        print(f"正在将已处理的文件从 {PENDING_DIR} 移动到 {SOURCE_DIR} ...")
-        for root, _, files in os.walk(PENDING_DIR):
+        print(f"正在将已处理的文件从 {config.PENDING_DIR} 移动到 {config.SOURCE_DIR} ...")
+        for root, _, files in os.walk(config.PENDING_DIR):
             for file in files:
                 src_path = os.path.join(root, file)
-                rel_path = os.path.relpath(src_path, PENDING_DIR)
-                dst_path = os.path.join(SOURCE_DIR, rel_path)
+                rel_path = os.path.relpath(src_path, config.PENDING_DIR)
+                dst_path = os.path.join(config.SOURCE_DIR, rel_path)
                 
                 os.makedirs(os.path.dirname(dst_path), exist_ok=True)
                 shutil.move(src_path, dst_path)
@@ -537,8 +536,8 @@ class MediaDataBuilder:
                     
         logger.info(f"Fitting BM25 model on {len(all_texts)} records...")
         models.av_bm25_ef.fit(all_texts)
-        os.makedirs(os.path.dirname("storage/av_bm25_model.json"), exist_ok=True)
-        models.av_bm25_ef.save("storage/av_bm25_model.json")
+        os.makedirs(config.STORAGE_DIR, exist_ok=True)
+        models.av_bm25_ef.save(config.AV_BM25_MODEL_PATH)
         logger.info("BM25 model saved.")
 
         logger.info("Second pass: batch insert...")
@@ -686,7 +685,7 @@ class MediaDataBuilder:
 def run_global_database_init():
     """一键运行系统所有数据库及知识库的流式初始化，供所有入口（控制台/微信/QQ）统一调用"""
     print("🚀 [Database] 开始执行全局多模态知识库联合初始化...")
-    init_knowledge_base("data/source")
+    init_knowledge_base(config.SOURCE_DIR)
     process_incremental_knowledge()
     init_av_graph_rag()
     init_memory_collection()

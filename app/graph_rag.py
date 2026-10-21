@@ -2,10 +2,10 @@ import atexit
 import logging
 import threading
 from typing import List, Dict, Optional
-from .database import get_client, execute_hybrid_search, rerank_candidates
-from .transforms import MediaQueryTranslator
-import config
-from . import models
+from app.database import get_client, execute_hybrid_search, rerank_candidates
+from app.transforms import MediaQueryTranslator
+from app import config
+from app import models
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ class MediaGraphRetriever:
             logger.warning(f"Collection {self.collection_name} not found. MediaAgent search disabled.")
 
         import os
-        bm25_path = "storage/av_bm25_model.json"
+        bm25_path = config.AV_BM25_MODEL_PATH
         if os.path.exists(bm25_path):
             try:
                 models.av_bm25_ef.load(bm25_path)
@@ -178,6 +178,6 @@ def get_media_retriever() -> MediaGraphRetriever:
 
 
 if __name__ == "__main__":
-    from .database import MediaDataBuilder
+    from app.database import MediaDataBuilder
     builder = MediaDataBuilder()
-    builder.build_from_file("data/graphrag/work.jsonl")
+    builder.build_from_file(config.MEDIA_SOURCE_FILE)

@@ -3,11 +3,10 @@ import asyncio
 import os
 import sys
 from playwright.async_api import async_playwright
+from app import config
 
 # 定义浏览器数据的持久化保存目录
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
-USER_DATA_DIR = os.path.join(PROJECT_ROOT, "storage", "browser_profile")
+USER_DATA_DIR = config.BROWSER_PROFILE_DIR
 
 
 async def main():

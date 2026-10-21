@@ -1,9 +1,9 @@
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import PydanticOutputParser
-from . import models
-from .models import QueryIntent, ExtractedEntities
-from .utils import extract_text
+from app import models
+from app.models import QueryIntent, ExtractedEntities
+from app.utils import extract_text
 import logging
 
 logger = logging.getLogger(__name__)

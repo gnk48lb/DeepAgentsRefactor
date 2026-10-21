@@ -13,7 +13,7 @@ from langgraph.types import Command
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 
-import config
+from app import config
 from app import database, deep_agent, outbox, models, hitl, cli_logger
 from app.utils import extract_text
 

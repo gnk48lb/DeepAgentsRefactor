@@ -22,9 +22,9 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+
+
+    
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -61,7 +61,7 @@ for _n, _m in (("database", _db), ("deep_agent", _da), ("models", _md)):
     sys.modules[f"app.{_n}"] = _m
     setattr(app, _n, _m)
 
-import config
+from app import config
 from app import chat_service as cs, file_agent, hitl, outbox
 
 

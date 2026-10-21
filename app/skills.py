@@ -7,8 +7,9 @@ deepagents Skills 的 backend 装配：把磁盘上的 skills/ 目录暴露成�
 import os
 
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
+from app import config
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = config.PROJECT_ROOT
 SKILLS_DIR = os.path.join(PROJECT_ROOT, "skills")   # 磁盘上的真实目录
 SKILLS_ROUTE = "/skills/"                           # 给 SkillsMiddleware / read_file 看的虚拟路径
 

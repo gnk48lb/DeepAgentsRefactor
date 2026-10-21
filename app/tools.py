@@ -1,10 +1,11 @@
+import os
 import re
-from langchain_core.tools import tool
-from .database import get_client, execute_hybrid_search, rerank_candidates
-from .graph_rag import get_media_retriever
 from datetime import datetime
-import config
-from . import models
+from langchain_core.tools import tool
+from app import config
+from app import models
+from app.database import get_client, execute_hybrid_search, rerank_candidates
+from app.graph_rag import get_media_retriever
 
 
 @tool
@@ -20,7 +21,7 @@ def rag(query: str):
         # 1. 查询转换路由
         queries_to_search = [query]
         if getattr(config, "ENABLE_QUERY_TRANSFORM", False):
-            from . import transforms as query_transforms
+            from app import transforms as query_transforms
             strategy = query_transforms.route_query(query)
             print(f"--> [Query Transform] Strategy selected: {strategy}")
             
@@ -74,7 +75,7 @@ def rag(query: str):
             
             # 如果是图像描述，提取完整小作文并记录图片路径
             if content_type == "image_description" and image_path:
-                full_summary_path = os.path.join("data", source_path)
+                full_summary_path = os.path.join(config.DATA_DIR, source_path)
                 try:
                     if os.path.exists(full_summary_path):
                         with open(full_summary_path, "r", encoding="utf-8") as f:
@@ -92,13 +93,13 @@ def rag(query: str):
         
         # 4. 根据是否包含图片决定返回类型
         if image_paths:
-            from .loader import compress_image_to_base64
+            from app.loader import compress_image_to_base64
             
             multimodal_content = []
             
             # 先添加图片，再添加文字描述，有助于模型更好地结合视觉信息
             for img_rel_path in image_paths:
-                full_img_path = os.path.join("data", img_rel_path)
+                full_img_path = os.path.join(config.DATA_DIR, img_rel_path)
                 if os.path.exists(full_img_path):
                     b64_img = compress_image_to_base64(full_img_path, max_size=(800, 800), quality=80)
                     if b64_img:
@@ -234,7 +235,7 @@ def execute_python_code(code: str) -> any:
     """
     print(f"\n[Tool Call: execute_python_code] 代码长度: {len(code)} 字符")
     try:
-        from .sandbox import run_code_in_sandbox
+        from app.sandbox import run_code_in_sandbox
         res = run_code_in_sandbox(code)
 
         # 记录终端日志（仅 stdout 前 200 字符，避免刷屏）
@@ -245,7 +246,7 @@ def execute_python_code(code: str) -> any:
 
         # 【多模态组装】：有图片时返回 list，与现有拦截器无缝对接
         if res["images"]:
-            from . import outbox
+            from app import outbox
             content = [
                 {
                     "type": "text",
@@ -275,7 +276,7 @@ code_tools = [execute_python_code]
 
 # ── BrowserAgent 专用工具 ───────────────────────────────────────────────────────
 
-from .browser_service import fetch_generic_webpage_content, fetch_bilibili_profile_data, run_browser_task
+from app.browser_service import fetch_generic_webpage_content, fetch_bilibili_profile_data, run_browser_task
 
 @tool
 async def read_webpage_content(url: str) -> str:

@@ -1,5 +1,6 @@
 import os
 from browser_use import Agent, Browser
+from app import config
 
 _browser = None
 
@@ -9,10 +10,7 @@ async def init_browser():
     """
     global _browser
     if _browser is None:
-        # 修正：获取项目根目录 (app 的上一级)
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(current_dir)
-        user_data_dir = os.path.join(project_root, "storage", "browser_profile")
+        user_data_dir = config.BROWSER_PROFILE_DIR
         
         print(f"\n[BrowserService] 🚀 正在启动可见模式浏览器...")
         print(f"[BrowserService] 📂 数据目录: {user_data_dir}")
@@ -52,8 +50,6 @@ async def run_browser_task(task_description: str, llm) -> str:
     运行 BrowserAgent 任务
     """
     try:
-        import config
-        
         if "gemini" in config.BROWSER_VLM_MODEL.lower():
             from browser_use.llm.google.chat import ChatGoogle
             browser_llm = ChatGoogle(
@@ -150,7 +146,7 @@ async def fetch_generic_webpage_content(url: str) -> str:
     }
 
     # 1. 优先尝试 Jina Reader（若配置了 JINA_API_KEY 或未被风控）
-    jina_key = os.getenv("JINA_API_KEY")
+    jina_key = config.JINA_API_KEY
     jina_headers = dict(default_headers)
     if jina_key:
         jina_headers["Authorization"] = f"Bearer {jina_key}"

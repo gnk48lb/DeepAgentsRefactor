@@ -19,8 +19,8 @@ if hasattr(sys.stderr, "reconfigure"):
 
 # 确保项目根目录在 sys.path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+
+
 
 # 仅导入 app.skills，严禁导入 app.models / app.deep_agent
 from app.skills import build_skills_backend, SKILLS_ROUTE, SKILLS_DIR

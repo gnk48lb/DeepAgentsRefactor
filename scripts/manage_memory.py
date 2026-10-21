@@ -3,13 +3,13 @@ import argparse
 from pathlib import Path
 
 # Add project root to sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 
 # 设置标准输出编码为 utf-8
-sys.stdout.reconfigure(encoding='utf-8')
-sys.stderr.reconfigure(encoding='utf-8')
 
-import config
+
+
+from app import config
 from app import database
 
 def list_memories():

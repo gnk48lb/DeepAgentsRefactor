@@ -1,5 +1,5 @@
 from typing import Any, Dict, Optional
-from . import client
+from app.amap import client
 
 
 async def maps_regeocode(location: str) -> Dict[str, Any]:

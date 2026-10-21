@@ -16,7 +16,7 @@ Architecture:
 import asyncio
 import re
 from typing import List, Optional
-from .utils import extract_text
+from app.utils import extract_text
 from langchain_core.messages import HumanMessage, BaseMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
@@ -63,19 +63,19 @@ try:
 except ImportError:
     ToolCallLimitMiddleware = None
 
-from . import amap
-from . import markitdown_tool
-from . import models
-from . import tools
-from . import mcp_service
-from . import database
-from . import file_agent
-from .graph import (
+from app import amap
+from app import markitdown_tool
+from app import models
+from app import tools
+from app import mcp_service
+from app import database
+from app import file_agent
+from app.graph import (
     build_desktop_agent_subgraph,
     DESKTOP_AGENT_PROMPT,
 )
-import config
-from .skills import build_skills_backend, SKILLS_ROUTE
+from app import config
+from app.skills import build_skills_backend, SKILLS_ROUTE
 
 
 # ============================================================================

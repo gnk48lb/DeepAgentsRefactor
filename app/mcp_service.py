@@ -19,12 +19,12 @@ from langchain_core.tools import BaseTool, StructuredTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 
-import config
+from app import config
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 
 # mcp_servers.json 所在路径
-_CONFIG_PATH = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "mcp_servers.json"
+_CONFIG_PATH = Path(config.PROJECT_ROOT) / "mcp_servers.json"
 
 # ── 全局单例与常驻 Runner ─────────────────────────────────────────────────────
 _mcp_client: Optional[MultiServerMCPClient] = None

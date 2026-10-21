@@ -5,7 +5,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, HarmCategory, HarmBlo
 from pymilvus.model.sparse import BM25EmbeddingFunction
 from langchain_core.embeddings import Embeddings
 from pymilvus.model.sparse.bm25.tokenizers import build_default_analyzer
-import config
+from app import config
 import logging
 import requests
 

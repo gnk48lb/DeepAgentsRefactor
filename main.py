@@ -25,7 +25,7 @@ from app import deep_agent
 from app import database
 from app import outbox
 from app import hitl
-import config
+from app import config
 import asyncio
 import traceback
 import json

@@ -5,7 +5,7 @@ import re
 from typing import Callable, List
 from langchain_core.tools import BaseTool, StructuredTool
 
-from . import impl
+from app.amap import impl
 
 _SNAPSHOT_PATH = Path(__file__).resolve().parent / "tools_snapshot.json"
 

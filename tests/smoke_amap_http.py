@@ -20,9 +20,9 @@ from pathlib import Path
 import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
 
-import config
+
+from app import config
 import app.amap as amap
 import app.amap.client as amap_client
 

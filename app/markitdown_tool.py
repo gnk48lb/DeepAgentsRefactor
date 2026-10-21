@@ -13,7 +13,7 @@ from urllib.parse import urlparse, unquote
 
 from langchain_core.tools import BaseTool, StructuredTool
 
-import config
+from app import config
 
 
 async def normalize_uri(

@@ -13,9 +13,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
 
-import config
+
+from app import config
 import app.mcp_service as mcp_service
 import app.markitdown_tool as markitdown_tool
 

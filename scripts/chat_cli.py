@@ -5,19 +5,13 @@ import base64
 import argparse
 from pathlib import Path
 
-# Add project root to sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-# 设置标准输出编码为 utf-8
-sys.stdout.reconfigure(encoding='utf-8')
-sys.stderr.reconfigure(encoding='utf-8')
-
+from app import config
 from app import chat_service
 
 def save_images(images: list):
     if not images:
         return
-    debug_dir = os.path.join("storage", "outbox_debug")
+    debug_dir = config.OUTBOX_DEBUG_DIR
     os.makedirs(debug_dir, exist_ok=True)
     for idx, item in enumerate(images):
         url = item.get("image_url", {}).get("url", "")

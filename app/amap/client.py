@@ -2,7 +2,7 @@ import json
 import re
 from typing import Optional, Tuple
 import httpx
-import config
+from app import config
 
 _BASE = "https://restapi.amap.com"
 _client: Optional[httpx.AsyncClient] = None
