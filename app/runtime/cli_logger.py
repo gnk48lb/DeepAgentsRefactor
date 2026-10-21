@@ -229,7 +229,7 @@ def _identify_agent(messages: Any, metadata: Optional[Dict[str, Any]], serialize
         corpus = "\n".join(sys_texts) if sys_texts else "\n".join(all_texts[:3])
 
         if "你是一个多智能体系统的主 Agent" in corpus:
-            return "MainAgent (Supervisor)"
+            return "MainAgent (Orchestrator)"
         if "个人隐私与偏好提取官" in corpus:
             return "MemoryExtractor"
         if "意图翻译官" in corpus:
@@ -261,7 +261,7 @@ def _identify_agent(messages: Any, metadata: Optional[Dict[str, Any]], serialize
 
             # 若 checkpoint_ns 为空，说明是顶层主图
             if not checkpoint_ns:
-                return "MainAgent (Supervisor)"
+                return "MainAgent (Orchestrator)"
 
             if checkpoint_ns and not checkpoint_ns.startswith(("model:", "tools:")):
                 return checkpoint_ns
@@ -272,7 +272,7 @@ def _identify_agent(messages: Any, metadata: Optional[Dict[str, Any]], serialize
             if s_name:
                 return str(s_name)
 
-        return "MainAgent (Supervisor)"
+        return "MainAgent (Orchestrator)"
     except Exception:
         return "Agent"
 

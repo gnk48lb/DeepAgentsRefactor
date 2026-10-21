@@ -4,7 +4,7 @@ tests/smoke_chat_service.py
 chat_service 服务层离线冒烟测试：用脚本化假模型驱动真实的 FileAgent / hitl / outbox / chat_service，
 覆盖：多轮 HITL（批准 / 拒绝 / 挂起期间发无关消息）、HITL 前已产生图片的发件箱连续性、
 并发忙提示、并行中断一次 Y 放行、超时后会话仍可继续、/reset 丢弃挂起授权与历史。
-不需要任何 API Key / Docker / MCP / 网络：supervisor / injector / extractor / startup 在 import 前被桩掉。
+不需要任何 API Key / Docker / MCP / 网络：orchestrator / injector / extractor / startup 在 import 前被桩掉。
 """
 import asyncio
 import operator
@@ -64,7 +64,7 @@ async def _fake_extract_memory(recent_chat):
     mem_calls.append(recent_chat)
 
 
-_stub(app.agents, "supervisor", build_main_agent=None)
+_stub(app.agents, "orchestrator", build_main_agent=None)
 _stub(
     app.memory,
     "injector",

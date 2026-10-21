@@ -112,7 +112,7 @@ async def build_main_agent(
 ):
     """
     构建基于 deepagents 的主 Agent 实例（单用户：本地操作类专家始终挂载）。
-    - 主模型: models.supervisor_llm
+    - 主模型: models.orchestrator_llm
     - 子专家: 声明式接入 (task 委派)，包含 FileAgent / DesktopAgent / BrowserAgent 等全部 8 个专家
     - 中间件: ToolCallLimitMiddleware 防御 task 工具死循环
     - 持久化: 默认使用 MemorySaver
@@ -162,7 +162,7 @@ async def build_main_agent(
         checkpointer = MemorySaver()
 
     agent = create_deep_agent(
-        model=models.supervisor_llm,
+        model=models.orchestrator_llm,
         system_prompt=MAIN_AGENT_PROMPT,
         subagents=subagents,
         middleware=middleware,

@@ -1,7 +1,7 @@
 """技能后端装配与路由管理 (所在层: L4)
 
 deepagents Skills 的 backend 装配：把磁盘上的 skills/ 目录暴露成虚拟路径 /skills/。
-故意不 import app.infra.models / app.agents.supervisor，方便离线烟测（不需要任何 API Key）。
+故意不 import app.infra.models / app.agents.orchestrator，方便离线烟测（不需要任何 API Key）。
 """
 import os
 

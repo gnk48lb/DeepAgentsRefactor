@@ -213,10 +213,10 @@ def _make_worker_llm():
     )
 
 
-def _make_supervisor_llm():
+def _make_orchestrator_llm():
     _require_gemini_key()
     return ChatGoogleGenerativeAI(
-        model=config.SUPERVISOR_LLM_MODEL,
+        model=config.ORCHESTRATOR_LLM_MODEL,
         google_api_key=config.GEMINI_API_KEY,
         safety_settings=DEFAULT_SAFETY_SETTINGS,
     )
@@ -267,7 +267,7 @@ _FACTORIES = {
     "av_bm25_ef": _make_av_bm25_ef,
     "reranker": _make_reranker,
     "worker_llm": _make_worker_llm,
-    "supervisor_llm": _make_supervisor_llm,
+    "orchestrator_llm": _make_orchestrator_llm,
     "browser_vlm": _make_browser_vlm,
     "desktop_llm": _make_desktop_llm,
     "vlm": _make_vlm,

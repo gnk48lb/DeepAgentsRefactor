@@ -22,7 +22,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 
-# 仅导入 app.agents.skills，严禁导入 app.infra.models / app.agents.supervisor
+# 仅导入 app.agents.skills，严禁导入 app.infra.models / app.agents.orchestrator
 from app.agents.skills import build_skills_backend, SKILLS_ROUTE, SKILLS_DIR
 
 

@@ -93,8 +93,8 @@ RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 # 文字模型 LLM (Worker)
 WORKER_LLM_MODEL = "gemini-3.5-flash-lite"
 
-# 文字模型 LLM (Supervisor)
-SUPERVISOR_LLM_MODEL = "gemini-3.5-flash-lite"
+# 文字模型 LLM (Orchestrator)
+ORCHESTRATOR_LLM_MODEL = "gemini-3.5-flash-lite"
 
 # 多模态模型 VLM
 VLM_MODEL = "gemini-3.5-flash-lite"

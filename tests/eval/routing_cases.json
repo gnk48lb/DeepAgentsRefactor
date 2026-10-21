@@ -1,0 +1,264 @@
+{
+  "_comment": "路由评测集。expected 为期望被委派的专家集合（顺序无关）。forbidden 为绝不能被委派的专家。needs_approval 表示该用例预期会触发 HITL 挂起。difficulty 仅用于分组统计。",
+  "version": 1,
+  "cases": [
+    {
+      "id": "K01",
+      "difficulty": "easy",
+      "query": "现在几点了？",
+      "expected": ["KnowledgeAgent"],
+      "forbidden": ["MapAgent", "SQLAgent", "MediaAgent"],
+      "note": "时间类，提示词里明确点名 KnowledgeAgent"
+    },
+    {
+      "id": "K02",
+      "difficulty": "easy",
+      "query": "今天星期几？",
+      "expected": ["KnowledgeAgent"],
+      "forbidden": ["MapAgent", "SQLAgent"]
+    },
+    {
+      "id": "K03",
+      "difficulty": "medium",
+      "query": "距离 2027 年春节还有多少天？",
+      "expected": ["KnowledgeAgent"],
+      "forbidden": ["MapAgent", "SQLAgent"],
+      "note": "以现在为基准的日期推算"
+    },
+    {
+      "id": "K04",
+      "difficulty": "easy",
+      "query": "红烧肉怎么做？",
+      "expected": ["KnowledgeAgent"],
+      "forbidden": ["MapAgent", "SQLAgent", "MediaAgent"],
+      "note": "菜谱类，且绝不能顺手查附近餐馆"
+    },
+    {
+      "id": "K05",
+      "difficulty": "medium",
+      "query": "艾尔登法环里怎么打女武神？",
+      "expected": ["KnowledgeAgent"],
+      "forbidden": ["MediaAgent"],
+      "note": "游戏攻略。与 MediaAgent 的女优图谱无关，是关键词干扰用例"
+    },
+    {
+      "id": "K06",
+      "difficulty": "medium",
+      "query": "给我讲讲量子纠缠是怎么回事",
+      "expected": ["KnowledgeAgent"],
+      "forbidden": ["SQLAgent", "MapAgent"]
+    },
+
+    {
+      "id": "M01",
+      "difficulty": "easy",
+      "query": "明天济南天气怎么样，需要带伞吗？",
+      "expected": ["MapAgent"],
+      "forbidden": ["KnowledgeAgent", "SQLAgent"],
+      "note": "天气归 MapAgent；提示词说时间类派 KnowledgeAgent，此处是歧义陷阱"
+    },
+    {
+      "id": "M02",
+      "difficulty": "easy",
+      "query": "从济南西站到趵突泉怎么走？",
+      "expected": ["MapAgent"],
+      "forbidden": ["KnowledgeAgent", "SQLAgent"]
+    },
+    {
+      "id": "M03",
+      "difficulty": "medium",
+      "query": "文化东路附近有什么好吃的？",
+      "expected": ["MapAgent"],
+      "forbidden": ["KnowledgeAgent"],
+      "note": "周边搜索。KnowledgeAgent 管菜谱，但不管附近有什么"
+    },
+    {
+      "id": "M04",
+      "difficulty": "medium",
+      "query": "我现在这个 IP 大概在哪个城市？",
+      "expected": ["MapAgent"],
+      "forbidden": ["KnowledgeAgent"]
+    },
+    {
+      "id": "M05",
+      "difficulty": "medium",
+      "query": "从家骑车到公司要多久？我家在济南市历下区文化东路42号，公司在历下区经十路100号",
+      "expected": ["MapAgent"],
+      "forbidden": ["SQLAgent"],
+      "note": "骑行路线，考察是否选对 address 变体而非 coordinates 变体"
+    },
+    {
+      "id": "M06",
+      "difficulty": "hard",
+      "query": "帮我规划一下明天下午的行程：先去泉城广场，然后去大明湖，全程走路，中间要避开下雨的时段",
+      "expected": ["MapAgent"],
+      "forbidden": ["SQLAgent"],
+      "note": "单专家复合任务：天气 + 路线。考察是否被拆成多个专家"
+    },
+
+    {
+      "id": "S01",
+      "difficulty": "easy",
+      "query": "数据库里身高 165 以上的女优有哪些？",
+      "expected": ["SQLAgent"],
+      "forbidden": ["MediaAgent"],
+      "note": "身体数值属性，提示词明确归 SQLAgent"
+    },
+    {
+      "id": "S02",
+      "difficulty": "medium",
+      "query": "罩杯是 D 杯而且 1995 年以后出生的有哪些？",
+      "expected": ["SQLAgent"],
+      "forbidden": ["MediaAgent"]
+    },
+    {
+      "id": "S03",
+      "difficulty": "medium",
+      "query": "2020 年发行了多少部作品？",
+      "expected": ["SQLAgent"],
+      "forbidden": ["MediaAgent"],
+      "note": "作品发行年份统计"
+    },
+    {
+      "id": "S04",
+      "difficulty": "hard",
+      "query": "身高 160 到 170 之间、罩杯 C 或 D 的女优，各自有多少部作品？",
+      "expected": ["SQLAgent"],
+      "forbidden": ["MediaAgent"],
+      "note": "多条件过滤 + 聚合"
+    },
+
+    {
+      "id": "G01",
+      "difficulty": "easy",
+      "query": "有哪些女优和某某某合作过？",
+      "expected": ["MediaAgent"],
+      "forbidden": ["SQLAgent"],
+      "note": "合作关系网络，走图谱"
+    },
+    {
+      "id": "G02",
+      "difficulty": "medium",
+      "query": "找一些题材是人妻的作品",
+      "expected": ["MediaAgent"],
+      "forbidden": ["SQLAgent"],
+      "note": "题材标签 100% 在图谱，提示词严禁派 SQLAgent"
+    },
+    {
+      "id": "G03",
+      "difficulty": "hard",
+      "query": "熟女题材里，身高 165 以上的都有谁？",
+      "expected": ["MediaAgent", "SQLAgent"],
+      "forbidden": [],
+      "note": "复合问题：题材走图谱 + 身高走数据库。考察是否会拆成两次委派"
+    },
+    {
+      "id": "G04",
+      "difficulty": "medium",
+      "query": "番号 ABC-123 是什么作品？",
+      "expected": ["MediaAgent"],
+      "forbidden": []
+    },
+
+    {
+      "id": "C01",
+      "difficulty": "easy",
+      "query": "帮我算一下 1 到 1000 的和",
+      "expected": ["CodeAgent"],
+      "forbidden": ["SQLAgent", "KnowledgeAgent"],
+      "note": "数学计算"
+    },
+    {
+      "id": "C02",
+      "difficulty": "medium",
+      "query": "把这三组数据画成折线图：(1,3),(2,5),(3,4)",
+      "expected": ["CodeAgent"],
+      "forbidden": ["FileAgent"],
+      "note": "绘图必须明确指示，提示词里有这条"
+    },
+    {
+      "id": "C03",
+      "difficulty": "medium",
+      "query": "用 Python 做个快速排序给我看看",
+      "expected": ["CodeAgent"],
+      "forbidden": ["KnowledgeAgent"],
+      "note": "写代码 vs 讲知识，考察是否误派 KnowledgeAgent"
+    },
+
+    {
+      "id": "F01",
+      "difficulty": "easy",
+      "query": "看看 workspace 里都有什么文件",
+      "expected": ["FileAgent"],
+      "forbidden": ["DesktopAgent"],
+      "note": "本地文件 vs 桌面，关键区分"
+    },
+    {
+      "id": "F02",
+      "difficulty": "medium",
+      "query": "把 workspace/notes 下所有 md 文件里的 TODO 找出来",
+      "expected": ["FileAgent"],
+      "forbidden": ["CodeAgent"],
+      "note": "grep 场景，不该派 CodeAgent 写脚本"
+    },
+    {
+      "id": "F03",
+      "difficulty": "hard",
+      "query": "在 workspace 里新建一个 hello.txt，内容写 hello world",
+      "expected": ["FileAgent"],
+      "forbidden": ["DesktopAgent", "CodeAgent"],
+      "needs_approval": true,
+      "note": "写文件，应触发 HITL 授权"
+    },
+
+    {
+      "id": "D01",
+      "difficulty": "medium",
+      "query": "帮我打开桌面上的那个文件夹",
+      "expected": ["DesktopAgent"],
+      "forbidden": ["FileAgent"],
+      "note": "桌面 GUI vs 本地文件系统，最容易混的一对"
+    },
+    {
+      "id": "D02",
+      "difficulty": "hard",
+      "query": "双击打开桌面上的 Excel 文件",
+      "expected": ["DesktopAgent"],
+      "forbidden": ["FileAgent"]
+    },
+
+    {
+      "id": "B01",
+      "difficulty": "medium",
+      "query": "帮我打开 https://example.com 看看上面写了什么",
+      "expected": ["BrowserAgent"],
+      "forbidden": ["KnowledgeAgent"],
+      "note": "网页读取 vs 知识检索"
+    },
+    {
+      "id": "B02",
+      "difficulty": "hard",
+      "query": "把这个文件上传到那个网页上：workspace/1.png",
+      "expected": ["BrowserAgent"],
+      "forbidden": ["FileAgent"],
+      "note": "提示词明确：上传不要先派 FileAgent 读取"
+    },
+
+    {
+      "id": "X01",
+      "difficulty": "easy",
+      "query": "你好呀",
+      "expected": [],
+      "forbidden": ["MapAgent", "SQLAgent", "MediaAgent", "CodeAgent", "FileAgent", "DesktopAgent", "BrowserAgent"],
+      "note": "闲聊，不该委派任何专家（KnowledgeAgent 允许但不鼓励）"
+    },
+    {
+      "id": "X02",
+      "difficulty": "hard",
+      "query": "帮我订一张明天去北京的高铁票",
+      "expected": [],
+      "forbidden": [],
+      "note": "能力边界外。考察是否诚实说明做不到，而不是硬派 BrowserAgent 瞎点"
+    }
+  ]
+}

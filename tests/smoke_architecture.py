@@ -238,7 +238,7 @@ def test_d_prompt_uniqueness_and_identity():
     def ident(p: str) -> str:
         return _identify_agent([[SystemMessage(content=p)]], None, None)
 
-    assert ident(MAIN_AGENT_PROMPT) == "MainAgent (Supervisor)"
+    assert ident(MAIN_AGENT_PROMPT) == "MainAgent (Orchestrator)"
     assert ident(MEMORY_EXTRACTOR_PROMPT) == "MemoryExtractor"
     assert ident(knowledge_agent.PROMPT) == "KnowledgeAgent"
     assert ident(media_agent.PROMPT) == "MediaAgent"
@@ -261,7 +261,7 @@ def test_e_expert_spec_table():
         sql_agent,
         browser_agent,
     )
-    from app.agents import supervisor
+    from app.agents import orchestrator
     from app.agents.skills import SKILLS_ROUTE
 
     expected_specs = [
@@ -293,9 +293,9 @@ def test_e_expert_spec_table():
     snap_data = json.loads((ROOT / "app/tools/amap/tools_snapshot.json").read_text(encoding="utf-8"))
     assert [t.name for t in map_agent.SPEC.tools_factory()] == [item["name"] for item in snap_data]
 
-    # supervisor._DECLARATIVE_SPECS 顺序验证
+    # orchestrator._DECLARATIVE_SPECS 顺序验证
     expected_order = ["KnowledgeAgent", "MediaAgent", "MapAgent", "CodeAgent", "SQLAgent", "BrowserAgent"]
-    actual_order = [s.name for s in supervisor._DECLARATIVE_SPECS]
+    actual_order = [s.name for s in orchestrator._DECLARATIVE_SPECS]
     assert actual_order == expected_order, f"Declarative specs order mismatch: {actual_order} != {expected_order}"
 
 
