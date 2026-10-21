@@ -1,7 +1,7 @@
 """
 tests/smoke_skills.py
 
-Skills 离线冒烟测试：验证 skills/*/SKILL.md 规范与 app/skills.py backend 装配。
+Skills 离线冒烟测试：验证 skills/*/SKILL.md 规范与 app/agents/skills.py backend 装配。
 不依赖外部服务、不需要任何 API Key。
 """
 import glob
@@ -22,8 +22,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 
-# 仅导入 app.skills，严禁导入 app.models / app.deep_agent
-from app.skills import build_skills_backend, SKILLS_ROUTE, SKILLS_DIR
+# 仅导入 app.agents.skills，严禁导入 app.infra.models / app.agents.supervisor
+from app.agents.skills import build_skills_backend, SKILLS_ROUTE, SKILLS_DIR
 
 
 def parse_frontmatter(text: str) -> dict:

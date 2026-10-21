@@ -1,9 +1,4 @@
-"""
-app/graph.py
-
-Subgraph and prompts for human-in-the-loop specialist agent (DesktopAgent).
-FileAgent has been migrated to deepagents native FilesystemMiddleware + HumanInTheLoopMiddleware in app/file_agent.py.
-"""
+"""Windows 桌面模拟操作专家子图与提示词 (所在层: L4)"""
 
 from typing import Annotated, List, Optional, Any, Dict
 from typing_extensions import TypedDict
@@ -16,6 +11,33 @@ from langgraph.types import interrupt
 
 from app.infra import models
 from app.utils.text import extract_text
+from app.agents.prompts import WORKER_BASE_PROMPT
+
+NAME = "DesktopAgent"
+
+DESCRIPTION = "桌面操作专家。负责通过屏幕截图和网格坐标操作 Windows 桌面 GUI。只要任务涉及打开桌面文件夹、点击屏幕图标、双击打开本地文件或应用、选择打开方式窗口等任何桌面端 GUI 交互，必须直接派给它执行，严禁提前结束并让用户手动操作！"
+
+DESKTOP_AGENT_PROMPT = (
+    WORKER_BASE_PROMPT
+    + "你是 DesktopAgent，负责通过纯视觉和模拟键鼠操作 Windows 桌面。\n"
+    + "【⚠️ 桌面操作核心防坑准则】\n"
+    + "1. **切回桌面**：如果第一步 take_grid_screenshot 发现屏幕被应用窗口（如 VS Code、浏览器）占满，而你的目标在桌面上，**你必须首先**调用 `press_hotkey(keys='win+d')` 来显示桌面！切换后**必须再次调用 `take_grid_screenshot`** 观察新的桌面网格！\n"
+    + "2. **精细坐标校准（防偏左偏右）**：\n"
+    + "   - 网格横向为 A-Z（26列），纵向为 1-16（16行）。A在最左，Z在最右。\n"
+    + "   - 如果目标在“最右上角”（例如右上角的文件夹），它通常位于 Z1、Y1、Z2、Y2 等最右侧的格子里。W1、P1 明显偏左，请仔细核对 Z, Y, X, W, V 的顺序，避免数错列！\n"
+    + "   - 每次决定点击前，在脑海中从最右侧（Z列）向左倒数，核实目标到底在第几列。\n"
+    + "【操作流程】\n"
+    + "1. 使用 take_grid_screenshot 获取带网格的屏幕截图。\n"
+    + "2. 观察截图，若未在桌面则调用 `press_hotkey(keys='win+d')` 切回桌面并重新截图。\n"
+    + "3. 仔细对照网格字母和数字，确定目标所在的网格（如 Z1），调用 click_grid_center(grid_id='Z1', click_type='double') 双击打开文件夹。\n"
+    + "4. 需要输入中文时，优先使用 safe_input_text，避免拼音输入法干扰。\n"
+    + "5. 需要按快捷键时，使用 press_hotkey（如 ctrl+a）。\n"
+    + "【重要安全限制】：部分高危按键操作会触发用户授权拦截，请勿滥用。"
+)
+
+PROMPT = DESKTOP_AGENT_PROMPT
+
+HIGH_RISK_HOTKEYS = ["enter", "return", "delete", "alt", "win", "ctrl"]
 
 
 def _sanitize_messages_for_llm(messages: list) -> list:
@@ -64,39 +86,6 @@ def _unanswered_tool_calls(messages):
         return []
     answered = {m.tool_call_id for m in messages[i + 1:] if isinstance(m, ToolMessage)}
     return [tc for tc in ai.tool_calls if tc["id"] not in answered]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Prompts
-# ══════════════════════════════════════════════════════════════════════════════
-
-WORKER_BASE_PROMPT = (
-    "你是一个底层领域专家。你的汇报对象是主管（Supervisor）。你的任务是严格执行主管交代的明确指令。\n"
-    "【执行规范 - 强制】：**严禁在调用工具前输出任何“计划”、“思考过程”或“闲聊”文字！** 如果你需要使用工具，请直接输出 tool_calls。只有当工具执行完毕且你拿到了最终结果后，你才进行数据总结和汇报。\n"
-    "【职能防火墙 - 极端重要】：你只能且必须只回答主管指派给你的具体子任务。严禁利用你的通用知识去回答用户提问中涉及其他领域的子问题！\n"
-    "（例如：如果你是 MapAgent，主管让你找菜市场，你只需返回菜市场信息，绝对严禁顺便提供菜谱或食材清单，即使你知道答案也必须闭嘴，让相关领域的专家去处理）。\n"
-    "请只返回客观、精确的工具执行结果或数据总结，禁止说客套话，禁止反问主管。\n"
-)
-
-DESKTOP_AGENT_PROMPT = (
-    WORKER_BASE_PROMPT
-    + "你是 DesktopAgent，负责通过纯视觉和模拟键鼠操作 Windows 桌面。\n"
-    + "【⚠️ 桌面操作核心防坑准则】\n"
-    + "1. **切回桌面**：如果第一步 take_grid_screenshot 发现屏幕被应用窗口（如 VS Code、浏览器）占满，而你的目标在桌面上，**你必须首先**调用 `press_hotkey(keys='win+d')` 来显示桌面！切换后**必须再次调用 `take_grid_screenshot`** 观察新的桌面网格！\n"
-    + "2. **精细坐标校准（防偏左偏右）**：\n"
-    + "   - 网格横向为 A-Z（26列），纵向为 1-16（16行）。A在最左，Z在最右。\n"
-    + "   - 如果目标在“最右上角”（例如右上角的文件夹），它通常位于 Z1、Y1、Z2、Y2 等最右侧的格子里。W1、P1 明显偏左，请仔细核对 Z, Y, X, W, V 的顺序，避免数错列！\n"
-    + "   - 每次决定点击前，在脑海中从最右侧（Z列）向左倒数，核实目标到底在第几列。\n"
-    + "【操作流程】\n"
-    + "1. 使用 take_grid_screenshot 获取带网格的屏幕截图。\n"
-    + "2. 观察截图，若未在桌面则调用 `press_hotkey(keys='win+d')` 切回桌面并重新截图。\n"
-    + "3. 仔细对照网格字母和数字，确定目标所在的网格（如 Z1），调用 click_grid_center(grid_id='Z1', click_type='double') 双击打开文件夹。\n"
-    + "4. 需要输入中文时，优先使用 safe_input_text，避免拼音输入法干扰。\n"
-    + "5. 需要按快捷键时，使用 press_hotkey（如 ctrl+a）。\n"
-    + "【重要安全限制】：部分高危按键操作会触发用户授权拦截，请勿滥用。"
-)
-
-HIGH_RISK_HOTKEYS = ["enter", "return", "delete", "alt", "win", "ctrl"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════

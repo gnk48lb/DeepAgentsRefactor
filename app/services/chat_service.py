@@ -1,3 +1,5 @@
+"""单用户多模态会话状态机与消息调度服务 (所在层: L5)"""
+
 import asyncio
 import base64
 import os
@@ -14,12 +16,14 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 
 from app import config
-from app import deep_agent
+from app.agents import supervisor
+from app.memory import injector, extractor
 from app.services import startup
 from app.runtime import outbox, hitl, cli_logger
 from app.infra import models
 from app.utils.text import extract_text
 from app.utils.images import guess_mime_type
+
 
 @dataclass
 class ChatReply:
@@ -37,9 +41,6 @@ _checkpointer = None                     # init_service 里保存，/reset 时�
 RESET_COMMANDS = {"/reset", "/new", "/新对话"}
 _background_tasks: Set[asyncio.Task] = set()
 
-def _guess_mime_type(data: bytes) -> str:
-    """根据字节头判断图片的 MIME 类型"""
-    return guess_mime_type(data)
 
 async def _load_image_as_data_uri(image_url: str) -> Optional[str]:
     """
@@ -61,7 +62,7 @@ async def _load_image_as_data_uri(image_url: str) -> Optional[str]:
             print(f"[WARN] 未知的图片路径或 URL: {image_url}")
             return None
 
-        mime = _guess_mime_type(img_bytes)
+        mime = guess_mime_type(img_bytes)
         b64_str = base64.b64encode(img_bytes).decode("utf-8")
         return f"data:{mime};base64,{b64_str}"
     except Exception as e:
@@ -76,12 +77,14 @@ async def init_service() -> None:
     print("🚀 [chat_service] 正在初始化数据环境与 Agent 服务...")
     await asyncio.to_thread(startup.run_global_database_init)
     _checkpointer = MemorySaver()
-    _agent = await deep_agent.build_main_agent(checkpointer=_checkpointer)
+    _agent = await supervisor.build_main_agent(checkpointer=_checkpointer)
     _initialized = True
     print("✅ [chat_service] 初始化完成。")
 
+
 def is_initialized() -> bool:
     return _initialized
+
 
 async def shutdown_service() -> None:
     """关闭系统服务并释放 MCP 资源"""
@@ -95,6 +98,7 @@ async def shutdown_service() -> None:
     _checkpointer = None
     _initialized = False
     print("✅ [chat_service] 服务已关闭。")
+
 
 async def process_message(text: str, image_url: Optional[str] = None) -> Optional[ChatReply]:
     """处理单条用户消息（单用户模式：不区分用户、无权限校验）。不依赖 NoneBot，纯业务逻辑层。"""
@@ -113,7 +117,8 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
         try:
             # 清空固定会话：放在 HITL 判断之前，这样挂起中的授权也能被一并丢弃
             if text.strip().lower() in RESET_COMMANDS:
-                await _checkpointer.adelete_thread(THREAD_ID)
+                if _checkpointer is not None:
+                    await _checkpointer.adelete_thread(THREAD_ID)
                 _pending_outbox = None
                 cli_logger.log_turn_end("已清空对话上下文，开始新的对话。", 0, False, time.perf_counter() - turn_start)
                 return ChatReply("已清空对话上下文，开始新的对话。", [])
@@ -135,20 +140,20 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
                     _pending_outbox = None
                     outbox.resume(resumed_outbox)
                     await asyncio.wait_for(
-                        agent.ainvoke(Command(resume=hitl.build_resume(current_state, user_reply)), agent_config),
+                        agent.ainvoke(
+                            Command(resume=hitl.build_resume(current_state, user_reply)),
+                            agent_config,
+                        ),
                         timeout=config.AGENT_TURN_TIMEOUT_SECONDS,
                     )
                 else:
-                    warning = hitl.format_hitl_warning(current_state)
-                    cli_logger.log_hitl_status("REMIND", text)
-                    cli_logger.log_turn_end(warning, 0, True, time.perf_counter() - turn_start)
-                    return ChatReply(
-                        text=f"⚠️ 当前正在等待授权确认，请回复 Y 允许或 N 拒绝。\n\n{warning}",
-                        images=[],
-                        awaiting_approval=True,
-                    )
+                    cli_logger.log_hitl_status("REMIND", user_reply)
+                    warn = hitl.format_hitl_warning(current_state)
+                    msg = f"⚠️ 当前正在等待授权确认，请回复 Y 允许或 N 拒绝。\n\n{warn}"
+                    cli_logger.log_turn_end(msg, 0, True, time.perf_counter() - turn_start)
+                    return ChatReply(msg, [], awaiting_approval=True)
             else:
-                # 3. 新消息流程
+                # 3. 新消息流程：图片转文字（可选）-> 拼装初次输入 -> 触发 Agent
                 processed_text = text
                 if image_url:
                     data_uri = await _load_image_as_data_uri(image_url)
@@ -192,7 +197,7 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
 
                 outbox.begin()
                 messages = await asyncio.to_thread(
-                    deep_agent.build_initial_messages,
+                    injector.build_initial_messages,
                     processed_text,
                 )
                 try:
@@ -236,8 +241,6 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
 
             if not final_text:
                 final_text = "（没有生成回复）"
-            elif len(final_text) > config.QQ_MAX_REPLY_CHARS:
-                final_text = final_text[:config.QQ_MAX_REPLY_CHARS] + "\n（内容过长已截断）"
 
             # 收集本轮发件箱图片
             round_images = outbox.current()
@@ -252,7 +255,7 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
 
                 if last_human_text and final_text:
                     recent_chat = f"human: {last_human_text}\nai: {final_text}"
-                    mem_task = asyncio.create_task(deep_agent._background_extract_memory(recent_chat))
+                    mem_task = asyncio.create_task(extractor.extract_and_store_memory(recent_chat))
                     _background_tasks.add(mem_task)
                     mem_task.add_done_callback(_background_tasks.discard)
             except Exception as bg_err:

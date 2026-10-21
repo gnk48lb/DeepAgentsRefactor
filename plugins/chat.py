@@ -7,7 +7,8 @@ from nonebot.adapters.qq.message import MessageSegment, Message
 from nonebot.matcher import Matcher
 from nonebot.exception import FinishedException
 
-from app import chat_service
+from app import config
+from app.services import chat_service
 
 _URL_REGEX = re.compile(r"(?:https?://|www\.)[^\s<>\"'）)】」》，。；、！？]+", re.IGNORECASE)
 
@@ -83,7 +84,10 @@ async def handle_chat(matcher: Matcher, event: MessageEvent | DirectMessageCreat
 
         out_msg = Message()
         if reply.text:
-            out_msg += MessageSegment.text(_strip_urls(reply.text))
+            reply_text = reply.text
+            if len(reply_text) > config.QQ_MAX_REPLY_CHARS:
+                reply_text = reply_text[:config.QQ_MAX_REPLY_CHARS] + "\n（内容过长已截断）"
+            out_msg += MessageSegment.text(_strip_urls(reply_text))
         for img_item in reply.images:
             url = img_item.get("image_url", {}).get("url", "")
             if url:

@@ -4,7 +4,7 @@ tests/smoke_chat_service.py
 chat_service 服务层离线冒烟测试：用脚本化假模型驱动真实的 FileAgent / hitl / outbox / chat_service，
 覆盖：多轮 HITL（批准 / 拒绝 / 挂起期间发无关消息）、HITL 前已产生图片的发件箱连续性、
 并发忙提示、并行中断一次 Y 放行、超时后会话仍可继续、/reset 丢弃挂起授权与历史。
-不需要任何 API Key / Docker / MCP / 网络：startup / deep_agent 在 import 前被桩掉。
+不需要任何 API Key / Docker / MCP / 网络：supervisor / injector / extractor / startup 在 import 前被桩掉。
 """
 import asyncio
 import operator
@@ -41,29 +41,46 @@ from deepagents import (
     GeneralPurposeSubagentProfile,
 )
 
-# ── 桩模块：必须在 import app.chat_service 之前安装，避免 import 时需要 API Key / Milvus ──
+# ── 桩模块：必须在 import app.services.chat_service 之前安装，避免 import 时需要 API Key / Milvus ──
 import app
+import app.agents
+import app.memory
 import app.services
 
-_startup = types.ModuleType("app.services.startup")
-_startup.run_global_database_init = lambda: None
-_da = types.ModuleType("app.deep_agent")
-_da.mem_calls = []
-_da.build_initial_messages = lambda user_query, history_messages=None: [HumanMessage(content=user_query, name="user")]
+
+def _stub(pkg, name, **attrs):
+    m = types.ModuleType(f"{pkg.__name__}.{name}")
+    for k, v in attrs.items():
+        setattr(m, k, v)
+    sys.modules[m.__name__] = m
+    setattr(pkg, name, m)
+    return m
+
+
+mem_calls = []
 
 
 async def _fake_extract_memory(recent_chat):
-    _da.mem_calls.append(recent_chat)
+    mem_calls.append(recent_chat)
 
 
-_da._background_extract_memory = _fake_extract_memory
-sys.modules["app.services.startup"] = _startup
-app.services.startup = _startup
-sys.modules["app.deep_agent"] = _da
-setattr(app, "deep_agent", _da)
+_stub(app.agents, "supervisor", build_main_agent=None)
+_stub(
+    app.memory,
+    "injector",
+    build_initial_messages=lambda user_query, history_messages=None: [HumanMessage(content=user_query, name="user")],
+)
+_extractor_stub = _stub(
+    app.memory,
+    "extractor",
+    extract_and_store_memory=_fake_extract_memory,
+    mem_calls=mem_calls,
+)
+_stub(app.services, "startup", run_global_database_init=lambda: None)
 
 from app import config
-from app import chat_service as cs, file_agent
+from app.services import chat_service as cs
+from app.agents.experts import file_agent
 from app.runtime import hitl, outbox
 
 
@@ -142,7 +159,7 @@ def _install(main_script, fa_script, extra=None, delay=0.0):
     cs._agent, cs._initialized, cs._pending_outbox = agent, True, None
     if hasattr(cs, "_checkpointer"):
         cs._checkpointer = cp
-    _da.mem_calls.clear()
+    mem_calls.clear()
     return root, fam, mm
 
 
@@ -164,7 +181,7 @@ async def test_a_multi_turn_hitl():
     r = await cs.process_message("你好")
     await asyncio.sleep(0.05)
     assert r.text == "你好呀" and not r.awaiting_approval, r
-    assert _da.mem_calls and "human: 你好" in _da.mem_calls[0], _da.mem_calls
+    assert mem_calls and "human: 你好" in mem_calls[0], mem_calls
 
     r = await cs.process_message("写个文件")
     assert r.awaiting_approval and "write_file" in r.text and "workspace/a.txt" in r.text and r.images == [], r.text

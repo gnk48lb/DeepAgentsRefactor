@@ -13,7 +13,7 @@ import sys
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
 
-from app import chat_service
+from app.services import chat_service
 from app import config
 from app.utils.images import guess_mime_type
 

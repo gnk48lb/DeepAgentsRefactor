@@ -24,8 +24,8 @@ if hasattr(sys.stderr, "reconfigure"):
 
 import asyncio
 
-# 仅导入 app.file_agent, app.hitl 与 app.markitdown_tool，严禁导入 app.models / app.deep_agent / app.graph
-from app import file_agent
+# 仅导入 app.agents.experts.file_agent, app.runtime.hitl 与 app.tools.markitdown_tool，严禁导入 app.infra.models / app.agents.supervisor
+from app.agents.experts import file_agent
 from app.tools import markitdown_tool
 from app.runtime import hitl
 from langchain_core.tools import StructuredTool
