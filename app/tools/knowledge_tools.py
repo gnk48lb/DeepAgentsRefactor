@@ -8,7 +8,7 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 from app import config
 from app.infra.milvus_client import get_client
 from app.knowledge.search import execute_hybrid_search, rerank_candidates
-from app.knowledge import query_transform as query_transforms
+from app.knowledge import query_transform
 from app.utils.images import compress_image_to_base64
 
 
@@ -24,19 +24,19 @@ def rag(query: str):
         # 1. 查询转换路由
         queries_to_search = [query]
         if getattr(config, "ENABLE_QUERY_TRANSFORM", False):
-            strategy = query_transforms.route_query(query)
+            strategy = query_transform.route_query(query)
             print(f"--> [Query Transform] Strategy selected: {strategy}")
             
             if strategy == "hyde":
-                hypo_doc = query_transforms.generate_hyde(query)
+                hypo_doc = query_transform.generate_hyde(query)
                 print(f"    - HyDE Document: {hypo_doc[:50]}...")
                 queries_to_search.append(hypo_doc)
             elif strategy == "step_back":
-                step_back_q = query_transforms.generate_step_back(query)
+                step_back_q = query_transform.generate_step_back(query)
                 print(f"    - Step-Back Query: {step_back_q}")
                 queries_to_search.append(step_back_q)
             elif strategy == "multi_query":
-                alt_qs = query_transforms.generate_multi_query(query)
+                alt_qs = query_transform.generate_multi_query(query)
                 for i, alt_q in enumerate(alt_qs):
                     print(f"    - Alt Query {i+1}: {alt_q}")
                 queries_to_search.extend(alt_qs)

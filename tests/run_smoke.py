@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SMOKES = [
+    "tests/smoke_architecture.py",
     "tests/smoke_file_agent.py",
     "tests/smoke_skills.py",
     "tests/smoke_amap_contract.py",

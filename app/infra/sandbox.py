@@ -126,7 +126,7 @@ def run_code_in_sandbox(code: str) -> SandboxResult:
                 # 手动清理容器
                 try:
                     container.remove(force=True)
-                except:
+                except Exception:
                     pass
 
         except Exception as e:

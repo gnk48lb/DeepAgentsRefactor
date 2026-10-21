@@ -62,16 +62,18 @@ _GENERAL_PURPOSE = {
 }
 
 
+_DECLARATIVE_SPECS = [
+    knowledge_agent.SPEC,
+    media_agent.SPEC,
+    map_agent.SPEC,
+    code_agent.SPEC,
+    sql_agent.SPEC,
+    browser_agent.SPEC,
+]
+
+
 def _declarative_subagents() -> list:
-    specs = [
-        knowledge_agent.SPEC,
-        media_agent.SPEC,
-        map_agent.SPEC,
-        code_agent.SPEC,
-        sql_agent.SPEC,
-        browser_agent.SPEC,
-    ]
-    return [spec.to_subagent(models) for spec in specs]
+    return [spec.to_subagent(models) for spec in _DECLARATIVE_SPECS]
 
 
 async def _local_subagents() -> tuple[CompiledSubAgent, CompiledSubAgent]:
