@@ -19,7 +19,7 @@
     "command": "uv",
     "args": [
       "run",
-      "app/windows_mcp.py"
+      "mcp_servers/windows_desktop.py"
     ],
     "transport": "stdio"
   }

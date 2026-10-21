@@ -1,3 +1,5 @@
+"""独立子进程 Windows 桌面 MCP 服务 (mcp_servers)"""
+
 import sys
 import ctypes
 import io
@@ -45,7 +47,7 @@ def take_grid_screenshot() -> str:
     # 标坐标 (尝试加载常见中文字体，失败则用默认)
     try:
         font = ImageFont.truetype("msyh.ttc", 20) # 微软雅黑
-    except:
+    except Exception:
         font = ImageFont.load_default()
 
     for row in range(GRID_ROWS):

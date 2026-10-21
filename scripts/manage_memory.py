@@ -1,13 +1,8 @@
-import sys
+from app import bootstrap
+bootstrap.apply()
+
 import argparse
 from pathlib import Path
-
-# Add project root to sys.path
-
-
-# 设置标准输出编码为 utf-8
-
-
 
 from app import config
 from app import database

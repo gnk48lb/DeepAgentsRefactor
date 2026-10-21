@@ -1,14 +1,8 @@
-import sys
-import os
+from app import bootstrap
+bootstrap.apply()
+
 import nonebot
 from nonebot.adapters.qq import Adapter as QQAdapter
-
-import logging
-
-# 压低 faiss 与 milvus 的日志噪音
-logging.getLogger("milvus_lite").setLevel(logging.WARNING)
-logging.getLogger("faiss").setLevel(logging.WARNING)
-logging.getLogger("pymilvus").setLevel(logging.WARNING)
 
 # 初始化 NoneBot
 nonebot.init()
