@@ -157,9 +157,7 @@ DeepAgentsRefactor/
 │   ├── smoke_skills.py       # Skills 规范与 Backend 路由冒烟测试
 │   ├── smoke_amap_contract.py# 高德工具快照与契约冒烟测试
 │   ├── smoke_amap_http.py    # 高德工具 HTTP 异常与密钥脱敏测试
-│   ├── smoke_chat_service.py # chat_service 服务层离线冒烟测试
-│   ├── live_amap_golden.py   # 高德工具在线 Golden 结构对比（--live）
-│   └── eval/                 # 路由行为评测（见 8.1）
+│   └── smoke_chat_service.py # chat_service 服务层离线冒烟测试
 ├── storage/                  # 运行时持久化目录（Milvus DB、浏览器配置等，已忽略）
 ├── workspace/                # FileAgent 操作工作区（已忽略）
 ├── bot.py                    # NoneBot2 QQ 机器人启动入口
@@ -270,25 +268,6 @@ uv run python tests/run_smoke.py
 4. `tests/smoke_amap_contract.py`：高德地图 16 个本地工具契约与 Schema 快照测试。
 5. `tests/smoke_amap_http.py`：高德工具 HTTP 异常与密钥脱敏测试。
 6. `tests/smoke_chat_service.py`：多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复与 `/reset` 测试（6 个场景）。
-
-### 8.1 路由行为评测
-
-冒烟测试验证的是**架构契约**（工具名、依赖方向、导入隔离），不涉及模型决策。若要衡量「orchestrator 把 query 派给哪个专家」的行为表现，使用路由评测：
-
-```bash
-# 关键词基线（离线、零成本，仅用于验证评测集与管线）
-uv run python tests/eval/run_routing_eval.py
-
-# 真实模型（产生 API 费用；subagent 全部替换为空壳，不会写文件/动桌面/发请求）
-uv run python tests/eval/run_routing_eval.py --live -v
-
-# 只跑指定用例组，或保存基线用于 A/B 对比
-uv run python tests/eval/run_routing_eval.py --live --only G,S --save baseline.json
-```
-
-- **用例集**：`tests/eval/routing_cases.json`，每条含 `expected`（必须委派）与 `forbidden`（绝不能委派）两个方向。
-- **用途**：修改提示词、拆分/合并专家后，用它验证行为是否变化；这是判断「架构调整是否真的改善结果」的依据。
-- **注意**：`--live` 会消耗 Gemini 配额（免费档约 15 请求/分钟），单条超时可用 `EVAL_CASE_TIMEOUT` 调整。
 
 ---
 
