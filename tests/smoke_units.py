@@ -18,6 +18,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from app import bootstrap, config
 from app.agents.experts import desktop_agent as da
+from app.tools import sql_tools
 from app.utils.images import guess_mime_type
 
 
@@ -93,12 +94,48 @@ def test_e_unanswered_tool_calls():
                                       ToolMessage(content="ok", tool_call_id="2", name="b")]) == []
 
 
+def test_f_sql_hardening():
+    prep = sql_tools._prepare_select_sql
+    assert prep("SELECT * FROM works;") == "SELECT * FROM works\nLIMIT 50"
+    for bad in ["DELETE FROM works", "SELECT 1; DROP TABLE works",
+                "SELECT * FROM works INTO OUTFILE '/tmp/x'", "select load_file('/etc/passwd')",
+                "SELECT 1 INTO   dumpfile '/tmp/y'"]:
+        try:
+            prep(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"应拒绝: {bad}")
+    captured = {}
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql): captured["sql"] = sql
+        def fetchall(self): return [{"a": 1}]
+
+    class _Conn:
+        def cursor(self): return _Cur()
+        def close(self): captured["closed"] = True
+
+    real = sql_tools.pymysql.connect
+    sql_tools.pymysql.connect = lambda **kw: (captured.update(kw), _Conn())[1]
+    try:
+        out = sql_tools.execute_sql.invoke({"sql_query": "SELECT 1"})
+    finally:
+        sql_tools.pymysql.connect = real
+    assert out == "[{'a': 1}]", out
+    assert captured["connect_timeout"] == 10 and captured["read_timeout"] == 30, captured
+    assert "READ ONLY" in captured["init_command"].upper(), captured
+    assert captured["sql"].endswith("LIMIT 50") and captured["closed"]
+
+
 SCENARIOS = [
     ("A config._resolve_path", test_a_resolve_path),
     ("B bootstrap os.rename 兜底补丁", test_b_bootstrap_rename_fallback),
     ("C guess_mime_type", test_c_guess_mime),
     ("D DesktopAgent 截图历史处理", test_d_desktop_screenshot_history),
     ("E DesktopAgent 未应答 tool_calls", test_e_unanswered_tool_calls),
+    ("F SQL 加固与超时只读", test_f_sql_hardening),
 ]
 
 

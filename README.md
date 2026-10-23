@@ -191,7 +191,7 @@ uv sync
 - **Neo4j**:
   - 提供知识图谱存储与 Cypher 关系查询，供 `MediaAgent` 使用。可通过 `docker compose -f deploy/docker-compose.yml up -d neo4j` 启动。
 - **MySQL**:
-  - 存储女优与作品结构化关系数据，供 `SQLAgent` 精确筛选查询。MySQL 需用户自备（`deploy/docker-compose.yml` 中不包含）。
+  - 存储女优与作品结构化关系数据，供 `SQLAgent` 精确筛选查询。MySQL 需用户自备（`deploy/docker-compose.yml` 中不包含）。建议为 SQLAgent 分配专用只读账号（如 `GRANT SELECT ON av_db.* TO 'readonly'@'%'`），并在 `.env` 中配置对应的 `MYSQL_USER` 与 `MYSQL_PASSWORD`。
 - **Docker Python 沙箱**:
   - 供 `CodeAgent` 启动轻量容器 (`python-ds:latest`) 安全运行数据分析与绘图代码。
 
@@ -271,13 +271,16 @@ uv run python -m app.knowledge.media.builder
 uv run python tests/run_smoke.py
 ```
 
-测试包含以下 6 个测试套件（共 37 个场景）：
+测试包含以下 9 个测试套件（共 54 个场景）：
 1. `tests/smoke_architecture.py`：分层单向依赖、语法禁令、空 `__init__`、提示词单例、专家规格、轻量隔离导入、无 Key 安全导入与 MCP 路径校验（8 个场景）。
 2. `tests/smoke_file_agent.py`：FileAgent 离线冒烟测试（含 MarkItDown 路径安全拦截、越界隔离、HITL 恢复映射等 16 个场景）。
 3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试。
-4. `tests/smoke_amap_contract.py`：高德地图 16 个本地工具契约与 Schema 快照测试。
-5. `tests/smoke_amap_http.py`：高德工具 HTTP 异常与密钥脱敏测试。
+4. `tests/smoke_amap_contract.py`：高德地图 16 个本地工具契约与 Schema 快照测试（3 个场景）。
+5. `tests/smoke_amap_http.py`：高德工具 HTTP 异常与密钥脱敏测试（6 个场景）。
 6. `tests/smoke_chat_service.py`：多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复与 `/reset` 测试（6 个场景）。
+7. `tests/smoke_knowledge.py`：知识库建库、pending 增量入库、混合检索与长期记忆离线冒烟测试（5 个场景）。
+8. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（3 个场景）。
+9. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读等 6 个场景）。
 
 ---
 

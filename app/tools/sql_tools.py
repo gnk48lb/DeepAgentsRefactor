@@ -15,6 +15,8 @@ def _prepare_select_sql(sql: str) -> str:
         s = s[:-1].strip()
     if ";" in s:
         raise ValueError("Security Check Failed. Multiple statements are not allowed.")
+    if re.search(r"\bINTO\s+(OUTFILE|DUMPFILE)\b|\bLOAD_FILE\s*\(", s, re.IGNORECASE):
+        raise ValueError("Security Check Failed. File read/write functions are not allowed.")
     if not re.search(r"\bLIMIT\b", s, re.IGNORECASE):
         s = s + "\nLIMIT 50"
     return s
@@ -44,7 +46,11 @@ def execute_sql(sql_query: str) -> str:
             password=password,
             database=database,
             port=port,
-            cursorclass=pymysql.cursors.DictCursor
+            cursorclass=pymysql.cursors.DictCursor,
+            connect_timeout=10,
+            read_timeout=30,
+            write_timeout=30,
+            init_command="SET SESSION TRANSACTION READ ONLY",
         )
         with connection.cursor() as cursor:
             cursor.execute(sql_query)
