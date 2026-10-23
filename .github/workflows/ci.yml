@@ -1,0 +1,14 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uvx ruff check --select F821,F811,F401 app plugins scripts tests bot.py main.py mcp_servers
+      - run: uv run python tests/run_smoke.py

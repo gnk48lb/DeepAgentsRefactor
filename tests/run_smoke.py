@@ -11,6 +11,9 @@ SMOKES = [
     "tests/smoke_amap_contract.py",
     "tests/smoke_amap_http.py",
     "tests/smoke_chat_service.py",
+    "tests/smoke_knowledge.py",
+    "tests/smoke_orchestrator.py",
+    "tests/smoke_units.py",
 ]
 
 failed = []
