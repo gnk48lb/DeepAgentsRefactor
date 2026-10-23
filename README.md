@@ -84,7 +84,7 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 DeepAgentsRefactor/
 ├── app/                      # 核心业务逻辑
 │   ├── config.py             # L0: 全局配置中心 (路径与环境变量规范)
-│   ├── bootstrap.py          # 启动环境补丁 (Windows 编码 / 事件循环)
+│   ├── bootstrap.py          # 启动环境补丁 (stdout/stderr UTF-8、第三方日志降噪、Windows os.rename 兜底)
 │   ├── utils/                # L0: 通用基础工具
 │   │   ├── text.py           # 纯文本抽取与规范化
 │   │   └── images.py         # 图像压缩、MIME 类型推导与 Base64 编码
@@ -139,7 +139,6 @@ DeepAgentsRefactor/
 ├── deploy/                   # 部署配置
 │   └── docker-compose.yml    # Neo4j 等后台服务容器编排
 ├── mcp_servers/              # 独立 MCP 服务实现
-│   ├── desktop_agent_server.py
 │   └── windows_desktop.py
 ├── plugins/                  # NoneBot2 插件层
 │   └── chat.py               # QQ 机器人消息接收与 ChatService 调度
@@ -186,7 +185,7 @@ uv sync
 
 ### 4.3 基础服务组件与说明
 - **Milvus 向量数据库说明**:
-  - 系统默认使用嵌入式 **Milvus Lite**（本地文件模式，存储于 `storage/milvus_data.db`），无需启动 Docker 即可运行知识库检索与长期记忆存储。
+  - 系统默认使用嵌入式 **Milvus Lite**（本地文件模式，存储于 `storage/gnk48_agent_collection.db`），无需启动 Docker 即可运行知识库检索与长期记忆存储。
   - `deploy/docker-compose.yml` 里的 Milvus/etcd/MinIO 服务仅在将 `MILVUS_DB_PATH` 配置为远程 HTTP URI 时才需要启用。
   - `--rebuild` 参数触发的物理索引清理仅对本地 Milvus Lite 生效。
 - **Neo4j**:
@@ -195,6 +194,17 @@ uv sync
   - 存储女优与作品结构化关系数据，供 `SQLAgent` 精确筛选查询。MySQL 需用户自备（`deploy/docker-compose.yml` 中不包含）。
 - **Docker Python 沙箱**:
   - 供 `CodeAgent` 启动轻量容器 (`python-ds:latest`) 安全运行数据分析与绘图代码。
+
+### 4.4 QQ 机器人配置 (仅 bot.py 需要)
+若使用 QQ 官方机器人（通过 `bot.py` 启动），需在 `.env` 中配置以下环境变量（NoneBot2 自动读取）：
+- `DRIVER`：NoneBot 驱动，推荐 `~fastapi+~httpx+~websockets`。
+- `QQ_IS_SANDBOX`：是否连接 QQ 开放平台沙箱环境（生产环境填 `false`，测试环境填 `true`）。
+- `QQ_BOTS`：JSON 数组格式的机器人凭证列表（来源为 QQ 开放平台申请的机器人 AppID、Token、AppSecret）：
+  - `id`：机器人 AppID。
+  - `token`：机器人 Token。
+  - `secret`：机器人 AppSecret。
+  - `intent`：订阅事件权限字典，如 `{"c2c_group_at_messages": true, "direct_message": true}`（以已安装的 `nonebot/adapters/qq/config.py` 中的 `Intents` 字段名为准）。
+  - `use_websocket`：是否使用 WebSocket 长连接接收事件（推荐 `true`）。
 
 ---
 

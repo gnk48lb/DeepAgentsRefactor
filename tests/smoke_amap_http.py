@@ -26,6 +26,9 @@ from app import config
 import app.tools.amap as amap
 import app.tools.amap.client as amap_client
 
+if not config.AMAP_API_KEY:   # 离线测试不需要真实 key:仅为通过 validate_config() 而占位
+    config.AMAP_API_KEY = "TEST_KEY_FOR_OFFLINE_SMOKE"
+
 
 def setup_mock_client(handler):
     transport = httpx.MockTransport(handler)

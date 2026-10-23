@@ -155,6 +155,10 @@ def test_b_layering_and_deps():
             elif isinstance(node, ast.ImportFrom):
                 if node.module:
                     targets.append(node.module)
+                    if node.module == "app":
+                        for alias in node.names:
+                            if alias.name != "config":
+                                targets.append(f"app.{alias.name}")
 
             for t in targets:
                 if not t.startswith("app"):
