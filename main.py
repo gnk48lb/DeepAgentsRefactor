@@ -9,7 +9,6 @@ import asyncio
 import base64
 import logging
 import os
-import sys
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
 

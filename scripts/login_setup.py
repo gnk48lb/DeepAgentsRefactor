@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import os
-import sys
 from playwright.async_api import async_playwright
 from app import config
 

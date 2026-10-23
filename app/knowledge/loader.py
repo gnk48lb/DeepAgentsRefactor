@@ -1,7 +1,6 @@
 """多模态文档解析与切分加载器 (所在层: L2)"""
 
 import os
-import shutil
 import hashlib
 import fitz  # PyMuPDF
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter

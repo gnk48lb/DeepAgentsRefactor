@@ -2,12 +2,11 @@
 
 import asyncio
 import base64
-import os
 import re
 import time
 import traceback
 from dataclasses import dataclass
-from typing import Optional, List, Set, Any
+from typing import Optional, Set, Any
 import httpx
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
@@ -65,7 +64,7 @@ async def _load_image_as_data_uri(image_url: str) -> Optional[str]:
         mime = guess_mime_type(img_bytes)
         b64_str = base64.b64encode(img_bytes).decode("utf-8")
         return f"data:{mime};base64,{b64_str}"
-    except Exception as e:
+    except Exception:
         print(f"[ERROR] 读取/下载图片失败: {e}")
         return None
 
@@ -178,7 +177,7 @@ async def _prepare_round_input(
             )
             processed_text = extract_text(vlm_res.content).strip()
             cli_logger.log_vlm_translation(processed_text, time.perf_counter() - vlm_start)
-        except Exception as e:
+        except Exception:
             print(f"[ERROR] VLM 意图翻译失败: {e}")
             traceback.print_exc()
             cli_logger.log_turn_end("图片理解失败，请稍后重试。", 0, False, time.perf_counter() - turn_start)
@@ -326,7 +325,7 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
                 images=[],
                 awaiting_approval=False,
             )
-        except Exception as e:
+        except Exception:
             traceback.print_exc()
             cli_logger.log_turn_end("处理时出了点问题，请稍后再试", 0, False, time.perf_counter() - turn_start)
             return ChatReply("处理时出了点问题，请稍后再试", [])

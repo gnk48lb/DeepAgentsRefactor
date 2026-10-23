@@ -1,6 +1,6 @@
 """模型客户端惰性单例与校验管理 (L1)"""
 
-from typing import Optional, List
+from typing import List
 import logging
 import threading
 import requests
@@ -88,6 +88,7 @@ class SiliconFlowEmbeddings(BaseModel, Embeddings):
             )
             data = resp.json()
             if "data" not in data or data["data"] is None:
+                # 记录详细错误，判断是否被模型网关拦截 (内容审核)
                 error_msg = data.get("error", data.get("message", "Unknown error"))
                 raise Exception(f"SiliconFlow Embedding Failed (Possible Censorship?): {error_msg}\nFull Response: {data}")
             all_embeddings.extend([item["embedding"] for item in data["data"]])
@@ -113,6 +114,7 @@ class SiliconFlowReranker:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
+        # 假设 pairs 格式为 [[query, doc1], [query, doc2], ...]
         payload = {
             "model": self.model_name,
             "query": pairs[0][0],
@@ -133,13 +135,15 @@ class SiliconFlowReranker:
             )
             return [0.0] * len(pairs)
         
+        # SiliconFlow 返回格式: {"results": [{"index": 0, "relevance_score": 0.9}, ...]}
+        # 需要还原到原始 list 的顺序
         scores = [0.0] * len(pairs)
         for item in data["results"]:
             scores[item["index"]] = item["relevance_score"]
         return scores
 
 
-# 默认宽松安全设置
+# 默认宽松安全设置（放开成人影视领域涉及的关键词，防止触发静默拦截或 0 token 阻断）
 DEFAULT_SAFETY_SETTINGS = {
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -222,14 +226,6 @@ def _make_orchestrator_llm():
     )
 
 
-def _make_browser_vlm():
-    _require_gemini_key()
-    return ChatGoogleGenerativeAI(
-        model=config.BROWSER_VLM_MODEL,
-        google_api_key=config.GEMINI_API_KEY,
-        safety_settings=DEFAULT_SAFETY_SETTINGS,
-    )
-
 
 def _make_desktop_llm():
     _require_gemini_key()
@@ -268,7 +264,6 @@ _FACTORIES = {
     "reranker": _make_reranker,
     "worker_llm": _make_worker_llm,
     "orchestrator_llm": _make_orchestrator_llm,
-    "browser_vlm": _make_browser_vlm,
     "desktop_llm": _make_desktop_llm,
     "vlm": _make_vlm,
     "extractor_llm": _make_extractor_llm,

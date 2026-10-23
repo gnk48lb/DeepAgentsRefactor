@@ -1,7 +1,5 @@
 import json
 import pymysql
-import sys
-from pathlib import Path
 
 # Add project root to sys.path
 import os

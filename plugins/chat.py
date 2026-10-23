@@ -31,7 +31,7 @@ def _make_image_segment(url: str) -> MessageSegment:
             header, b64data = url.split(",", 1)
             img_bytes = base64.b64decode(b64data)
             return MessageSegment.file_image(img_bytes)
-        except Exception as e:
+        except Exception:
             print(f"[WARN] _make_image_segment 解码失败: {e}")
             return MessageSegment.text("[图片发送失败]")
     return MessageSegment.image(url)
@@ -41,7 +41,7 @@ async def init_system():
     """在 NoneBot 启动时初始化 chat_service 服务"""
     try:
         await chat_service.init_service()
-    except Exception as e:
+    except Exception:
         print(f"[ERROR] chat_service 初始化失败: {e}")
         traceback.print_exc()
 
@@ -50,7 +50,7 @@ async def shutdown_system():
     """在 NoneBot 关闭时释放 chat_service 与 MCP 资源"""
     try:
         await chat_service.shutdown_service()
-    except Exception as e:
+    except Exception:
         print(f"[ERROR] chat_service 关闭失败: {e}")
         traceback.print_exc()
 
@@ -97,6 +97,6 @@ async def handle_chat(matcher: Matcher, event: MessageEvent | DirectMessageCreat
 
     except FinishedException:
         raise
-    except Exception as e:
+    except Exception:
         traceback.print_exc()
         await matcher.finish("处理时出了点问题，请稍后再试")

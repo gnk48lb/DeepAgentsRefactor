@@ -6,7 +6,6 @@ Provides colored, framed, and hierarchical visual traces of LLM invocations,
 tool executions, subagent delegations, thinking processes, and HITL interrupts.
 """
 
-import os
 import sys
 import time
 import json
@@ -15,7 +14,7 @@ from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import BaseMessage, SystemMessage
 from app import config
 from app.utils.text import extract_text
 

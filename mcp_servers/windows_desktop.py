@@ -7,7 +7,7 @@ import base64
 from mcp.server.fastmcp import FastMCP
 import pyautogui
 import pyperclip
-from PIL import Image, ImageDraw, ImageFont
+from PIL import ImageDraw, ImageFont
 
 # 【核心防坑】强制声明 Per-Monitor DPI Aware v2，无视 175% 缩放
 try:

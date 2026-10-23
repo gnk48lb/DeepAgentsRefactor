@@ -2,7 +2,6 @@ from app import bootstrap
 bootstrap.apply()
 
 import argparse
-from pathlib import Path
 
 from app import config
 from app.infra.milvus_client import get_client

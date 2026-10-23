@@ -2,7 +2,6 @@
 
 from langchain_core.tools import tool
 from app import config
-from app.infra import models
 from app.infra.browser_service import fetch_generic_webpage_content, fetch_bilibili_profile_data, run_browser_task
 
 
@@ -30,7 +29,7 @@ async def get_bilibili_profile(uid: str) -> str:
 async def execute_complex_browser_action(instruction: str) -> str:
     """用于需要模拟真人操作浏览器的复杂网页任务，例如：在网页上点击按钮、输入文字搜索、登录、翻页，或是处理极度复杂的动态交互网页。仅当普通的网页内容读取(read_webpage_content)无法满足需求，或用户明确要求“操作”、“点击”时才使用此工具。"""
     # 这里直接调用原有的服务函数，传入配置好的 VLM
-    return await run_browser_task(instruction, models.browser_vlm)
+    return await run_browser_task(instruction)
 
 
 TOOLS = [read_webpage_content, get_bilibili_profile, execute_complex_browser_action]

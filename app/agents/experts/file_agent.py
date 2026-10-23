@@ -1,4 +1,13 @@
-"""本地工作区文件操作专家 (所在层: L4)"""
+"""本地工作区文件操作专家 (所在层: L4)
+
+FileAgent：deepagents 内置 FilesystemMiddleware + FilesystemBackend，加 langchain 原生
+HumanInTheLoopMiddleware（approve / edit / reject 协议）。
+
+注意：这里故意用 create_agent 而不是 create_deep_agent 构建，这样 orchestrator 模块里全局
+HarnessProfile.excluded_tools（隐藏 write_file/edit_file/delete/execute）不会作用到 FileAgent，
+也不用改动主 Agent 与其他子 Agent 的工具可见性。
+本模块不 import app.infra.models / app.agents.experts.desktop_agent，方便离线烟测（不需要任何 API Key）。
+"""
 
 import os
 from pathlib import Path

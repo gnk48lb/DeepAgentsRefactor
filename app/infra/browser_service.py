@@ -47,7 +47,7 @@ BROWSER_ACTION_RULES = (
     "3. 【处理弹窗】：上传完封面或勾选协议时，网页常会弹出“确认/确定”的蒙版遮罩弹窗。你必须优先寻找并点击该弹窗中的“确定”按钮（若点击失效，用 JS evaluate 强行清除或点击），直到弹窗彻底消失，才能去操作底部的后续按钮（如“提交稿件”）。"
 )
 
-async def run_browser_task(task_description: str, llm) -> str:
+async def run_browser_task(task_description: str) -> str:
     """
     运行 BrowserAgent 任务
     """
