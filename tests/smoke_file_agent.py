@@ -52,7 +52,7 @@ register_harness_profile(
     "scriptedmodel",
     HarnessProfile(
         general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
-        excluded_tools=frozenset({"write_file", "edit_file", "delete", "execute"}),
+        excluded_tools=frozenset({"write_file", "edit_file", "delete", "execute", "ls", "glob", "grep"}),
     ),
 )
 
@@ -605,16 +605,20 @@ def test_b9_global_profile_isolation():
         # 断言主 Agent 与声明式子 Agent 不暴露写/删工具
         assert len(main_m.seen_tools) > 0
         main_tools = set(main_m.seen_tools[0])
-        assert not (main_tools & {"write_file", "edit_file", "delete", "execute"}), f"主 Agent 包含了被排除工具: {main_tools}"
+        assert not (main_tools & {"write_file", "edit_file", "delete", "execute", "ls", "glob", "grep"}), f"主 Agent 包含了被排除工具: {main_tools}"
+        assert "read_file" in main_tools, f"主 Agent 缺失 read_file: {main_tools}"
 
         assert len(normal_m.seen_tools) > 0
         normal_tools = set(normal_m.seen_tools[0])
-        assert not (normal_tools & {"write_file", "edit_file", "delete", "execute"}), f"声明式子 Agent 包含了被排除工具: {normal_tools}"
+        assert not (normal_tools & {"write_file", "edit_file", "delete", "execute", "ls", "glob", "grep"}), f"声明式子 Agent 包含了被排除工具: {normal_tools}"
+        assert "read_file" in normal_tools, f"声明式子 Agent 缺失 read_file: {normal_tools}"
 
         # 断言 FileAgent 含有 write_file / edit_file
         assert len(fa_m.seen_tools) > 0
         fa_tools = set(fa_m.seen_tools[0])
         assert "write_file" in fa_tools and "edit_file" in fa_tools, f"FileAgent 缺失写工具: {fa_tools}"
+        for tool_name in ("ls", "glob", "grep", "read_file"):
+            assert tool_name in fa_tools, f"FileAgent 缺失工具 {tool_name}: {fa_tools}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -110,7 +110,7 @@ register_harness_profile(
     "scriptedmodel",
     HarnessProfile(
         general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
-        excluded_tools=frozenset({"write_file", "edit_file", "delete", "execute"}),
+        excluded_tools=frozenset({"write_file", "edit_file", "delete", "execute", "ls", "glob", "grep"}),
     ),
 )
 

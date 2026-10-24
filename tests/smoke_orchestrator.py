@@ -30,7 +30,7 @@ EXPECTED_TOOLS = {
     "BrowserAgent": ["read_webpage_content", "get_bilibili_profile", "execute_complex_browser_action"],
     "general-purpose": [],
 }
-BANNED = {"write_file", "edit_file", "delete", "execute"}
+BANNED = {"write_file", "edit_file", "delete", "execute", "ls", "glob", "grep"}
 
 _captured = {}
 
@@ -82,6 +82,7 @@ def test_c_harness_profile():
         prof = _harness_profile_for_model(getattr(models, label), None)
         missing = BANNED - set(prof.excluded_tools)
         assert not missing, f"{label} 的 HarnessProfile 未排除 {sorted(missing)}:LLM 将重新获得写工具!"
+        assert "read_file" not in prof.excluded_tools, f"{label} 的 HarnessProfile 误排除了 read_file!"
         gp = prof.general_purpose_subagent
         assert gp is not None and gp.enabled is False, f"{label} 应禁用内置 general-purpose 子 Agent"
 
