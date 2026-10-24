@@ -13,7 +13,7 @@ tests/smoke_amap_contract.py
 
 import asyncio
 import json
-import os
+
 import sys
 from pathlib import Path
 

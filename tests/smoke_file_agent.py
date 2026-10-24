@@ -9,7 +9,7 @@ import sys
 import tempfile
 import traceback
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List
 
 # 保证在项目环境下统一 UTF-8 输出
 if hasattr(sys.stdout, "reconfigure"):

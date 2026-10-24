@@ -137,7 +137,6 @@ def _extract_text_from_html(html: str) -> str:
 
 async def fetch_generic_webpage_content(url: str) -> str:
     import httpx
-    import os
 
     default_headers = {
         "User-Agent": (

@@ -18,7 +18,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 ROOT = Path(__file__).resolve().parents[1]
 
