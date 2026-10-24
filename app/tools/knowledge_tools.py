@@ -12,6 +12,47 @@ from app.knowledge import query_transform
 from app.utils.images import compress_image_to_base64
 
 
+def _build_context(best_hits) -> tuple[list[str], list[str]]:
+    context_docs = []
+    image_paths = []
+    seen_summary_paths = set()
+
+    for score, hit in best_hits:
+        entity = hit.get('entity', {}) if isinstance(hit, dict) else hit.entity
+        text = entity.get('text', '')
+        source_path = entity.get('source_path', '')
+        chunk_id = entity.get('chunk_id', '')
+        content_type = entity.get('content_type', 'text')
+        image_path = entity.get('image_path', '')
+
+        # 如果是图像描述，提取完整小作文并记录图片路径
+        if content_type == "image_description" and image_path:
+            if source_path and source_path in seen_summary_paths:
+                continue
+
+            full_summary_path = os.path.join(config.DATA_DIR, source_path)
+            read_success = False
+            try:
+                if os.path.exists(full_summary_path):
+                    with open(full_summary_path, "r", encoding="utf-8") as f:
+                        text = f.read()
+                        read_success = True
+            except Exception as e:
+                print(f"Failed to read full summary from {full_summary_path}: {e}")
+
+            if read_success and source_path:
+                seen_summary_paths.add(source_path)
+
+            if image_path not in image_paths:
+                image_paths.append(image_path)
+
+        meta_str = f"[{source_path}] " if source_path else ""
+        meta_str += f"({chunk_id}): " if chunk_id else ""
+        context_docs.append(f"{meta_str}{text}")
+
+    return context_docs, image_paths
+
+
 @tool
 def rag(query: str):
     """从 Milvus 本地知识库中检索相关信息（包含游戏攻略、菜谱等项目内部文档）。"""
@@ -64,32 +105,7 @@ def rag(query: str):
         top_k = 3
         best_hits = rerank_candidates(query, candidates, unique_hits, top_k=top_k)
         
-        context_docs = []
-        image_paths = set()
-        
-        for score, hit in best_hits:
-            entity = hit.get('entity', {}) if isinstance(hit, dict) else hit.entity
-            text = entity.get('text', '')
-            source_path = entity.get('source_path', '')
-            chunk_id = entity.get('chunk_id', '')
-            content_type = entity.get('content_type', 'text')
-            image_path = entity.get('image_path', '')
-            
-            # 如果是图像描述，提取完整小作文并记录图片路径
-            if content_type == "image_description" and image_path:
-                full_summary_path = os.path.join(config.DATA_DIR, source_path)
-                try:
-                    if os.path.exists(full_summary_path):
-                        with open(full_summary_path, "r", encoding="utf-8") as f:
-                            text = f.read()
-                except Exception as e:
-                    print(f"Failed to read full summary from {full_summary_path}: {e}")
-                
-                image_paths.add(image_path)
-            
-            meta_str = f"[{source_path}] " if source_path else ""
-            meta_str += f"({chunk_id}): " if chunk_id else ""
-            context_docs.append(f"{meta_str}{text}")
+        context_docs, image_paths = _build_context(best_hits)
             
         context = "\n".join(context_docs)
         

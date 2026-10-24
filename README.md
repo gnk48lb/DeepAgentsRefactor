@@ -271,7 +271,7 @@ uv run python -m app.knowledge.media.builder
 uv run python tests/run_smoke.py
 ```
 
-测试包含以下 9 个测试套件（共 54 个场景）：
+测试包含以下 9 个测试套件（共 55 个场景）：
 1. `tests/smoke_architecture.py`：分层单向依赖、语法禁令、空 `__init__`、提示词单例、专家规格、轻量隔离导入、无 Key 安全导入与 MCP 路径校验（8 个场景）。
 2. `tests/smoke_file_agent.py`：FileAgent 离线冒烟测试（含 MarkItDown 路径安全拦截、越界隔离、HITL 恢复映射等 16 个场景）。
 3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试。
@@ -280,7 +280,7 @@ uv run python tests/run_smoke.py
 6. `tests/smoke_chat_service.py`：多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复与 `/reset` 测试（6 个场景）。
 7. `tests/smoke_knowledge.py`：知识库建库、pending 增量入库、混合检索与长期记忆离线冒烟测试（5 个场景）。
 8. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（3 个场景）。
-9. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读等 6 个场景）。
+9. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重等 7 个场景）。
 
 ---
 

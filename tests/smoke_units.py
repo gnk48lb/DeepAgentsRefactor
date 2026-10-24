@@ -7,18 +7,22 @@ tests/smoke_units.py
   C utils.images.guess_mime_type
   D DesktopAgent 截图历史处理:只有最新一张合法截图保留图片,历史截图替换为占位;失败文本原样保留
   E DesktopAgent 未应答 tool_calls 的判定
+  F SQL 加固与超时只读
+  G rag 同源图片描述只展开一次
 """
 import base64
 import os
 import sys
 import tempfile
 import traceback
+from pathlib import Path
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from app import bootstrap, config
 from app.agents.experts import desktop_agent as da
 from app.tools import sql_tools
+from app.tools.knowledge_tools import _build_context
 from app.utils.images import guess_mime_type
 
 
@@ -129,6 +133,40 @@ def test_f_sql_hardening():
     assert captured["sql"].endswith("LIMIT 50") and captured["closed"]
 
 
+
+
+def test_g_rag_image_description_dedup():
+    orig_data_dir = config.DATA_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            config.DATA_DIR = td
+            unique_tag = "UNIQUE_TAG_DEDUP_98765_ABCD"
+            summary_content = ("这是图片摘要测试文本。" * 150) + unique_tag + ("这是图片摘要后续文本。" * 150)
+            summary_file = Path(td) / "summary.md"
+            summary_file.write_text(summary_content, encoding="utf-8")
+
+            # 构造 3 条 source_path 与 image_path 相同、content_type="image_description" 的假命中
+            hit1 = (0.95, {"entity": {"text": "chunk1", "source_path": "summary.md", "chunk_id": "c1", "content_type": "image_description", "image_path": "img.png"}})
+            hit2 = (0.90, {"entity": {"text": "chunk2", "source_path": "summary.md", "chunk_id": "c2", "content_type": "image_description", "image_path": "img.png"}})
+            hit3 = (0.85, {"entity": {"text": "chunk3", "source_path": "summary.md", "chunk_id": "c3", "content_type": "image_description", "image_path": "img.png"}})
+            # 混入 1 条 content_type="text" 的命中
+            text_hit = (0.80, {"entity": {"text": "普通文本知识片段", "source_path": "doc.txt", "chunk_id": "c4", "content_type": "text", "image_path": ""}})
+
+            best_hits = [hit1, hit2, hit3, text_hit]
+            context_docs, image_paths = _build_context(best_hits)
+            context = "\n".join(context_docs)
+
+            # 断言拼出的 context 中该唯一标记串只出现 1 次、image_paths 长度为 1
+            assert context.count(unique_tag) == 1, f"唯一标记串出现次数不为 1: {context.count(unique_tag)}"
+            assert len(image_paths) == 1, f"image_paths 长度不为 1: {len(image_paths)}"
+            assert image_paths == ["img.png"]
+            # 断言 content_type='text' 仍被保留
+            assert any("普通文本知识片段" in doc for doc in context_docs), "普通文本知识命中未被保留"
+            assert len(context_docs) == 2, f"context_docs 预期包含 2 条，实际为: {len(context_docs)}"
+    finally:
+        config.DATA_DIR = orig_data_dir
+
+
 SCENARIOS = [
     ("A config._resolve_path", test_a_resolve_path),
     ("B bootstrap os.rename 兜底补丁", test_b_bootstrap_rename_fallback),
@@ -136,6 +174,7 @@ SCENARIOS = [
     ("D DesktopAgent 截图历史处理", test_d_desktop_screenshot_history),
     ("E DesktopAgent 未应答 tool_calls", test_e_unanswered_tool_calls),
     ("F SQL 加固与超时只读", test_f_sql_hardening),
+    ("G rag 同源图片描述只展开一次", test_g_rag_image_description_dedup),
 ]
 
 
