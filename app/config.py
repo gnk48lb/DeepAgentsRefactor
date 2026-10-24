@@ -71,6 +71,7 @@ MILVUS_DB_PATH = _resolve_path(
 # 长期记忆相似度阈值（IP 分数；向量归一化时等价于余弦相似度）
 MEMORY_MIN_SCORE = 0.45
 MEMORY_DEDUP_SCORE = 0.92
+MEMORY_TOP_K = 3  # 每轮最多注入的长期记忆条数
 
 # MySQL Configuration
 MYSQL_HOST = os.getenv("MYSQL_HOST") or "localhost"

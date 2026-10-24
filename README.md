@@ -69,6 +69,7 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 - **检索过滤**：检索时通过 `config.MEMORY_MIN_SCORE` 进行相似度阈值过滤，低于阈值的记忆视为与当前问题无关，不注入对话上下文。
 - **写入去重**：写入时通过 `config.MEMORY_DEDUP_SCORE` 进行语义去重，与已有记忆相似度高于该阈值时自动覆盖旧记忆。
 - **日志审计**：记忆检索阶段输出 `[记忆检索]` 标签日志，明确标注每条命中条目的分数与采用/丢弃状态。
+- **注入控制**：注入条数由 config.MEMORY_TOP_K 控制（默认 3），相似度阈值由 MEMORY_MIN_SCORE 控制，可参考日志里的 [记忆检索] 分数调整。
 
 ### 2.7 Skills 扩展机制
 系统采用 deepagents 官方 Skills 机制扩展专家的专业技能：

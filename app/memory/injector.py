@@ -3,6 +3,7 @@
 import re
 from typing import List, Optional
 from langchain_core.messages import HumanMessage, BaseMessage
+from app import config
 from app.memory import store as memory_store
 
 # 长期记忆块标签常量
@@ -30,11 +31,11 @@ def build_initial_messages(
     - 绝不在此产生任何 SystemMessage。若在历史中引入 SystemMessage，langchain-google-genai
       会在多轮中把中间的 SystemMessage extend 进 system_instruction，导致系统指令动态变长、
       请求前缀每轮改变，前缀缓存整段失效。
-    - 检索到的长期记忆（top_k=1）固定以 <long_term_memory> 块拼在当轮 HumanMessage 开头；
+    - 检索到的长期记忆（最多 MEMORY_TOP_K 条）固定以 <long_term_memory> 块拼在当轮 HumanMessage 开头；
       未检索到记忆时保持纯 user_query。
     """
     messages: List[BaseMessage] = []
-    memories = memory_store.search_memory(user_query, top_k=1)
+    memories = memory_store.search_memory(user_query, top_k=config.MEMORY_TOP_K)
     if memories:
         query_content = f"{MEMORY_TAG_OPEN}\n" + "\n".join(memories) + f"\n{MEMORY_TAG_CLOSE}\n{user_query}"
     else:
