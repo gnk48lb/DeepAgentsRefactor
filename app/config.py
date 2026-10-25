@@ -132,6 +132,22 @@ QQ_MAX_REPLY_CHARS = 10000
 # Agent 执行 recursion_limit
 AGENT_RECURSION_LIMIT = 60
 
+# 专家独立停止条件：每个专家在“一次 task 委派”内最多可调用的工具次数（实现见 app/agents/budget.py）。
+# 第 N+1 次起的工具调用不再执行（软停止，提示模型立即收尾汇报）；模型仍不收手则在第 N+2 次模型调用后强制结束（硬停止）。
+# 这些是“止损阈值”而不是常规用量：按各专家真实流程留足余量，调参只改这里。
+# 约束：DesktopAgent 是手写子图，没有自己的 recursion_limit，继承 AGENT_RECURSION_LIMIT，
+# 且每个工具步骤占 2 个 superstep，所以必须满足 2 * N + 4 <= AGENT_RECURSION_LIMIT（tests/smoke_budget.py 会校验）。
+SUBAGENT_TOOL_LIMIT_DEFAULT = 8
+SUBAGENT_TOOL_LIMITS = {
+    "KnowledgeAgent": 5,
+    "MediaAgent": 10,
+    "MapAgent": 12,
+    "CodeAgent": 8,
+    "BrowserAgent": 6,
+    "FileAgent": 20,
+    "DesktopAgent": 20,
+}
+
 # 单轮 Agent 运行总时限（秒）
 AGENT_TURN_TIMEOUT_SECONDS = 600
 

@@ -88,8 +88,22 @@ def test_c_harness_profile():
 
 
 def test_d_time_tool_and_budgets():
-    # 改动：主管直接挂载 get_current_time
+    from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
+    from app import config
+
+    # 主管直接挂载 get_current_time
     assert [t.name for t in _captured["tools"]] == ["get_current_time"], _captured.get("tools")
+
+    # 配置表覆盖全部专家（不含 general-purpose）；声明式专家各挂 [软停止, 硬停止]
+    by_name = {_name(s): s for s in _captured["subagents"]}
+    expert_names = set(EXPECTED_ORDER) - {"general-purpose"}
+    assert set(config.SUBAGENT_TOOL_LIMITS) == expert_names, set(config.SUBAGENT_TOOL_LIMITS) ^ expert_names
+    for name in ("KnowledgeAgent", "MediaAgent", "MapAgent", "CodeAgent", "BrowserAgent"):
+        mws = by_name[name]["middleware"]
+        assert [type(m) for m in mws] == [ToolCallLimitMiddleware, ModelCallLimitMiddleware], name
+        limit = config.SUBAGENT_TOOL_LIMITS[name]
+        assert mws[0].run_limit == limit and mws[1].run_limit == limit + 2, name
+    assert "middleware" not in by_name["general-purpose"]
 
 
 def main():

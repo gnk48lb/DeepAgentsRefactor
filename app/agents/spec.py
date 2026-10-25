@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
+from app.agents.budget import build_budget_middleware, tool_limit_for
+
 
 @dataclass(frozen=True)
 class ExpertSpec:
@@ -20,6 +22,7 @@ class ExpertSpec:
             "system_prompt": self.system_prompt,
             "tools": list(self.tools_factory()),
             "model": getattr(models, self.model_key),
+            "middleware": build_budget_middleware(tool_limit_for(self.name)),
         }
         if self.skills:
             d["skills"] = list(self.skills)

@@ -313,6 +313,7 @@ import app.utils.images
 import app.runtime.hitl
 import app.runtime.outbox
 import app.agents.spec
+import app.agents.budget
 import app.agents.prompts
 import app.agents.skills
 import app.agents.experts.file_agent

@@ -12,6 +12,7 @@ from langgraph.types import interrupt
 from app.infra import models
 from app.utils.text import extract_text
 from app.agents.prompts import WORKER_BASE_PROMPT
+from app.agents.budget import tool_limit_for
 
 NAME = "DesktopAgent"
 
@@ -88,6 +89,42 @@ def _unanswered_tool_calls(messages):
     return [tc for tc in ai.tool_calls if tc["id"] not in answered]
 
 
+def _executed_tool_steps(messages) -> int:
+    """本次委派里已经产生过结果的工具步骤数（子 Agent 每次委派都从全新的消息列表开始，所以按 ToolMessage 计数即可）。"""
+    return sum(1 for m in messages if isinstance(m, ToolMessage))
+
+
+def _budget_cut(messages, limit: int) -> bool:
+    """预算已用完，而模型最后一条消息仍想继续调用工具。"""
+    last = messages[-1] if messages else None
+    return (
+        isinstance(last, AIMessage)
+        and bool(getattr(last, "tool_calls", None))
+        and _executed_tool_steps(messages) >= limit
+    )
+
+
+def _budget_report(messages, limit: int) -> str:
+    """预算耗尽时的确定性汇报（不再调用模型）：列出已执行步骤，并明确告知任务可能未完成。
+    截图结果是超长 base64，只写工具名；其余结果截断到 80 字。"""
+    steps = []
+    for m in messages:
+        if not isinstance(m, ToolMessage):
+            continue
+        name = getattr(m, "name", None) or "tool"
+        if name == "take_grid_screenshot":
+            detail = "（已截图）"
+        else:
+            detail = extract_text(m.content).replace("\n", " ")[:80]
+        steps.append(f"{len(steps) + 1}. {name} {detail}".rstrip())
+    body = "\n".join(steps) if steps else "（无）"
+    return (
+        "【内部专家汇报 - 来源：DesktopAgent】\n"
+        f"⚠️ 已达到本次委派的步骤上限（{limit} 步），任务可能尚未完成，不要当作已完成处理。\n"
+        f"已执行的步骤：\n{body}"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # DesktopAgent Subgraph —— 带动态风险拦截的桌面操作 Agent
 # ══════════════════════════════════════════════════════════════════════════════
@@ -149,9 +186,11 @@ def _process_desktop_messages_for_llm(messages: list) -> list:
     return processed
 
 
-def build_desktop_agent_subgraph(desktop_tools: list, system_prompt: str, llm=None, checkpointer=None):
+def build_desktop_agent_subgraph(desktop_tools: list, system_prompt: str, llm=None, checkpointer=None, max_tool_calls=None):
     if llm is None:
         llm = models.desktop_llm
+    if max_tool_calls is None:
+        max_tool_calls = tool_limit_for(NAME)
 
     tool_map = {t.name: t for t in desktop_tools}
     
@@ -233,6 +272,8 @@ def build_desktop_agent_subgraph(desktop_tools: list, system_prompt: str, llm=No
 
     async def da_summarize_node(state: DesktopAgentState) -> dict:
         msgs = state["messages"]
+        if _budget_cut(msgs, max_tool_calls):
+            return {"messages": [AIMessage(content=_budget_report(msgs, max_tool_calls))]}
         worker_text = ""
         for msg in reversed(msgs):
             if isinstance(msg, AIMessage) and msg.content:
@@ -251,6 +292,8 @@ def build_desktop_agent_subgraph(desktop_tools: list, system_prompt: str, llm=No
     def _route_after_llm(state: DesktopAgentState) -> str:
         last_ai: AIMessage = state["messages"][-1]
         if not getattr(last_ai, "tool_calls", None):
+            return "da_summarize"
+        if _budget_cut(state["messages"], max_tool_calls):
             return "da_summarize"
         return "da_tools"
 

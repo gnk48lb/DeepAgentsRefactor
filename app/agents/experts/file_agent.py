@@ -16,8 +16,10 @@ from deepagents import FilesystemMiddleware
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
 from app.agents.prompts import WORKER_BASE_PROMPT
+from app.agents.budget import build_budget_middleware, tool_limit_for
 
 NAME = "FileAgent"
 
@@ -66,12 +68,26 @@ FILE_AGENT_MARKITDOWN_PROMPT = PROMPT_MARKITDOWN
 # 内置文件工具白名单。故意不含 delete / execute（“删除 = 归档”：move_file 到 archive_trash）。
 FS_TOOLS = ["ls", "read_file", "write_file", "edit_file", "glob", "grep"]
 
+def _not_yet_answered(req) -> bool:
+    """HITL 的 when 谓词：该调用若已经有 ToolMessage 应答，就不再弹授权。
+
+    超预算的调用会先被限步中间件用错误 ToolMessage 拦下（after_model 钩子按列表倒序执行：
+    限步在前、HITL 在后）。不跳过的话，用户会被问一个根本不会执行的授权；
+    用户点“拒绝”时，同一个 tool_call_id 还会出现两条应答。
+    """
+    call_id = req.tool_call["id"]
+    return not any(
+        isinstance(m, ToolMessage) and m.tool_call_id == call_id
+        for m in req.state["messages"]
+    )
+
+
 # 需要人工授权的工具，与旧版 DANGEROUS_FS_TOOLS 保持一致
 FILE_AGENT_INTERRUPT_ON = {
-    "write_file": {"allowed_decisions": ["approve", "edit", "reject"]},
-    "edit_file": {"allowed_decisions": ["approve", "edit", "reject"]},
-    "create_directory": {"allowed_decisions": ["approve", "reject"]},
-    "move_file": {"allowed_decisions": ["approve", "reject"]},
+    "write_file": {"allowed_decisions": ["approve", "edit", "reject"], "when": _not_yet_answered},
+    "edit_file": {"allowed_decisions": ["approve", "edit", "reject"], "when": _not_yet_answered},
+    "create_directory": {"allowed_decisions": ["approve", "reject"], "when": _not_yet_answered},
+    "move_file": {"allowed_decisions": ["approve", "reject"], "when": _not_yet_answered},
 }
 
 
@@ -148,9 +164,12 @@ def make_workspace_tools(workspace_dir: str) -> list:
     return [move_file, create_directory]
 
 
-def build_file_agent_runnable(llm, system_prompt: str, workspace_dir: str, checkpointer=None, extra_tools=None):
+def build_file_agent_runnable(llm, system_prompt: str, workspace_dir: str, checkpointer=None, extra_tools=None, max_tool_calls=None):
     """返回可直接放进 CompiledSubAgent(runnable=...) 的已编译图。
-    checkpointer 保持 None：由主图的 checkpointer 统一接管（与旧子图一致）。"""
+    checkpointer 保持 None：由主图的 checkpointer 统一接管（与旧子图一致）。
+    max_tool_calls：单次委派内的工具调用预算，默认取 config.SUBAGENT_TOOL_LIMITS["FileAgent"]。"""
+    if max_tool_calls is None:
+        max_tool_calls = tool_limit_for(NAME)
     tools = make_workspace_tools(workspace_dir) + list(extra_tools or [])
     return create_agent(
         model=llm,
@@ -158,7 +177,10 @@ def build_file_agent_runnable(llm, system_prompt: str, workspace_dir: str, check
         system_prompt=system_prompt,
         middleware=[
             FilesystemMiddleware(backend=build_workspace_backend(workspace_dir), tools=FS_TOOLS),
+            # 顺序有讲究：create_agent 的 after_model 钩子按列表倒序执行（排在后面的先执行），
+            # 所以限步中间件放在 HITL 之后 → 先拦截超预算调用，再轮到 HITL（并通过 when 跳过已被拦截的调用）。
             HumanInTheLoopMiddleware(interrupt_on=FILE_AGENT_INTERRUPT_ON),
+            *build_budget_middleware(max_tool_calls),
         ],
         checkpointer=checkpointer,
     )

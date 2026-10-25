@@ -76,6 +76,14 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 - **专家装配**：自定义子专家在声明式 spec 中显式配置 `skills=[SKILLS_ROUTE]`。
 - **虚拟路由**：由 `app/agents/skills.py` 构建 `CompositeBackend`，将虚拟路径 `/skills/` 路由到本地真实的 `skills/` 磁盘目录。
 
+### 2.8 专家步骤预算（独立停止条件）
+每个专家在**一次 `task` 委派内**最多可调用的工具次数由 `app/config.py` 的 `SUBAGENT_TOOL_LIMITS` 配置（未登记的专家使用 `SUBAGENT_TOOL_LIMIT_DEFAULT`；统计包含 `read_file`、`write_todos` 等框架内置工具），实现见 `app/agents/budget.py`，两级止损：
+- **软停止**：第 N+1 次起的工具调用不再执行，而是以 `Tool call limit exceeded` 错误回给模型，模型据已有结果收尾汇报（`WORKER_BASE_PROMPT` 的【步骤预算】一节教它这样做）。
+- **硬停止**：模型无视软停止继续要工具时，在第 N+2 次模型调用后强制结束，`task` 返回 `Model call limits exceeded`。
+- **实现方式**：声明式专家与 FileAgent 用 langchain 的 `ToolCallLimitMiddleware` + `ModelCallLimitMiddleware`；DesktopAgent 是手写子图，按已执行的工具步数手动计数，超限直接返回确定性汇报（不再调用模型）。
+- **FileAgent 与 HITL**：授权恢复后计数重新开始；超预算被拦下的写入类调用不再弹授权。
+- 预算是“止损阈值”而不是常规用量：日志里出现 `Tool call limit exceeded` / `Model call limits exceeded` 说明某个专家触顶，按真实用量调整 `SUBAGENT_TOOL_LIMITS`。
+
 ---
 
 ## 3. 目录结构
@@ -121,6 +129,7 @@ DeepAgentsRefactor/
 │   │   └── amap/             # 高德地图本地 Tool 实现与契约快照
 │   ├── agents/               # L4: 智能体编排与专家定义
 │   │   ├── spec.py           # 声明式 ExpertSpec 数据结构
+│   │   ├── budget.py         # 专家工具调用预算（软 / 硬两级停止条件）
 │   │   ├── prompts.py        # 主 Agent 提示词与唯一的 WORKER_BASE_PROMPT
 │   │   ├── skills.py         # Skills 虚拟文件系统 Backend 路由
 │   │   ├── orchestrator.py   # 主管智能体构建与多专家编排
@@ -152,6 +161,7 @@ DeepAgentsRefactor/
 │   ├── run_smoke.py          # 一键运行全部离线冒烟测试
 │   ├── smoke_architecture.py # 架构分层、规范与契约冒烟测试
 │   ├── smoke_file_agent.py   # FileAgent 离线冒烟测试
+│   ├── smoke_budget.py       # 专家工具调用预算（独立停止条件）冒烟测试
 │   ├── smoke_skills.py       # Skills 规范与 Backend 路由冒烟测试
 │   ├── smoke_amap_contract.py# 高德工具快照与契约冒烟测试
 │   ├── smoke_amap_http.py    # 高德工具 HTTP 异常与密钥脱敏测试
@@ -237,7 +247,7 @@ uv run python -m app.knowledge.media.builder
 
 若需向系统扩展新的垂直领域专家，按以下 6 步标准流程实施：
 1. **定义工具集**：在 `app/tools/<x>_tools.py` 中编写 `@tool` 函数并导出 `TOOLS = [...]`。
-2. **定义专家规格**：在 `app/agents/experts/<x>_agent.py` 中定义 `NAME`、`DESCRIPTION`、`PROMPT`（基于统一的 `WORKER_BASE_PROMPT` 拼接），并导出 `SPEC = ExpertSpec(...)`。
+2. **定义专家规格**：在 `app/agents/experts/<x>_agent.py` 中定义 `NAME`、`DESCRIPTION`、`PROMPT`（基于统一的 `WORKER_BASE_PROMPT` 拼接），并导出 `SPEC = ExpertSpec(...)`，并在 `app/config.py` 的 `SUBAGENT_TOOL_LIMITS` 里登记它的工具调用预算（未登记则使用 `SUBAGENT_TOOL_LIMIT_DEFAULT`；`tests/smoke_budget.py` 的 A2 与 `tests/smoke_orchestrator.py` 的 D 会校验预算表与专家集合一致，需同步更新）。
 3. **注册至主管**：在 `app/agents/orchestrator.py` 的 `_DECLARATIVE_SPECS` 列表中按期望的展示顺序追加该专家的 `SPEC`。
 4. **补充委派规则**：在 `app/agents/prompts.py` 的 `MAIN_AGENT_PROMPT` 任务委派决策流程中补充何时委派给该专家的指示。
 5. **补充审计名单**：在 `app/runtime/cli_logger.py` 的 `_identify_agent` 专家名称白名单中添加该专家的名称。
@@ -270,7 +280,7 @@ uv run python -m app.knowledge.media.builder
 uv run python tests/run_smoke.py
 ```
 
-测试包含以下 9 个测试套件（共 55 个场景）：
+测试包含以下 10 个测试套件（共 71 个场景）：
 1. `tests/smoke_architecture.py`：分层单向依赖、语法禁令、空 `__init__`、提示词单例、专家规格、轻量隔离导入、无 Key 安全导入与 MCP 路径校验（8 个场景）。
 2. `tests/smoke_file_agent.py`：FileAgent 离线冒烟测试（含 MarkItDown 路径安全拦截、越界隔离、HITL 恢复映射等 16 个场景）。
 3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试。
@@ -278,8 +288,9 @@ uv run python tests/run_smoke.py
 5. `tests/smoke_amap_http.py`：高德工具 HTTP 异常与密钥脱敏测试（6 个场景）。
 6. `tests/smoke_chat_service.py`：多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复与 `/reset` 测试（6 个场景）。
 7. `tests/smoke_knowledge.py`：知识库建库、pending 增量入库、混合检索与长期记忆离线冒烟测试（5 个场景）。
-8. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（3 个场景）。
+8. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（4 个场景，含主管时间工具与专家预算装配）。
 9. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重等 7 个场景）。
+10. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、生产递归上限下失控保护等 15 个场景）。
 
 ---
 
@@ -287,4 +298,4 @@ uv run python tests/run_smoke.py
 
 1. **DesktopAgent 不稳定**: 桌面操作依赖网格视觉识别，受分辨率和缩放比例影响较大，可能存在点击漂移。
 2. **MemorySaver 会话重启丢失**: 当前状态保存器为内存级 `MemorySaver`，机器人进程重启后进行中的上下文与未决 HITL 中断会丢失。长期事实依赖 Milvus 后台抽取持久化。
-3. **FileAgent 工具调用步数限制**: 单次 FileAgent 运行串行工具调用上限约 19 次（带 HITL 中间件每次工具调用占 3 个 superstep）；`write_file` 对已存在文件会整体覆盖。
+3. **专家单次委派有工具调用预算**: 每个专家单次委派内的工具调用次数受 `config.SUBAGENT_TOOL_LIMITS` 限制（见 2.8；FileAgent 默认 20 次，授权恢复后重新计数），触顶后调用被拦截、专家以已有结果收尾，复杂任务可能因此汇报不完整；`write_file` 对已存在文件会整体覆盖。
