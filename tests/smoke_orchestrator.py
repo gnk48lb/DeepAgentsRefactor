@@ -20,13 +20,12 @@ for _k in ("GEMINI_API_KEY", "SILICON_FLOW_API_KEY", "HUGGINGFACEHUB_API_TOKEN",
 from app.infra import mcp_service, models  # noqa: E402
 from app.agents import orchestrator  # noqa: E402
 
-EXPECTED_ORDER = ["KnowledgeAgent", "MediaAgent", "MapAgent", "CodeAgent", "SQLAgent",
+EXPECTED_ORDER = ["KnowledgeAgent", "MediaAgent", "MapAgent", "CodeAgent",
                   "BrowserAgent", "FileAgent", "DesktopAgent", "general-purpose"]
 EXPECTED_TOOLS = {
     "KnowledgeAgent": ["rag", "web_search", "get_current_time"],
-    "MediaAgent": ["av_graph_rag"],
+    "MediaAgent": ["av_graph_rag", "execute_sql"],
     "CodeAgent": ["execute_python_code"],
-    "SQLAgent": ["execute_sql"],
     "BrowserAgent": ["read_webpage_content", "get_bilibili_profile", "execute_complex_browser_action"],
     "general-purpose": [],
 }
@@ -67,7 +66,7 @@ def test_b_specs():
         assert got == tools, f"{name} 工具不一致: {got} != {tools}"
     assert len(by_name["MapAgent"]["tools"]) == 16, "MapAgent 应挂载 16 个高德工具"
     assert by_name["CodeAgent"].get("skills") == ["/skills/"], by_name["CodeAgent"].get("skills")
-    for name in ("KnowledgeAgent", "MediaAgent", "MapAgent", "SQLAgent", "BrowserAgent"):
+    for name in ("KnowledgeAgent", "MediaAgent", "MapAgent", "BrowserAgent"):
         assert not by_name[name].get("skills"), f"{name} 不应挂 skills"
     for name in ("FileAgent", "DesktopAgent"):
         assert "runnable" in by_name[name], f"{name} 应是 CompiledSubAgent"

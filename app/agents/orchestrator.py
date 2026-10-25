@@ -21,7 +21,6 @@ from app.agents.experts import (
     media_agent,
     map_agent,
     code_agent,
-    sql_agent,
     browser_agent,
     file_agent,
     desktop_agent,
@@ -66,7 +65,6 @@ _DECLARATIVE_SPECS = [
     media_agent.SPEC,
     map_agent.SPEC,
     code_agent.SPEC,
-    sql_agent.SPEC,
     browser_agent.SPEC,
 ]
 
@@ -112,7 +110,7 @@ async def build_main_agent(
     """
     构建基于 deepagents 的主 Agent 实例（单用户：本地操作类专家始终挂载）。
     - 主模型: models.orchestrator_llm
-    - 子专家: 声明式接入 (task 委派)，包含 FileAgent / DesktopAgent / BrowserAgent 等全部 8 个专家
+    - 子专家: 声明式接入 (task 委派)，包含 FileAgent / DesktopAgent / BrowserAgent 等全部 7 个专家
     - 中间件: ToolCallLimitMiddleware 防御 task 工具死循环
     - 持久化: 默认使用 MemorySaver
     """

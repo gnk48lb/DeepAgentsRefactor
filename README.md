@@ -42,17 +42,16 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 
 ### 2.3 子专家清单
 1. **KnowledgeAgent**: 知识检索专家，优先检索本地 Milvus 知识库 (`rag`)，无果且具时效性时通过 Tavily 全网搜索 (`web_search`)；另提供 `get_current_time`，回答当前日期 / 时间 / 星期类问题。
-2. **MediaAgent**: 专有图谱检索专家，基于 Neo4j 知识图谱 (`av_graph_rag`) 进行实体与关系网络查询。
+2. **MediaAgent**: 成人影视专家，同时挂载 Neo4j 知识图谱检索 (`av_graph_rag`) 与 MySQL 只读查询 (`execute_sql`)：图谱负责实体 / 合作关系网络与题材标签，数据库负责身高、罩杯、出生年份等精确属性过滤与发行年份统计，复合问题由它自己组合完成。
 3. **MapAgent**: 地理与出行专家，挂载高德地图本地工具（共 16 个高德本地 Tool），支持天气查询、周边检索、路径规划与地理编码。
 4. **CodeAgent**: 代码执行专家，通过 Docker 隔离沙箱安全运行 Python 脚本，支持数据分析与 Matplotlib 绘图（绘图规范由 Skill `matplotlib-chart` 提供）。
-5. **SQLAgent**: 关系数据库专家，负责将自然语言转为 SQL 并查询本地 MySQL (`execute_sql`)。
-6. **BrowserAgent**: 浏览器自动化专家，基于 Playwright/browser-use 操控真实或无头浏览器，处理网页端交互。
-7. **FileAgent (HITL)**: 本地文件专家，内置 FilesystemMiddleware + FilesystemBackend + 原生 HITL。提供工具：`ls`/`glob`/`grep`/`read_file` 免授权，`convert_to_markdown`（由 markitdown-mcp 提供，支持富文档转 Markdown），`write_file`/`edit_file`/`create_directory`/`move_file` 需授权，删除 = 移动到 archive_trash 归档。只能在 workspace 工作区内操作。转换结果过大时会暂存到 `/_artifacts/large_tool_results/<id>`，FileAgent 用 `read_file` 分页读回。
-8. **DesktopAgent (HITL)**: 桌面操作专家，基于网格坐标截屏、模拟点击与键鼠交互。
+5. **BrowserAgent**: 浏览器自动化专家，基于 Playwright/browser-use 操控真实或无头浏览器，处理网页端交互。
+6. **FileAgent (HITL)**: 本地文件专家，内置 FilesystemMiddleware + FilesystemBackend + 原生 HITL。提供工具：`ls`/`glob`/`grep`/`read_file` 免授权，`convert_to_markdown`（由 markitdown-mcp 提供，支持富文档转 Markdown），`write_file`/`edit_file`/`create_directory`/`move_file` 需授权，删除 = 移动到 archive_trash 归档。只能在 workspace 工作区内操作。转换结果过大时会暂存到 `/_artifacts/large_tool_results/<id>`，FileAgent 用 `read_file` 分页读回。
+7. **DesktopAgent (HITL)**: 桌面操作专家，基于网格坐标截屏、模拟点击与键鼠交互。
 
 ### 2.4 单用户模式
 系统为单用户专属模式，仅供本人使用：
-- 所有专家（含具有本地文件读写权限的 `FileAgent`、物理桌面控制的 `DesktopAgent` 以及自动化操作网页的 `BrowserAgent` 等全量 8 个专家）始终挂载。
+- 所有专家（含具有本地文件读写权限的 `FileAgent`、物理桌面控制的 `DesktopAgent` 以及自动化操作网页的 `BrowserAgent` 等全量 7 个专家）始终挂载。
 - 系统内部没有任何用户身份或权限校验逻辑。
 - 对话会话使用固定的 `thread_id`（`"main"`），私聊与群聊共享同一份对话上下文。
 - 发送 `/reset`（或 `/new`、`/新对话`）可清空固定会话，含挂起中的授权。
@@ -125,12 +124,11 @@ DeepAgentsRefactor/
 │   │   ├── prompts.py        # 主 Agent 提示词与唯一的 WORKER_BASE_PROMPT
 │   │   ├── skills.py         # Skills 虚拟文件系统 Backend 路由
 │   │   ├── orchestrator.py   # 主管智能体构建与多专家编排
-│   │   └── experts/          # 8 个垂直领域子专家实现
+│   │   └── experts/          # 7 个垂直领域子专家实现
 │   │       ├── knowledge_agent.py
 │   │       ├── media_agent.py
 │   │       ├── map_agent.py
 │   │       ├── code_agent.py
-│   │       ├── sql_agent.py
 │   │       ├── browser_agent.py
 │   │       ├── file_agent.py
 │   │       └── desktop_agent.py
@@ -192,7 +190,7 @@ uv sync
 - **Neo4j**:
   - 提供知识图谱存储与 Cypher 关系查询，供 `MediaAgent` 使用。可通过 `docker compose -f deploy/docker-compose.yml up -d neo4j` 启动。
 - **MySQL**:
-  - 存储女优与作品结构化关系数据，供 `SQLAgent` 精确筛选查询。MySQL 需用户自备（`deploy/docker-compose.yml` 中不包含）。建议为 SQLAgent 分配专用只读账号（如 `GRANT SELECT ON av_db.* TO 'readonly'@'%'`），并在 `.env` 中配置对应的 `MYSQL_USER` 与 `MYSQL_PASSWORD`。
+  - 存储女优与作品结构化关系数据，供 `MediaAgent` 的 `execute_sql` 工具精确筛选查询。MySQL 需用户自备（`deploy/docker-compose.yml` 中不包含）。建议为该工具分配专用只读账号（如 `GRANT SELECT ON av_db.* TO 'readonly'@'%'`），并在 `.env` 中配置对应的 `MYSQL_USER` 与 `MYSQL_PASSWORD`。
 - **Docker Python 沙箱**:
   - 供 `CodeAgent` 启动轻量容器 (`python-ds:latest`) 安全运行数据分析与绘图代码。
 

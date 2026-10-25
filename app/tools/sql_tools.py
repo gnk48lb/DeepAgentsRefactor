@@ -24,7 +24,7 @@ def _prepare_select_sql(sql: str) -> str:
 
 @tool("execute_sql")
 def execute_sql(sql_query: str) -> str:
-    """执行 SQL SELECT 查询并返回结果。当需要精确过滤/多条件筛选/统计计算（如女优身高、罩杯统计、发行年份过滤等）本库 MySQL 数据时调用。"""
+    """执行 SQL SELECT 查询并返回结果。当需要精确过滤/多条件筛选/统计计算（如女优身高、罩杯统计、发行年份过滤等）本库 MySQL 数据时调用。数据库没有题材/标签字段，题材标签请改用 av_graph_rag。"""
     print(f"\n[Tool Call: execute_sql] SQL: {sql_query}")
     
     try:

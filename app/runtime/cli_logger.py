@@ -240,7 +240,7 @@ def _identify_agent(messages: Any, metadata: Optional[Dict[str, Any]], serialize
             candidate = agent_match.group(1)
             if candidate in (
                 "KnowledgeAgent", "FileAgent", "MapAgent", "CodeAgent",
-                "SQLAgent", "MediaAgent", "BrowserAgent", "DesktopAgent"
+                "MediaAgent", "BrowserAgent", "DesktopAgent"
             ):
                 return candidate
         if "KnowledgeAgent" in corpus and "知识百科专家" in corpus:
@@ -253,7 +253,7 @@ def _identify_agent(messages: Any, metadata: Optional[Dict[str, Any]], serialize
             for role in (
                 "FileAgent", "DesktopAgent", "BrowserAgent",
                 "KnowledgeAgent", "MapAgent", "CodeAgent",
-                "SQLAgent", "MediaAgent"
+                "MediaAgent"
             ):
                 if role in checkpoint_ns or role in node:
                     return role

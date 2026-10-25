@@ -15,6 +15,7 @@ tests/smoke_architecture.py
 import ast
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -233,7 +234,6 @@ def test_d_prompt_uniqueness_and_identity():
         media_agent,
         map_agent,
         code_agent,
-        sql_agent,
         browser_agent,
         desktop_agent,
         file_agent,
@@ -248,10 +248,12 @@ def test_d_prompt_uniqueness_and_identity():
     assert ident(media_agent.PROMPT) == "MediaAgent"
     assert ident(map_agent.PROMPT) == "MapAgent"
     assert ident(code_agent.PROMPT) == "CodeAgent"
-    assert ident(sql_agent.PROMPT) == "SQLAgent"
     assert ident(browser_agent.PROMPT) == "BrowserAgent"
     assert ident(desktop_agent.PROMPT) == "DesktopAgent"
     assert ident(file_agent.PROMPT + file_agent.PROMPT_MARKITDOWN) == "FileAgent"
+    for _p in (media_agent.PROMPT, media_agent.DESCRIPTION, MAIN_AGENT_PROMPT):
+        assert "SQLAgent" not in _p, "合并后不应再出现 SQLAgent"
+    assert len(re.findall(r"(?<!如果)你是\s*[A-Za-z]+Agent", media_agent.PROMPT)) == 1
 
 
 def test_e_expert_spec_table():
@@ -262,7 +264,6 @@ def test_e_expert_spec_table():
         media_agent,
         map_agent,
         code_agent,
-        sql_agent,
         browser_agent,
     )
     from app.agents import orchestrator
@@ -270,9 +271,8 @@ def test_e_expert_spec_table():
 
     expected_specs = [
         (knowledge_agent.SPEC, "KnowledgeAgent", "vlm", ["rag", "web_search", "get_current_time"], ()),
-        (media_agent.SPEC, "MediaAgent", "worker_llm", ["av_graph_rag"], ()),
+        (media_agent.SPEC, "MediaAgent", "worker_llm", ["av_graph_rag", "execute_sql"], ()),
         (code_agent.SPEC, "CodeAgent", "worker_llm", ["execute_python_code"], (SKILLS_ROUTE,)),
-        (sql_agent.SPEC, "SQLAgent", "worker_llm", ["execute_sql"], ()),
         (
             browser_agent.SPEC,
             "BrowserAgent",
@@ -298,7 +298,7 @@ def test_e_expert_spec_table():
     assert [t.name for t in map_agent.SPEC.tools_factory()] == [item["name"] for item in snap_data]
 
     # orchestrator._DECLARATIVE_SPECS 顺序验证
-    expected_order = ["KnowledgeAgent", "MediaAgent", "MapAgent", "CodeAgent", "SQLAgent", "BrowserAgent"]
+    expected_order = ["KnowledgeAgent", "MediaAgent", "MapAgent", "CodeAgent", "BrowserAgent"]
     actual_order = [s.name for s in orchestrator._DECLARATIVE_SPECS]
     assert actual_order == expected_order, f"Declarative specs order mismatch: {actual_order} != {expected_order}"
 
