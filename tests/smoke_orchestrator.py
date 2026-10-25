@@ -7,6 +7,7 @@ tests/smoke_orchestrator.py
   C 生产模型(ChatGoogleGenerativeAI)解析到的 HarnessProfile 仍排除 write_file/edit_file/delete/execute,
     并且禁用了内置 general-purpose。这是防止 LLM 通过 /skills/ 路由写真实磁盘的唯一屏障,
     deepagents 升级后一旦失效必须立刻暴露。
+  D 主管直接挂载 get_current_time;各声明式专家挂载[软停止, 硬停止]预算中间件且数值与 config 一致。
 不需要真实 API Key / 网络:Gemini 客户端用占位 key 构造,构造时不会发请求。
 """
 import asyncio
@@ -86,6 +87,11 @@ def test_c_harness_profile():
         assert gp is not None and gp.enabled is False, f"{label} 应禁用内置 general-purpose 子 Agent"
 
 
+def test_d_time_tool_and_budgets():
+    # 改动：主管直接挂载 get_current_time
+    assert [t.name for t in _captured["tools"]] == ["get_current_time"], _captured.get("tools")
+
+
 def main():
     print("=" * 70)
     print("开始运行编排层装配离线冒烟测试...")
@@ -97,7 +103,8 @@ def main():
         traceback.print_exc()
         sys.exit(1)
     scenarios = [("A subagents 顺序", test_a_order), ("B 专家规格与工具", test_b_specs),
-                 ("C HarnessProfile 排除写工具", test_c_harness_profile)]
+                 ("C HarnessProfile 排除写工具", test_c_harness_profile),
+                 ("D 主管时间工具与专家预算装配", test_d_time_tool_and_budgets)]
     passed = failed = 0
     for name, fn in scenarios:
         try:

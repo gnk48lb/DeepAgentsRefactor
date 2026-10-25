@@ -4,7 +4,7 @@ from app.agents.prompts import WORKER_BASE_PROMPT
 from app.agents.spec import ExpertSpec
 from app.tools import knowledge_tools
 
-DESCRIPTION = "知识百科专家。处理菜谱、游戏攻略、历史、科学等纯知识性咨询，优先检索本地知识库；同时负责回答当前日期、时间、星期几，以及以“现在”为基准的日期推算（如距离某天还有几天）。不处理地理位置相关问题（在哪买/怎么去/天气），也不处理代码、本地文件、目录浏览。"
+DESCRIPTION = "知识百科专家。处理菜谱、游戏攻略、历史、科学等纯知识性咨询，优先检索本地知识库，无果且具时效性时再用网络搜索。不处理地理位置相关问题（在哪买/怎么去/天气），也不处理代码、本地文件、目录浏览。"
 
 PROMPT = (
     WORKER_BASE_PROMPT + (
