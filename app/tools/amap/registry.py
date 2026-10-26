@@ -1,7 +1,6 @@
 import asyncio
 import json
 from pathlib import Path
-import re
 from typing import Callable, List
 from langchain_core.tools import BaseTool, StructuredTool
 
@@ -9,17 +8,16 @@ from app.tools.amap import impl
 
 _SNAPSHOT_PATH = Path(__file__).resolve().parent / "tools_snapshot.json"
 
-_COORD_KEYWORDS = ("around", "coordinates", "regeocode", "distance")
-_COORD_FIELDS = ("location", "origin", "destination", "origins")
-_COORD_RE = re.compile(r"^[0-9.]+,[0-9.]+$")
+# 只有这些工具的这些参数必须是纯 '经度,纬度'；其余位置参数一律由 impl 自动识别（坐标 / 文字地址）
+_COORD_ONLY_FIELDS: dict[str, tuple[str, ...]] = {
+    "maps_regeocode": ("location",),
+}
 
 
 def _check_coords(name: str, kwargs: dict) -> str | None:
-    if not any(kw in name for kw in _COORD_KEYWORDS):
-        return None
-    for field in _COORD_FIELDS:
+    for field in _COORD_ONLY_FIELDS.get(name, ()):
         val = kwargs.get(field)
-        if isinstance(val, str) and not _COORD_RE.match(val.strip()):
+        if isinstance(val, str) and not impl.is_coordinates(val):
             return (
                 f"工具 '{name}' 调用失败：参数 '{field}' 格式错误。"
                 f"该字段必须是 '经度,纬度' 格式的数字字符串（如 '117.05,36.65'）。"

@@ -1,448 +1,293 @@
 [
   {
     "name": "maps_regeocode",
-    "description": "将一个高德经纬度坐标转换为行政区划地址信息\n\n【重要说明】该工具要求传入精确的经纬度坐标（格式：'经度,纬度'）。如果你只有文字地址（如 '文化东路42号'），你必须先调用 maps_geo 获取坐标，严禁根据自身知识库猜测、编造或幻觉经纬度数字。",
+    "description": "逆地理编码：把'经度,纬度'坐标转换为所在的省、市、区。只返回行政区划（不含街道门牌）；直辖市的 city 为空，以 province 为准。location 只能传坐标；手里只有文字地址时请改用 maps_geo。",
     "inputSchema": {
+      "type": "object",
       "properties": {
         "location": {
-          "title": "Location",
-          "type": "string"
+          "type": "string",
+          "description": "经度,纬度（经度在前），如 '116.481488,39.990464'"
         }
       },
       "required": [
         "location"
-      ],
-      "title": "maps_regeocodeArguments",
-      "type": "object"
+      ]
     }
   },
   {
     "name": "maps_geo",
-    "description": "将详细的结构化地址转换为经纬度坐标。支持对地标性名胜景区、建筑物名称解析为经纬度坐标",
+    "description": "地理编码：把结构化地址或地标/建筑名称转成'经度,纬度'坐标，同时返回省、市、区、adcode 和匹配级别 level，可能有多个候选（第一个最匹配）。需要坐标本身、行政区划或 adcode 时用它；路线、周边搜索、测距工具可以直接传文字地址，不必先调用本工具。",
     "inputSchema": {
+      "type": "object",
       "properties": {
         "address": {
-          "title": "Address",
-          "type": "string"
+          "type": "string",
+          "description": "详细地址或地标名称，如 '北京市朝阳区阜通东大街6号'、'望京SOHO'"
         },
         "city": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "City"
+          "type": "string",
+          "description": "限定城市（中文名或 adcode）；地址可能重名时建议填写"
         }
       },
       "required": [
         "address"
-      ],
-      "title": "maps_geoArguments",
-      "type": "object"
+      ]
     }
   },
   {
     "name": "maps_ip_location",
-    "description": "IP 定位根据用户输入的 IP 地址，定位 IP 的所在位置",
+    "description": "IP 定位：根据 IP 地址返回所在省、市、adcode 和大致范围 rectangle。",
     "inputSchema": {
+      "type": "object",
       "properties": {
         "ip": {
-          "title": "Ip",
-          "type": "string"
+          "type": "string",
+          "description": "要定位的 IP 地址"
         }
       },
       "required": [
         "ip"
-      ],
-      "title": "maps_ip_locationArguments",
-      "type": "object"
+      ]
     }
   },
   {
     "name": "maps_weather",
-    "description": "根据城市名称或者标准adcode查询指定城市的天气",
+    "description": "天气预报：查询某城市今天起未来 4 天的白天/夜间天气、气温、风向和风力。",
     "inputSchema": {
+      "type": "object",
       "properties": {
         "city": {
-          "title": "City",
-          "type": "string"
+          "type": "string",
+          "description": "城市名称（如 '济南市'）或 6 位 adcode（如 '370100'）；要查区县请写全（如 '北京市朝阳区'）或直接用 adcode"
         }
       },
       "required": [
         "city"
-      ],
-      "title": "maps_weatherArguments",
-      "type": "object"
+      ]
     }
   },
   {
-    "name": "maps_bicycling_by_address",
-    "description": "Plans a bicycle route between two locations using addresses. Unless you have a specific reason to use coordinates, it's recommended to use this tool.\n    \n    Args:\n        origin_address (str): Starting point address (e.g. \"北京市朝阳区阜通东大街6号\")\n        destination_address (str): Ending point address (e.g. \"北京市海淀区上地十街10号\")\n        origin_city (Optional[str]): Optional city name for the origin address to improve geocoding accuracy\n        destination_city (Optional[str]): Optional city name for the destination address to improve geocoding accuracy\n        \n    Returns:\n        Dict[str, Any]: Route information including distance, duration, and turn-by-turn instructions.\n        Considers bridges, one-way streets, and road closures. Supports routes up to 500km.\n    ",
+    "name": "maps_route_bicycling",
+    "description": "骑行路线规划（500km 以内）。起点、终点既可以是文字地址，也可以是'经度,纬度'坐标，无需先调用 maps_geo。返回总距离（米）、耗时（秒）和分步指引；起点或终点是文字地址时，另附 addresses 字段给出解析出的坐标。",
     "inputSchema": {
-      "properties": {
-        "origin_address": {
-          "title": "Origin Address",
-          "type": "string"
-        },
-        "destination_address": {
-          "title": "Destination Address",
-          "type": "string"
-        },
-        "origin_city": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Origin City"
-        },
-        "destination_city": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Destination City"
-        }
-      },
-      "required": [
-        "origin_address",
-        "destination_address"
-      ],
-      "title": "maps_bicycling_by_addressArguments",
-      "type": "object"
-    }
-  },
-  {
-    "name": "maps_bicycling_by_coordinates",
-    "description": "Plans a bicycle route between two coordinates.\n    \n    Args:\n        origin_coordinates (str): Starting point coordinates in the format \"longitude,latitude\" (e.g. \"116.434307,39.90909\")\n        destination_coordinates (str): Ending point coordinates in the format \"longitude,latitude\" (e.g. \"116.434307,39.90909\")\n        \n    Returns:\n        Dict[str, Any]: Route information including distance, duration, and turn-by-turn instructions.\n        Considers bridges, one-way streets, and road closures. Supports routes up to 500km.\n    \n\n【重要说明】该工具要求传入精确的经纬度坐标（格式：'经度,纬度'）。如果你只有文字地址（如 '文化东路42号'），你必须先调用 maps_geo 获取坐标，严禁根据自身知识库猜测、编造或幻觉经纬度数字。",
-    "inputSchema": {
-      "properties": {
-        "origin_coordinates": {
-          "title": "Origin Coordinates",
-          "type": "string"
-        },
-        "destination_coordinates": {
-          "title": "Destination Coordinates",
-          "type": "string"
-        }
-      },
-      "required": [
-        "origin_coordinates",
-        "destination_coordinates"
-      ],
-      "title": "maps_bicycling_by_coordinatesArguments",
-      "type": "object"
-    }
-  },
-  {
-    "name": "maps_direction_walking_by_address",
-    "description": "Plans a walking route between two locations using addresses. Unless you have a specific reason to use coordinates, it's recommended to use this tool.\n    \n    Args:\n        origin_address (str): Starting point address (e.g. \"北京市朝阳区阜通东大街6号\")\n        destination_address (str): Ending point address (e.g. \"北京市海淀区上地十街10号\")\n        origin_city (Optional[str]): Optional city name for the origin address to improve geocoding accuracy\n        destination_city (Optional[str]): Optional city name for the destination address to improve geocoding accuracy\n        \n    Returns:\n        Dict[str, Any]: Route information including distance, duration, and turn-by-turn instructions.\n        Supports routes up to 100km.\n    ",
-    "inputSchema": {
-      "properties": {
-        "origin_address": {
-          "title": "Origin Address",
-          "type": "string"
-        },
-        "destination_address": {
-          "title": "Destination Address",
-          "type": "string"
-        },
-        "origin_city": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Origin City"
-        },
-        "destination_city": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Destination City"
-        }
-      },
-      "required": [
-        "origin_address",
-        "destination_address"
-      ],
-      "title": "maps_direction_walking_by_addressArguments",
-      "type": "object"
-    }
-  },
-  {
-    "name": "maps_direction_walking_by_coordinates",
-    "description": "步行路径规划 API 可以根据输入起点终点经纬度坐标规划100km 以内的步行通勤方案，并且返回通勤方案的数据\n    \n    Args:\n        origin (str): 起点经纬度坐标，格式为\"经度,纬度\" (例如：\"116.434307,39.90909\")\n        destination (str): 终点经纬度坐标，格式为\"经度,纬度\" (例如：\"116.434307,39.90909\")\n        \n    Returns:\n        Dict[str, Any]: 包含距离、时长和详细导航信息的路线数据\n    \n\n【重要说明】该工具要求传入精确的经纬度坐标（格式：'经度,纬度'）。如果你只有文字地址（如 '文化东路42号'），你必须先调用 maps_geo 获取坐标，严禁根据自身知识库猜测、编造或幻觉经纬度数字。",
-    "inputSchema": {
+      "type": "object",
       "properties": {
         "origin": {
-          "title": "Origin",
-          "type": "string"
+          "type": "string",
+          "description": "起点：文字地址（如 '北京市朝阳区阜通东大街6号'）或 '经度,纬度' 坐标"
         },
         "destination": {
-          "title": "Destination",
-          "type": "string"
+          "type": "string",
+          "description": "终点：格式同 origin"
+        },
+        "origin_city": {
+          "type": "string",
+          "description": "起点是文字地址、又可能重名时，填写起点所在城市（如 '济南市'）"
+        },
+        "destination_city": {
+          "type": "string",
+          "description": "终点是文字地址、又可能重名时，填写终点所在城市；跨城路线务必与 origin_city 区分"
         }
       },
       "required": [
         "origin",
         "destination"
-      ],
-      "title": "maps_direction_walking_by_coordinatesArguments",
-      "type": "object"
+      ]
     }
   },
   {
-    "name": "maps_direction_driving_by_address",
-    "description": "Plans a driving route between two locations using addresses. Unless you have a specific reason to use coordinates, it's recommended to use this tool.\n    \n    Args:\n        origin_address (str): Starting point address (e.g. \"北京市朝阳区阜通东大街6号\")\n        destination_address (str): Ending point address (e.g. \"北京市海淀区上地十街10号\")\n        origin_city (Optional[str]): Optional city name for the origin address to improve geocoding accuracy\n        destination_city (Optional[str]): Optional city name for the destination address to improve geocoding accuracy\n        \n    Returns:\n        Dict[str, Any]: Route information including distance, duration, and turn-by-turn instructions.\n        Considers traffic conditions and road restrictions.\n    ",
+    "name": "maps_route_walking",
+    "description": "步行路线规划（100km 以内）。起点、终点既可以是文字地址，也可以是'经度,纬度'坐标，无需先调用 maps_geo。返回总距离（米）、耗时（秒）和分步指引；起点或终点是文字地址时，另附 addresses 字段给出解析出的坐标。",
     "inputSchema": {
-      "properties": {
-        "origin_address": {
-          "title": "Origin Address",
-          "type": "string"
-        },
-        "destination_address": {
-          "title": "Destination Address",
-          "type": "string"
-        },
-        "origin_city": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Origin City"
-        },
-        "destination_city": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Destination City"
-        }
-      },
-      "required": [
-        "origin_address",
-        "destination_address"
-      ],
-      "title": "maps_direction_driving_by_addressArguments",
-      "type": "object"
-    }
-  },
-  {
-    "name": "maps_direction_driving_by_coordinates",
-    "description": "驾车路径规划 API 可以根据用户起终点经纬度坐标规划以小客车、轿车通勤出行的方案，并且返回通勤方案的数据\n    \n    Args:\n        origin (str): 起点经纬度坐标，格式为\"经度,纬度\" (例如：\"116.434307,39.90909\")\n        destination (str): 终点经纬度坐标，格式为\"经度,纬度\" (例如：\"116.434307,39.90909\")\n        \n    Returns:\n        Dict[str, Any]: 包含距离、时长和详细导航信息的路线数据\n    \n\n【重要说明】该工具要求传入精确的经纬度坐标（格式：'经度,纬度'）。如果你只有文字地址（如 '文化东路42号'），你必须先调用 maps_geo 获取坐标，严禁根据自身知识库猜测、编造或幻觉经纬度数字。",
-    "inputSchema": {
+      "type": "object",
       "properties": {
         "origin": {
-          "title": "Origin",
-          "type": "string"
+          "type": "string",
+          "description": "起点：文字地址（如 '北京市朝阳区阜通东大街6号'）或 '经度,纬度' 坐标"
         },
         "destination": {
-          "title": "Destination",
-          "type": "string"
+          "type": "string",
+          "description": "终点：格式同 origin"
+        },
+        "origin_city": {
+          "type": "string",
+          "description": "起点是文字地址、又可能重名时，填写起点所在城市（如 '济南市'）"
+        },
+        "destination_city": {
+          "type": "string",
+          "description": "终点是文字地址、又可能重名时，填写终点所在城市；跨城路线务必与 origin_city 区分"
         }
       },
       "required": [
         "origin",
         "destination"
-      ],
-      "title": "maps_direction_driving_by_coordinatesArguments",
-      "type": "object"
+      ]
     }
   },
   {
-    "name": "maps_direction_transit_integrated_by_address",
-    "description": "Plans a public transit route between two locations using addresses. Unless you have a specific reason to use coordinates, it's recommended to use this tool.\n    \n    Args:\n        origin_address (str): Starting point address (e.g. \"北京市朝阳区阜通东大街6号\")\n        destination_address (str): Ending point address (e.g. \"北京市海淀区上地十街10号\")\n        origin_city (str): City name for the origin address (required for cross-city transit)\n        destination_city (str): City name for the destination address (required for cross-city transit)\n        \n    Returns:\n        Dict[str, Any]: Route information including distance, duration, and detailed transit instructions.\n        Considers various public transit options including buses, subways, and trains.\n    ",
+    "name": "maps_route_driving",
+    "description": "驾车路线规划（小客车）。起点、终点既可以是文字地址，也可以是'经度,纬度'坐标，无需先调用 maps_geo。返回总距离（米）、耗时（秒）和分步指引；起点或终点是文字地址时，另附 addresses 字段给出解析出的坐标。",
     "inputSchema": {
+      "type": "object",
       "properties": {
-        "origin_address": {
-          "title": "Origin Address",
-          "type": "string"
+        "origin": {
+          "type": "string",
+          "description": "起点：文字地址（如 '北京市朝阳区阜通东大街6号'）或 '经度,纬度' 坐标"
         },
-        "destination_address": {
-          "title": "Destination Address",
-          "type": "string"
+        "destination": {
+          "type": "string",
+          "description": "终点：格式同 origin"
         },
         "origin_city": {
-          "title": "Origin City",
-          "type": "string"
+          "type": "string",
+          "description": "起点是文字地址、又可能重名时，填写起点所在城市（如 '济南市'）"
         },
         "destination_city": {
-          "title": "Destination City",
-          "type": "string"
+          "type": "string",
+          "description": "终点是文字地址、又可能重名时，填写终点所在城市；跨城路线务必与 origin_city 区分"
         }
       },
       "required": [
-        "origin_address",
-        "destination_address",
-        "origin_city",
-        "destination_city"
-      ],
-      "title": "maps_direction_transit_integrated_by_addressArguments",
-      "type": "object"
+        "origin",
+        "destination"
+      ]
     }
   },
   {
-    "name": "maps_direction_transit_integrated_by_coordinates",
-    "description": "根据用户起终点经纬度坐标规划综合各类公共（火车、公交、地铁）交通方式的通勤方案，并且返回通勤方案的数据，跨城场景下必须传起点城市与终点城市\n\n    Args:\n        origin (str): 起点经纬度坐标，格式为\"经度,纬度\" (例如：\"116.434307,39.90909\")\n        destination (str): 终点经纬度坐标，格式为\"经度,纬度\" (例如：\"116.434307,39.90909\")\n        city (str): 起点城市名称\n        cityd (str): 终点城市名称\n\n    Returns:\n        Dict[str, Any]: 包含距离、时长和详细公共交通信息的路线数据\n    \n\n【重要说明】该工具要求传入精确的经纬度坐标（格式：'经度,纬度'）。如果你只有文字地址（如 '文化东路42号'），你必须先调用 maps_geo 获取坐标，严禁根据自身知识库猜测、编造或幻觉经纬度数字。",
+    "name": "maps_route_transit",
+    "description": "公共交通（公交/地铁/火车）路线规划。起点、终点既可以是文字地址，也可以是'经度,纬度'坐标，无需先调用 maps_geo。origin_city（起点所在城市）必填；跨城出行时还要填 destination_city，同城可省略。返回若干换乘方案，每个含总耗时（秒）、步行距离（米），以及分段的步行指引和公交/地铁/火车线路与上下车站点；起点或终点是文字地址时，另附 addresses 字段给出解析出的坐标。",
     "inputSchema": {
+      "type": "object",
       "properties": {
         "origin": {
-          "title": "Origin",
-          "type": "string"
+          "type": "string",
+          "description": "起点：文字地址（如 '北京市朝阳区阜通东大街6号'）或 '经度,纬度' 坐标"
         },
         "destination": {
-          "title": "Destination",
-          "type": "string"
+          "type": "string",
+          "description": "终点：格式同 origin"
         },
-        "city": {
-          "title": "City",
-          "type": "string"
+        "origin_city": {
+          "type": "string",
+          "description": "起点所在城市，必填（如 '北京'）"
         },
-        "cityd": {
-          "title": "Cityd",
-          "type": "string"
+        "destination_city": {
+          "type": "string",
+          "description": "终点所在城市；跨城出行必填，同城可省略"
         }
       },
       "required": [
         "origin",
         "destination",
-        "city",
-        "cityd"
-      ],
-      "title": "maps_direction_transit_integrated_by_coordinatesArguments",
-      "type": "object"
+        "origin_city"
+      ]
     }
   },
   {
     "name": "maps_distance",
-    "description": "测量两个经纬度坐标之间的距离,支持驾车、步行以及球面距离测量\n\n【重要说明】该工具要求传入精确的经纬度坐标（格式：'经度,纬度'）。如果你只有文字地址（如 '文化东路42号'），你必须先调用 maps_geo 获取坐标，严禁根据自身知识库猜测、编造或幻觉经纬度数字。",
+    "description": "测距：计算一个或多个起点到同一个终点的距离（米）和耗时（秒）。起点、终点既可以是文字地址，也可以是'经度,纬度'坐标；origins 可用 '|' 连接多个起点（其中文字地址最多 10 个）。type：0 直线距离，1 驾车距离（默认），3 步行距离。results 按 origins 顺序返回，每项带 origin 便于对应；某个起点算不出来时该项会带 info。",
     "inputSchema": {
+      "type": "object",
       "properties": {
         "origins": {
-          "title": "Origins",
-          "type": "string"
+          "type": "string",
+          "description": "起点；多个用 '|' 连接，如 '116.48,39.99|望京SOHO'"
         },
         "destination": {
-          "title": "Destination",
-          "type": "string"
+          "type": "string",
+          "description": "终点：文字地址（如 '北京市朝阳区阜通东大街6号'）或 '经度,纬度' 坐标"
         },
         "type": {
-          "default": "1",
-          "title": "Type",
-          "type": "string"
+          "type": "string",
+          "description": "0=直线距离，1=驾车距离（默认），3=步行距离",
+          "enum": [
+            "0",
+            "1",
+            "3"
+          ]
+        },
+        "city": {
+          "type": "string",
+          "description": "位置是文字地址、又可能重名时，限定城市（对所有文字地址生效）"
         }
       },
       "required": [
         "origins",
         "destination"
-      ],
-      "title": "maps_distanceArguments",
-      "type": "object"
+      ]
     }
   },
   {
     "name": "maps_text_search",
-    "description": "关键词搜索 API 根据用户输入的关键字进行 POI 搜索，并返回相关的信息",
+    "description": "关键词 POI 搜索：按名称或类别找地点（如 '济南西站'、'西单 肯德基'），最多返回 20 条，每条含 id、name、address、location（'经度,纬度'）、type（可读的分类）。结果不含距离：要找'某处附近有哪些/最近的'请用 maps_around_search；需要距离可把 location 交给 maps_distance 或路线工具。",
     "inputSchema": {
+      "type": "object",
       "properties": {
         "keywords": {
-          "title": "Keywords",
-          "type": "string"
+          "type": "string",
+          "description": "搜索关键词"
         },
         "city": {
-          "default": "",
-          "title": "City",
-          "type": "string"
+          "type": "string",
+          "description": "限定城市名；不填则全国范围"
         },
         "citylimit": {
-          "default": "false",
-          "title": "Citylimit",
-          "type": "string"
+          "type": "string",
+          "description": "是否只返回 city 内的结果，默认 'false'",
+          "enum": [
+            "true",
+            "false"
+          ]
         }
       },
       "required": [
         "keywords"
-      ],
-      "title": "maps_text_searchArguments",
-      "type": "object"
+      ]
     }
   },
   {
     "name": "maps_around_search",
-    "description": "周边搜，根据用户传入关键词以及坐标location，搜索出radius半径范围的POI\n\n【重要说明】该工具要求传入精确的经纬度坐标（格式：'经度,纬度'）。如果你只有文字地址（如 '文化东路42号'），你必须先调用 maps_geo 获取坐标，严禁根据自身知识库猜测、编造或幻觉经纬度数字。",
+    "description": "周边 POI 搜索：以 location 为中心、radius 米为半径，按 keywords 搜索周边地点，最多返回 20 条。location 既可以是文字地址，也可以是'经度,纬度'坐标。每条结果自带 location、distance（距中心点的米数）和可读的 type（注意过滤掉不相关的类型，如公司企业），不必再逐个测距。",
     "inputSchema": {
+      "type": "object",
       "properties": {
         "location": {
-          "title": "Location",
-          "type": "string"
+          "type": "string",
+          "description": "搜索中心：文字地址（如 '北京市朝阳区阜通东大街6号'）或 '经度,纬度' 坐标"
         },
         "radius": {
-          "default": "1000",
-          "title": "Radius",
-          "type": "string"
+          "type": "integer",
+          "description": "搜索半径，单位米，默认 1000，最大 50000"
         },
         "keywords": {
-          "default": "",
-          "title": "Keywords",
-          "type": "string"
+          "type": "string",
+          "description": "搜索关键词，如 '菜市场'、'咖啡'"
+        },
+        "city": {
+          "type": "string",
+          "description": "中心是文字地址、又可能重名时，填写其所在城市"
         }
       },
       "required": [
         "location"
-      ],
-      "title": "maps_around_searchArguments",
-      "type": "object"
+      ]
     }
   },
   {
     "name": "maps_search_detail",
-    "description": "查询关键词搜或者周边搜获取到的POI ID的详细信息",
+    "description": "POI 详情：根据搜索结果里的 POI id 查询详细信息，返回 name、location、address、商圈、所在城市、type、别名、电话 tel，以及评分、人均消费、营业时间等（因商户而异，可能缺失）。",
     "inputSchema": {
+      "type": "object",
       "properties": {
         "id": {
-          "title": "Id",
-          "type": "string"
+          "type": "string",
+          "description": "POI 的 id，取自 maps_text_search 或 maps_around_search 的结果"
         }
       },
       "required": [
         "id"
-      ],
-      "title": "maps_search_detailArguments",
-      "type": "object"
+      ]
     }
   }
 ]

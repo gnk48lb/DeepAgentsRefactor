@@ -65,7 +65,7 @@ def test_b_specs():
     for name, tools in EXPECTED_TOOLS.items():
         got = [t.name for t in by_name[name]["tools"]]
         assert got == tools, f"{name} 工具不一致: {got} != {tools}"
-    assert len(by_name["MapAgent"]["tools"]) == 16, "MapAgent 应挂载 16 个高德工具"
+    assert len(by_name["MapAgent"]["tools"]) == 12, "MapAgent 应挂载 12 个高德工具"
     assert by_name["CodeAgent"].get("skills") == ["/skills/"], by_name["CodeAgent"].get("skills")
     for name in ("KnowledgeAgent", "MediaAgent", "MapAgent", "BrowserAgent"):
         assert not by_name[name].get("skills"), f"{name} 不应挂 skills"

@@ -4,65 +4,64 @@
     "destination": "116.470293,39.996171",
     "paths": [
       {
-        "path": null,
         "distance": "2130",
-        "duration": "508",
+        "duration": "640",
         "steps": [
           {
             "instruction": "向西南行驶100米向左前方行驶",
             "road": null,
             "distance": "100",
             "orientation": "西南",
-            "duration": "39"
+            "duration": "29"
           },
           {
             "instruction": "向西南行驶76米右转进入主路",
             "road": null,
             "distance": "76",
             "orientation": "西南",
-            "duration": "48"
+            "duration": "25"
           },
           {
             "instruction": "沿阜荣街向西北行驶102米左转进入主路",
             "road": "阜荣街",
             "distance": "102",
             "orientation": "西北",
-            "duration": "38"
+            "duration": "83"
           },
           {
             "instruction": "沿阜通东大街向西南行驶249米右转进入主路",
             "road": "阜通东大街",
             "distance": "249",
             "orientation": "西南",
-            "duration": "69"
+            "duration": "62"
           },
           {
             "instruction": "沿广顺南大街途径广顺北大街向西北行驶1.3千米右转进入主路",
             "road": "广顺南大街",
             "distance": "1343",
             "orientation": "西北",
-            "duration": "223"
+            "duration": "335"
           },
           {
             "instruction": "沿宏昌路向东北行驶93米右转",
             "road": "宏昌路",
             "distance": "93",
             "orientation": "东北",
-            "duration": "19"
+            "duration": "26"
           },
           {
             "instruction": "向东南行驶108米右转",
             "road": null,
             "distance": "108",
             "orientation": "东南",
-            "duration": "43"
+            "duration": "46"
           },
           {
             "instruction": "向西南行驶20米左转",
             "road": null,
             "distance": "20",
             "orientation": "西南",
-            "duration": "15"
+            "duration": "20"
           },
           {
             "instruction": "向东南行驶39米到达目的地",

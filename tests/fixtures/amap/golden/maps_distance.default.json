@@ -2,9 +2,9 @@
   "results": [
     {
       "origin_id": "1",
-      "dest_id": "1",
+      "origin": "116.481488,39.990464",
       "distance": "1181",
-      "duration": "294"
+      "duration": "505"
     }
   ]
 }

@@ -5,7 +5,7 @@
     "distance": "1635",
     "transits": [
       {
-        "duration": "1900",
+        "duration": "2081",
         "walking_distance": "699",
         "segments": [
           {
@@ -63,7 +63,7 @@
                     "name": "望京西园四区"
                   },
                   "distance": "2093",
-                  "duration": "1217",
+                  "duration": "1398",
                   "via_stops": [
                     {
                       "name": "国风北京"
@@ -178,7 +178,7 @@
         ]
       },
       {
-        "duration": "1777",
+        "duration": "1619",
         "walking_distance": "984",
         "segments": [
           {
@@ -186,7 +186,7 @@
               "origin": "116.482269,39.990372",
               "destination": "116.484016,39.994343",
               "distance": "541",
-              "duration": "525",
+              "duration": "520",
               "steps": [
                 {
                   "instruction": "步行46米左转",
@@ -229,7 +229,7 @@
                     "name": "望京西园四区"
                   },
                   "distance": "1307",
-                  "duration": "805",
+                  "duration": "652",
                   "via_stops": [
                     {
                       "name": "融科橄榄城"
@@ -341,7 +341,7 @@
         ]
       },
       {
-        "duration": "1712",
+        "duration": "1710",
         "walking_distance": "1061",
         "segments": [
           {
@@ -349,7 +349,7 @@
               "origin": "116.482269,39.990372",
               "destination": "116.485229,39.991016",
               "distance": "570",
-              "duration": "553",
+              "duration": "548",
               "steps": [
                 {
                   "instruction": "步行46米左转",
@@ -392,7 +392,7 @@
                     "name": "望京街西口"
                   },
                   "distance": "1366",
-                  "duration": "674",
+                  "duration": "677",
                   "via_stops": []
                 },
                 {
@@ -404,7 +404,7 @@
                     "name": "望京街西口"
                   },
                   "distance": "1366",
-                  "duration": "674",
+                  "duration": "677",
                   "via_stops": []
                 }
               ]
@@ -502,89 +502,61 @@
         ]
       },
       {
-        "duration": "1862",
-        "walking_distance": "1214",
+        "duration": "1934",
+        "walking_distance": "1065",
         "segments": [
           {
             "walking": {
               "origin": "116.482269,39.990372",
-              "destination": "116.474907,39.989853",
-              "distance": "856",
-              "duration": "780",
+              "destination": "116.476578,39.987339",
+              "distance": "707",
+              "duration": "646",
               "steps": [
                 {
-                  "instruction": "步行100米右转",
+                  "instruction": "步行181米右转",
                   "road": [],
-                  "distance": "100",
+                  "distance": "181",
                   "action": "右转",
                   "assistant_action": []
                 },
                 {
-                  "instruction": "步行34米左转",
-                  "road": [],
-                  "distance": "34",
+                  "instruction": "沿阜荣街辅路步行135米左转",
+                  "road": "阜荣街辅路",
+                  "distance": "135",
                   "action": "左转",
                   "assistant_action": []
                 },
                 {
-                  "instruction": "步行56米右转",
-                  "road": [],
-                  "distance": "56",
-                  "action": "右转",
-                  "assistant_action": []
-                },
-                {
-                  "instruction": "步行47米左转",
-                  "road": [],
-                  "distance": "47",
-                  "action": "左转",
-                  "assistant_action": []
-                },
-                {
-                  "instruction": "沿阜通东大街辅路步行296米右转",
+                  "instruction": "沿阜通东大街辅路步行391米到达阜通东大街",
                   "road": "阜通东大街辅路",
-                  "distance": "296",
-                  "action": "右转",
-                  "assistant_action": []
-                },
-                {
-                  "instruction": "沿广顺南大街辅路步行323米到达望花路东里",
-                  "road": "广顺南大街辅路",
-                  "distance": "323",
+                  "distance": "391",
                   "action": [],
-                  "assistant_action": "到达望花路东里"
+                  "assistant_action": "到达阜通东大街"
                 }
               ]
             },
             "bus": {
               "buslines": [
                 {
-                  "name": "451路(黄厂路--来广营北)",
+                  "name": "404路(东直门枢纽站--来广营西桥东)",
                   "departure_stop": {
-                    "name": "望花路东里"
+                    "name": "阜通东大街"
                   },
                   "arrival_stop": {
                     "name": "大西洋新城东门"
                   },
-                  "distance": "901",
-                  "duration": "738",
+                  "distance": "2307",
+                  "duration": "944",
                   "via_stops": [
                     {
-                      "name": "地铁阜通站"
-                    }
-                  ]
-                },
-                {
-                  "name": "593路(环行铁道--地铁北苑路北站)",
-                  "departure_stop": {
-                    "name": "望花路东里"
-                  },
-                  "arrival_stop": {
-                    "name": "大西洋新城东门"
-                  },
-                  "distance": "900",
-                  "duration": "738",
-                  "via_stops": [
+                      "name": "望京医院"
+                    },
+                    {
+                      "name": "花家地北里"
+                    },
+                    {
+                      "name": "望花路"
+                    },
                     {
                       "name": "地铁阜通站"
                     }
@@ -671,61 +643,89 @@
         ]
       },
       {
-        "duration": "2004",
-        "walking_distance": "1065",
+        "duration": "1872",
+        "walking_distance": "1214",
         "segments": [
           {
             "walking": {
               "origin": "116.482269,39.990372",
-              "destination": "116.476578,39.987339",
-              "distance": "707",
-              "duration": "646",
+              "destination": "116.474907,39.989853",
+              "distance": "856",
+              "duration": "780",
               "steps": [
                 {
-                  "instruction": "步行181米右转",
+                  "instruction": "步行100米右转",
                   "road": [],
-                  "distance": "181",
+                  "distance": "100",
                   "action": "右转",
                   "assistant_action": []
                 },
                 {
-                  "instruction": "沿阜荣街辅路步行135米左转",
-                  "road": "阜荣街辅路",
-                  "distance": "135",
+                  "instruction": "步行34米左转",
+                  "road": [],
+                  "distance": "34",
                   "action": "左转",
                   "assistant_action": []
                 },
                 {
-                  "instruction": "沿阜通东大街辅路步行391米到达阜通东大街",
+                  "instruction": "步行56米右转",
+                  "road": [],
+                  "distance": "56",
+                  "action": "右转",
+                  "assistant_action": []
+                },
+                {
+                  "instruction": "步行47米左转",
+                  "road": [],
+                  "distance": "47",
+                  "action": "左转",
+                  "assistant_action": []
+                },
+                {
+                  "instruction": "沿阜通东大街辅路步行296米右转",
                   "road": "阜通东大街辅路",
-                  "distance": "391",
+                  "distance": "296",
+                  "action": "右转",
+                  "assistant_action": []
+                },
+                {
+                  "instruction": "沿广顺南大街辅路步行323米到达望花路东里",
+                  "road": "广顺南大街辅路",
+                  "distance": "323",
                   "action": [],
-                  "assistant_action": "到达阜通东大街"
+                  "assistant_action": "到达望花路东里"
                 }
               ]
             },
             "bus": {
               "buslines": [
                 {
-                  "name": "404路(东直门枢纽站--来广营西桥东)",
+                  "name": "593路(环行铁道--地铁北苑路北站)",
                   "departure_stop": {
-                    "name": "阜通东大街"
+                    "name": "望花路东里"
                   },
                   "arrival_stop": {
                     "name": "大西洋新城东门"
                   },
-                  "distance": "2307",
-                  "duration": "1014",
+                  "distance": "900",
+                  "duration": "748",
                   "via_stops": [
                     {
-                      "name": "望京医院"
-                    },
-                    {
-                      "name": "花家地北里"
-                    },
-                    {
-                      "name": "望花路"
-                    },
+                      "name": "地铁阜通站"
+                    }
+                  ]
+                },
+                {
+                  "name": "451路(黄厂路--来广营北)",
+                  "departure_stop": {
+                    "name": "望花路东里"
+                  },
+                  "arrival_stop": {
+                    "name": "大西洋新城东门"
+                  },
+                  "distance": "901",
+                  "duration": "748",
+                  "via_stops": [
                     {
                       "name": "地铁阜通站"
                     }

@@ -1,9 +1,83 @@
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Awaitable, Callable, Dict, Optional
+
 from app.tools.amap import client
+
+_COORD_RE = re.compile(r"^-?\d+(?:\.\d+)?,-?\d+(?:\.\d+)?$")
+_MAX_GEOCODED_ORIGINS = 10  # maps_distance 一次最多自动地理编码的文字地址个数（防止打爆高德 QPS）
+
+
+def normalize_coordinates(val: Any) -> Optional[str]:
+    """'经度,纬度' → 规整后的字符串：去空白、全角逗号转半角、小数位超过 6 位时四舍五入（高德要求 ≤6 位）。
+    不是坐标返回 None。"""
+    if not isinstance(val, str):
+        return None
+    s = re.sub(r"\s+", "", val).replace("，", ",")
+    if not _COORD_RE.match(s):
+        return None
+    out = []
+    for p in s.split(","):
+        if "." in p and len(p.split(".")[1]) > 6:
+            p = f"{float(p):.6f}"
+        out.append(p)
+    return ",".join(out)
+
+
+def is_coordinates(val: Any) -> bool:
+    return normalize_coordinates(val) is not None
+
+
+def _city_key(cand: dict) -> tuple:
+    p, c = cand.get("province"), cand.get("city")  # 高德用 [] 表示空值
+    return (p if isinstance(p, str) else "", c if isinstance(c, str) else "")
+
+
+def _city_label(key: tuple) -> str:
+    p, c = key
+    return p + c if c and c != p else (p or c)
+
+
+async def _geocode(text: str, city: Optional[str], label: str) -> tuple[Optional[dict], Optional[str]]:
+    """文字地址 → 第一个候选。没给城市且候选横跨多个城市时拒绝（不要悄悄取第一个）。返回 (候选, 错误信息)。"""
+    city = (city or "").strip() or None
+    geo = await maps_geo(text, city)
+    if "error" in geo:
+        return None, f"Failed to geocode {label} '{text}': {geo['error']}"
+    cands = geo.get("return") or []
+    if not cands:
+        return None, f"No geocoding results found for {label} '{text}'"
+    if city is None:
+        keys = list(dict.fromkeys(_city_key(c) for c in cands))
+        if len(keys) > 1:
+            names = "、".join(_city_label(k) for k in keys[:4])
+            return None, (
+                f"{label} '{text}' 有歧义：匹配到多个城市（{names}）。"
+                f"请在地址里写明城市，或填写对应的城市参数后重试。"
+            )
+    if not cands[0].get("location"):
+        return None, f"Could not extract coordinates for {label} '{text}'"
+    return cands[0], None
+
+
+async def _resolve_location(
+    val: str, city: Optional[str], label: str
+) -> tuple[Optional[str], Optional[str], bool]:
+    """坐标直接规整，文字地址自动地理编码。返回 (坐标, 错误信息, 是否做了地理编码)。"""
+    coord = normalize_coordinates(val)
+    if coord:
+        return coord, None, False
+    text = (val or "").strip() if isinstance(val, str) else ""
+    if not text:
+        return None, f"{label} 不能为空", False
+    cand, err = await _geocode(text, city, label)
+    if err:
+        return None, err, True
+    return cand["location"], None, True
 
 
 async def maps_regeocode(location: str) -> Dict[str, Any]:
-    data, err = await client.get("/v3/geocode/regeo", {"location": location})
+    loc = normalize_coordinates(location) or location
+    data, err = await client.get("/v3/geocode/regeo", {"location": loc})
     if err:
         return {"error": err}
     if data["status"] != "1":
@@ -58,7 +132,15 @@ async def maps_ip_location(ip: str) -> Dict[str, Any]:
 
 
 async def maps_weather(city: str) -> Dict[str, Any]:
-    data, err = await client.get("/v3/weather/weatherInfo", {"city": city, "extensions": "all"})
+    code = (city or "").strip()
+    if not re.fullmatch(r"\d{6}", code):  # 高德天气接口官方只认 adcode：名称先自动解析
+        cand, err = await _geocode(code, None, "city")
+        if err:
+            return {"error": err}
+        code = cand.get("adcode")
+        if not isinstance(code, str) or not code:
+            return {"error": f"Could not resolve adcode for city '{city}'"}
+    data, err = await client.get("/v3/weather/weatherInfo", {"city": code, "extensions": "all"})
     if err:
         return {"error": err}
     if data["status"] != "1":
@@ -66,20 +148,17 @@ async def maps_weather(city: str) -> Dict[str, Any]:
     forecasts = data.get("forecasts", [])
     if not forecasts:
         return {"error": "No forecast data available"}
-    return {
-        "city": forecasts[0]["city"],
-        "forecasts": forecasts[0]["casts"],
-    }
+    return {"city": forecasts[0]["city"], "forecasts": forecasts[0]["casts"]}
 
 
-async def maps_bicycling_by_coordinates(
-    origin_coordinates: str, destination_coordinates: str
+async def _bicycling_by_coordinates(
+    origin: str, destination: str
 ) -> Dict[str, Any]:
     data, err = await client.get(
         "/v4/direction/bicycling",
         {
-            "origin": origin_coordinates,
-            "destination": destination_coordinates,
+            "origin": origin,
+            "destination": destination,
         },
     )
     if err:
@@ -114,49 +193,7 @@ async def maps_bicycling_by_coordinates(
     }
 
 
-async def maps_bicycling_by_address(
-    origin_address: str,
-    destination_address: str,
-    origin_city: Optional[str] = None,
-    destination_city: Optional[str] = None,
-) -> Dict[str, Any]:
-    try:
-        origin_result = await maps_geo(origin_address, origin_city)
-        if "error" in origin_result:
-            return {"error": f"Failed to geocode origin address: {origin_result['error']}"}
-        if not origin_result.get("return") or not origin_result["return"]:
-            return {"error": "No geocoding results found for origin address"}
-        origin_location = origin_result["return"][0].get("location")
-        if not origin_location:
-            return {"error": "Could not extract coordinates from origin geocoding result"}
-
-        destination_result = await maps_geo(destination_address, destination_city)
-        if "error" in destination_result:
-            return {"error": f"Failed to geocode destination address: {destination_result['error']}"}
-        if not destination_result.get("return") or not destination_result["return"]:
-            return {"error": "No geocoding results found for destination address"}
-        destination_location = destination_result["return"][0].get("location")
-        if not destination_location:
-            return {"error": "Could not extract coordinates from destination geocoding result"}
-
-        route_result = await maps_bicycling_by_coordinates(origin_location, destination_location)
-        if "error" not in route_result:
-            route_result["addresses"] = {
-                "origin": {
-                    "address": origin_address,
-                    "coordinates": origin_location,
-                },
-                "destination": {
-                    "address": destination_address,
-                    "coordinates": destination_location,
-                },
-            }
-        return route_result
-    except Exception as e:
-        return {"error": f"Route planning failed: {str(e)}"}
-
-
-async def maps_direction_walking_by_coordinates(
+async def _walking_by_coordinates(
     origin: str, destination: str
 ) -> Dict[str, Any]:
     data, err = await client.get(
@@ -195,49 +232,7 @@ async def maps_direction_walking_by_coordinates(
     }
 
 
-async def maps_direction_walking_by_address(
-    origin_address: str,
-    destination_address: str,
-    origin_city: Optional[str] = None,
-    destination_city: Optional[str] = None,
-) -> Dict[str, Any]:
-    try:
-        origin_result = await maps_geo(origin_address, origin_city)
-        if "error" in origin_result:
-            return {"error": f"Failed to geocode origin address: {origin_result['error']}"}
-        if not origin_result.get("return") or not origin_result["return"]:
-            return {"error": "No geocoding results found for origin address"}
-        origin_location = origin_result["return"][0].get("location")
-        if not origin_location:
-            return {"error": "Could not extract coordinates from origin geocoding result"}
-
-        destination_result = await maps_geo(destination_address, destination_city)
-        if "error" in destination_result:
-            return {"error": f"Failed to geocode destination address: {destination_result['error']}"}
-        if not destination_result.get("return") or not destination_result["return"]:
-            return {"error": "No geocoding results found for destination address"}
-        destination_location = destination_result["return"][0].get("location")
-        if not destination_location:
-            return {"error": "Could not extract coordinates from destination geocoding result"}
-
-        route_result = await maps_direction_walking_by_coordinates(origin_location, destination_location)
-        if "error" not in route_result:
-            route_result["addresses"] = {
-                "origin": {
-                    "address": origin_address,
-                    "coordinates": origin_location,
-                },
-                "destination": {
-                    "address": destination_address,
-                    "coordinates": destination_location,
-                },
-            }
-        return route_result
-    except Exception as e:
-        return {"error": f"Route planning failed: {str(e)}"}
-
-
-async def maps_direction_driving_by_coordinates(
+async def _driving_by_coordinates(
     origin: str, destination: str
 ) -> Dict[str, Any]:
     data, err = await client.get(
@@ -262,7 +257,6 @@ async def maps_direction_driving_by_coordinates(
         ]
         paths.append(
             {
-                "path": path.get("path"),
                 "distance": path.get("distance"),
                 "duration": path.get("duration"),
                 "steps": steps,
@@ -277,49 +271,7 @@ async def maps_direction_driving_by_coordinates(
     }
 
 
-async def maps_direction_driving_by_address(
-    origin_address: str,
-    destination_address: str,
-    origin_city: Optional[str] = None,
-    destination_city: Optional[str] = None,
-) -> Dict[str, Any]:
-    try:
-        origin_result = await maps_geo(origin_address, origin_city)
-        if "error" in origin_result:
-            return {"error": f"Failed to geocode origin address: {origin_result['error']}"}
-        if not origin_result.get("return") or not origin_result["return"]:
-            return {"error": "No geocoding results found for origin address"}
-        origin_location = origin_result["return"][0].get("location")
-        if not origin_location:
-            return {"error": "Could not extract coordinates from origin geocoding result"}
-
-        destination_result = await maps_geo(destination_address, destination_city)
-        if "error" in destination_result:
-            return {"error": f"Failed to geocode destination address: {destination_result['error']}"}
-        if not destination_result.get("return") or not destination_result["return"]:
-            return {"error": "No geocoding results found for destination address"}
-        destination_location = destination_result["return"][0].get("location")
-        if not destination_location:
-            return {"error": "Could not extract coordinates from destination geocoding result"}
-
-        route_result = await maps_direction_driving_by_coordinates(origin_location, destination_location)
-        if "error" not in route_result:
-            route_result["addresses"] = {
-                "origin": {
-                    "address": origin_address,
-                    "coordinates": origin_location,
-                },
-                "destination": {
-                    "address": destination_address,
-                    "coordinates": destination_location,
-                },
-            }
-        return route_result
-    except Exception as e:
-        return {"error": f"Route planning failed: {str(e)}"}
-
-
-async def maps_direction_transit_integrated_by_coordinates(
+async def _transit_by_coordinates(
     origin: str, destination: str, city: str, cityd: str
 ) -> Dict[str, Any]:
     data, err = await client.get(
@@ -448,71 +400,136 @@ async def maps_direction_transit_integrated_by_coordinates(
     }
 
 
-async def maps_direction_transit_integrated_by_address(
-    origin_address: str,
-    destination_address: str,
-    origin_city: str,
-    destination_city: str,
+async def _route(
+    coord_fn: Callable[[str, str], Awaitable[Dict[str, Any]]],
+    origin: str,
+    destination: str,
+    origin_city: Optional[str],
+    destination_city: Optional[str],
 ) -> Dict[str, Any]:
     try:
-        origin_result = await maps_geo(origin_address, origin_city)
-        if "error" in origin_result:
-            return {"error": f"Failed to geocode origin address: {origin_result['error']}"}
-        if not origin_result.get("return") or not origin_result["return"]:
-            return {"error": "No geocoding results found for origin address"}
-        origin_location = origin_result["return"][0].get("location")
-        if not origin_location:
-            return {"error": "Could not extract coordinates from origin geocoding result"}
-
-        destination_result = await maps_geo(destination_address, destination_city)
-        if "error" in destination_result:
-            return {"error": f"Failed to geocode destination address: {destination_result['error']}"}
-        if not destination_result.get("return") or not destination_result["return"]:
-            return {"error": "No geocoding results found for destination address"}
-        destination_location = destination_result["return"][0].get("location")
-        if not destination_location:
-            return {"error": "Could not extract coordinates from destination geocoding result"}
-
-        route_result = await maps_direction_transit_integrated_by_coordinates(
-            origin_location, destination_location, origin_city, destination_city
-        )
-        if "error" not in route_result:
-            route_result["addresses"] = {
-                "origin": {
-                    "address": origin_address,
-                    "coordinates": origin_location,
-                },
-                "destination": {
-                    "address": destination_address,
-                    "coordinates": destination_location,
-                },
-            }
-        return route_result
+        o_loc, err, o_geo = await _resolve_location(origin, origin_city, "origin")
+        if err:
+            return {"error": err}
+        d_loc, err, d_geo = await _resolve_location(destination, destination_city, "destination")
+        if err:
+            return {"error": err}
+        result = await coord_fn(o_loc, d_loc)
+        if "error" not in result and (o_geo or d_geo):
+            addresses: Dict[str, Any] = {}
+            if o_geo:
+                addresses["origin"] = {"address": origin, "coordinates": o_loc}
+            if d_geo:
+                addresses["destination"] = {"address": destination, "coordinates": d_loc}
+            result["addresses"] = addresses
+        return result
     except Exception as e:
-        return {"error": f"Route planning failed: {str(e)}"}
+        return {"error": f"Route planning failed: {e}"}
+
+
+async def maps_route_walking(
+    origin: str, destination: str, origin_city: Optional[str] = None, destination_city: Optional[str] = None
+) -> Dict[str, Any]:
+    return await _route(_walking_by_coordinates, origin, destination, origin_city, destination_city)
+
+
+async def maps_route_bicycling(
+    origin: str, destination: str, origin_city: Optional[str] = None, destination_city: Optional[str] = None
+) -> Dict[str, Any]:
+    return await _route(_bicycling_by_coordinates, origin, destination, origin_city, destination_city)
+
+
+async def maps_route_driving(
+    origin: str, destination: str, origin_city: Optional[str] = None, destination_city: Optional[str] = None
+) -> Dict[str, Any]:
+    return await _route(_driving_by_coordinates, origin, destination, origin_city, destination_city)
+
+
+async def maps_route_transit(
+    origin: str, destination: str, origin_city: str = "", destination_city: Optional[str] = None
+) -> Dict[str, Any]:
+    o_city = (origin_city or "").strip()
+    if not o_city:
+        return {"error": "origin_city 不能为空：公共交通规划必须提供起点所在城市（跨城还要提供 destination_city）"}
+    d_city = (destination_city or "").strip() or o_city
+
+    async def _fn(o: str, d: str) -> Dict[str, Any]:
+        return await _transit_by_coordinates(o, d, o_city, d_city)
+
+    return await _route(_fn, origin, destination, o_city, d_city)
 
 
 async def maps_distance(
-    origins: str, destination: str, type: str = "1"
+    origins: str, destination: str, type: str = "1", city: Optional[str] = None
 ) -> Dict[str, Any]:
-    data, err = await client.get(
-        "/v3/distance",
-        {"origins": origins, "destination": destination, "type": type},
-    )
+    parts = [p.strip() for p in str(origins).split("|") if p.strip()]
+    if not parts:
+        return {"error": "origins 不能为空"}
+    if sum(1 for p in parts if not is_coordinates(p)) > _MAX_GEOCODED_ORIGINS:
+        return {"error": f"origins 里的文字地址最多 {_MAX_GEOCODED_ORIGINS} 个，请改传坐标或分批查询"}
+    resolved = []
+    for i, part in enumerate(parts, 1):
+        loc, err, _ = await _resolve_location(part, city, f"origin #{i}")
+        if err:
+            return {"error": err}
+        resolved.append(loc)
+    dest_loc, err, _ = await _resolve_location(destination, city, "destination")
     if err:
         return {"error": err}
+
+    data, http_err = await client.get(
+        "/v3/distance",
+        {"origins": "|".join(resolved), "destination": dest_loc, "type": str(type)},
+    )
+    if http_err:
+        return {"error": http_err}
     if data["status"] != "1":
         return {"error": f"Direction Distance failed: {data.get('info') or data.get('infocode')}"}
-    results = [
-        {
-            "origin_id": result.get("origin_id"),
-            "dest_id": result.get("dest_id"),
-            "distance": result.get("distance"),
-            "duration": result.get("duration"),
+    results = []
+    for r in data["results"]:
+        try:
+            idx = int(r.get("origin_id")) - 1
+        except (TypeError, ValueError):
+            idx = -1
+        item = {
+            "origin_id": r.get("origin_id"),
+            "origin": parts[idx] if 0 <= idx < len(parts) else None,
+            "distance": r.get("distance"),
+            "duration": r.get("duration"),
         }
-        for result in data["results"]
-    ]
+        if r.get("info"):  # 单个起点算不出来时高德会在该项里给 info/code，别把它显示成 0 米
+            item["info"] = r["info"]
+            item["code"] = r.get("code")
+        results.append(item)
     return {"results": results}
+
+
+async def maps_around_search(
+    location: str, radius: int | str = 1000, keywords: str = "", city: Optional[str] = None
+) -> Dict[str, Any]:
+    loc, err, _ = await _resolve_location(location, city, "location")
+    if err:
+        return {"error": err}
+    data, http_err = await client.get(
+        "/v3/place/around",
+        {"location": loc, "radius": str(int(float(radius))), "keywords": keywords},
+    )
+    if http_err:
+        return {"error": http_err}
+    if data["status"] != "1":
+        return {"error": f"Around Search failed: {data.get('info') or data.get('infocode')}"}
+    pois = [
+        {
+            "id": poi.get("id"),
+            "name": poi.get("name"),
+            "address": poi.get("address"),
+            "location": poi.get("location"),
+            "distance": poi.get("distance"),
+            "type": poi.get("type"),
+        }
+        for poi in data.get("pois", [])
+    ]
+    return {"pois": pois}
 
 
 async def maps_text_search(
@@ -535,7 +552,8 @@ async def maps_text_search(
             "id": poi.get("id"),
             "name": poi.get("name"),
             "address": poi.get("address"),
-            "typecode": poi.get("typecode"),
+            "location": poi.get("location"),
+            "type": poi.get("type"),
         }
         for poi in data.get("pois", [])
     ]
@@ -546,29 +564,6 @@ async def maps_text_search(
         },
         "pois": pois,
     }
-
-
-async def maps_around_search(
-    location: str, radius: str = "1000", keywords: str = ""
-) -> Dict[str, Any]:
-    data, err = await client.get(
-        "/v3/place/around",
-        {"location": location, "radius": radius, "keywords": keywords},
-    )
-    if err:
-        return {"error": err}
-    if data["status"] != "1":
-        return {"error": f"Around Search failed: {data.get('info') or data.get('infocode')}"}
-    pois = [
-        {
-            "id": poi.get("id"),
-            "name": poi.get("name"),
-            "address": poi.get("address"),
-            "typecode": poi.get("typecode"),
-        }
-        for poi in data.get("pois", [])
-    ]
-    return {"pois": pois}
 
 
 async def maps_search_detail(id: str) -> Dict[str, Any]:
@@ -585,6 +580,7 @@ async def maps_search_detail(id: str) -> Dict[str, Any]:
         "name": poi.get("name"),
         "location": poi.get("location"),
         "address": poi.get("address"),
+        "tel": poi.get("tel"),
         "business_area": poi.get("business_area"),
         "city": poi.get("cityname"),
         "type": poi.get("type"),
