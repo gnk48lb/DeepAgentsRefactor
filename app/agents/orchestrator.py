@@ -33,6 +33,7 @@ def _register_harness_profiles():
             register_harness_profile(
                 _provider,
                 HarnessProfile(
+                    # 禁用框架内置 general-purpose（它会继承主管的全部工具）；本项目不再提供兜底子专家。
                     general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
                     excluded_tools=frozenset({"write_file", "edit_file", "delete", "execute", "ls", "glob", "grep"}),
                 ),
@@ -47,17 +48,6 @@ try:
     from langchain.agents.middleware import ToolCallLimitMiddleware
 except ImportError:
     ToolCallLimitMiddleware = None
-
-
-_GENERAL_PURPOSE = {
-    "name": "general-purpose",
-    "description": "仅当用户请求明显不属于以上任何专家范围时才使用，绝大多数情况不应该被调用。",
-    "system_prompt": (
-        "如果你被调用，说明主 Agent 判断这个任务不属于任何专属领域专家的范围。"
-        "请如实告知用户无法处理这类请求，不要尝试执行任何工具操作或猜测性回答。"
-    ),
-    "tools": [],
-}
 
 
 _DECLARATIVE_SPECS = [
@@ -141,11 +131,6 @@ async def build_main_agent(
     file_subagent, desktop_subagent = await _local_subagents()
     subagents.append(file_subagent)
     subagents.append(desktop_subagent)
-
-    # 显式覆盖框架内置的 general-purpose subagent
-    gp_subagent = dict(_GENERAL_PURPOSE)
-    gp_subagent["model"] = models.worker_llm
-    subagents.append(gp_subagent)
 
     # 断言除 FileAgent 外，任何声明式子 Agent 的工具列表都不得包含 convert_to_markdown
     for sa in subagents:

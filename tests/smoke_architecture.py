@@ -270,7 +270,7 @@ def test_e_expert_spec_table():
     from app.agents.skills import SKILLS_ROUTE
 
     expected_specs = [
-        (knowledge_agent.SPEC, "KnowledgeAgent", "vlm", ["rag", "web_search", "get_current_time"], ()),
+        (knowledge_agent.SPEC, "KnowledgeAgent", "vlm", ["rag", "web_search"], ()),
         (media_agent.SPEC, "MediaAgent", "worker_llm", ["av_graph_rag", "execute_sql"], ()),
         (code_agent.SPEC, "CodeAgent", "worker_llm", ["execute_python_code"], (SKILLS_ROUTE,)),
         (

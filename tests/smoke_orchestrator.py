@@ -3,7 +3,7 @@ tests/smoke_orchestrator.py
 
 编排层装配离线冒烟测试:桩掉 MCP 子进程,用真实的 prompt / 工具 / 专家规格装配主 Agent。
   A subagents 顺序(task 工具向 LLM 展示的顺序)
-  B 各声明式专家的工具名顺序 / skills 与规格表一致;general-purpose 无工具
+  B 各声明式专家的工具名顺序 / skills 与规格表一致
   C 生产模型(ChatGoogleGenerativeAI)解析到的 HarnessProfile 仍排除 write_file/edit_file/delete/execute,
     并且禁用了内置 general-purpose。这是防止 LLM 通过 /skills/ 路由写真实磁盘的唯一屏障,
     deepagents 升级后一旦失效必须立刻暴露。
@@ -22,13 +22,12 @@ from app.infra import mcp_service, models  # noqa: E402
 from app.agents import orchestrator  # noqa: E402
 
 EXPECTED_ORDER = ["KnowledgeAgent", "MediaAgent", "MapAgent", "CodeAgent",
-                  "BrowserAgent", "FileAgent", "DesktopAgent", "general-purpose"]
+                  "BrowserAgent", "FileAgent", "DesktopAgent"]
 EXPECTED_TOOLS = {
-    "KnowledgeAgent": ["rag", "web_search", "get_current_time"],
+    "KnowledgeAgent": ["rag", "web_search"],
     "MediaAgent": ["av_graph_rag", "execute_sql"],
     "CodeAgent": ["execute_python_code"],
     "BrowserAgent": ["read_webpage_content", "get_bilibili_profile", "execute_complex_browser_action"],
-    "general-purpose": [],
 }
 BANNED = {"write_file", "edit_file", "delete", "execute", "ls", "glob", "grep"}
 
@@ -94,16 +93,15 @@ def test_d_time_tool_and_budgets():
     # 主管直接挂载 get_current_time
     assert [t.name for t in _captured["tools"]] == ["get_current_time"], _captured.get("tools")
 
-    # 配置表覆盖全部专家（不含 general-purpose）；声明式专家各挂 [软停止, 硬停止]
+    # 配置表覆盖全部专家；声明式专家各挂 [软停止, 硬停止]
     by_name = {_name(s): s for s in _captured["subagents"]}
-    expert_names = set(EXPECTED_ORDER) - {"general-purpose"}
+    expert_names = set(EXPECTED_ORDER)
     assert set(config.SUBAGENT_TOOL_LIMITS) == expert_names, set(config.SUBAGENT_TOOL_LIMITS) ^ expert_names
     for name in ("KnowledgeAgent", "MediaAgent", "MapAgent", "CodeAgent", "BrowserAgent"):
         mws = by_name[name]["middleware"]
         assert [type(m) for m in mws] == [ToolCallLimitMiddleware, ModelCallLimitMiddleware], name
         limit = config.SUBAGENT_TOOL_LIMITS[name]
         assert mws[0].run_limit == limit and mws[1].run_limit == limit + 2, name
-    assert "middleware" not in by_name["general-purpose"]
 
 
 def main():

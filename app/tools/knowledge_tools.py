@@ -168,4 +168,5 @@ def web_search(query: str) -> str:
         return f"网络搜索失败: {str(e)}"
 
 
-TOOLS = [rag, web_search, get_current_time]
+# get_current_time 只由主管挂载，不属于 KnowledgeAgent。
+TOOLS = [rag, web_search]

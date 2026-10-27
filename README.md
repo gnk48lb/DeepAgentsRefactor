@@ -41,7 +41,7 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 - **图片发件箱 (Outbox)**: 子 Agent 产出的图片（如代码绘图）通过旁路发件箱系统收集并递交给接入层，避免将海量 Base64 塞入主 Agent 上下文。
 
 ### 2.3 子专家清单
-1. **KnowledgeAgent**: 知识检索专家，优先检索本地 Milvus 知识库 (`rag`)，无果且具时效性时通过 Tavily 全网搜索 (`web_search`)；另提供 `get_current_time`（主 Agent 也直接挂载同一个工具，时间类问题由主 Agent 就地回答，不再委派）。
+1. **KnowledgeAgent**: 知识检索专家，优先检索本地 Milvus 知识库 (`rag`)，无果且具时效性时通过 Tavily 全网搜索 (`web_search`)；时间类问题由主 Agent 通过自己挂载的 get_current_time 就地回答，KnowledgeAgent 不挂载该工具。
 2. **MediaAgent**: 成人影视专家，同时挂载 Neo4j 知识图谱检索 (`av_graph_rag`) 与 MySQL 只读查询 (`execute_sql`)：图谱负责实体 / 合作关系网络与题材标签，数据库负责身高、罩杯、出生年份等精确属性过滤与发行年份统计，复合问题由它自己组合完成。
 3. **MapAgent**: 地理与出行专家，挂载高德地图本地工具（共 12 个高德本地 Tool），支持天气查询、周边检索、路径规划与地理编码。约定：路线、周边搜索、测距的位置参数既可传文字地址也可传'经度,纬度'，工具内部自动解析（文字地址跨城有歧义时会报错要求补城市）；只有 maps_regeocode 必须传坐标。
 4. **CodeAgent**: 代码执行专家，通过 Docker 隔离沙箱安全运行 Python 脚本，支持数据分析与 Matplotlib 绘图（绘图规范由 Skill `matplotlib-chart` 提供）。
