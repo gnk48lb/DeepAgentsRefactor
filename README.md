@@ -252,6 +252,39 @@ uv run python bot.py
 uv run python -m app.knowledge.media.builder
 ```
 
+### 5.4 知识库增量入库与 BM25 维护
+
+知识库涉及两个目录：
+
+- `data/source/`：已归档的资料（全量建库 / 重建时读取）。
+- `data/pending/`：待处理的增量资料；每次启动时自动处理，成功后移动到 `data/source/`。
+
+#### 普通增量（`REFRESH_BM25=False`，默认）
+
+1. 把新文件放进 `data/pending/`，正常启动即可。
+2. 程序会为图片/PDF 生成 VLM 摘要、切分文本，用**现有的** `storage/bm25_model.json` 编码稀疏向量，然后写入 Milvus 并把文件归档到 `data/source/`。
+3. 普通增量**不会**重新拟合 BM25 模型：新卡片用旧模型编码，模型文件保持不变。检索仍然可用（查询和文档用同一个模型），只是新词 / 新语料的权重不是最优。
+
+#### 刷新 BM25（`REFRESH_BM25=True`）
+
+当新增内容较多、希望 BM25 统计覆盖全量语料时，按以下顺序操作：
+
+1. 保持 `config.REFRESH_BM25 = False`，启动一次，让 `data/pending/` 处理完，并确认该目录为空。
+2. 将 `config.REFRESH_BM25 = True`，再启动一次。程序会：
+   - 用 `data/source/` + `data/pending/` 的全部文本重新拟合 BM25 并保存；
+   - 用新模型重新编码 Milvus 中所有历史记录的 `sparse_vector` 并局部更新（`partial_update=True`，不会重新调用 Embedding API）。
+3. 看到“已成功局部更新 N 条历史数据的稀疏向量字段”后，把 `REFRESH_BM25` 改回 `False`，避免每次启动重复执行。
+
+> **不要**在 `data/pending/` 还有图片/PDF 时开启 `REFRESH_BM25=True`：刷新分支会先把这些文件的 VLM 摘要生成好，但只用于 BM25 统计、不写入 Milvus；随后的增量步骤会把这些摘要当成“已存在”而跳过，导致摘要块永久缺失。
+
+如果只想彻底重建知识库，也可以直接：
+
+```bash
+uv run python main.py --rebuild
+```
+
+`--rebuild` 会删除 `knowledge` 集合（不影响媒体库和记忆库），从 `data/source/` 全量重新建库并重新拟合 BM25。代价是所有片段都会重新调用 Embedding API，比重刷 BM25 慢且费额度。
+
 ---
 
 ## 6. 新增专家步骤
@@ -310,3 +343,4 @@ uv run python tests/run_smoke.py
 1. **DesktopAgent 不稳定**: 桌面操作依赖网格视觉识别，受分辨率和缩放比例影响较大，可能存在点击漂移。
 2. **MemorySaver 会话重启丢失**: 当前状态保存器为内存级 `MemorySaver`，机器人进程重启后进行中的上下文与未决 HITL 中断会丢失。长期事实依赖 Milvus 后台抽取持久化。
 3. **专家单次委派有工具调用预算**: 每个专家单次委派内的工具调用次数受 `config.SUBAGENT_TOOL_LIMITS` 限制（见 2.8；FileAgent 默认 20 次，授权恢复后重新计数），触顶后调用被拦截、专家以已有结果收尾，复杂任务可能因此汇报不完整；`write_file` 对已存在文件会整体覆盖。
+4. **增量入库不是事务**: 图片/PDF 的 VLM 摘要生成、写入 Milvus、把文件从 `data/pending/` 移到 `data/source/` 是三个独立步骤，失败不会回滚。若 VLM 调用失败（或摘要已生成但入库前进程中断），而同一批还有其它成功入库的文档，该文件仍会被移动到 `data/source/`，其摘要块之后不会被自动补入，表现为“文件已归档，但检索不到”。恢复方式：修复后执行 `uv run python main.py --rebuild`；若文件仍卡在 `data/pending/`，先删除对应的 `data/pipeline/summaries/<hash>.md`，并确保 `REFRESH_BM25=False` 后重新启动。

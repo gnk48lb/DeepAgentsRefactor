@@ -194,7 +194,9 @@ def process_incremental_knowledge():
                 
                 batch_size = 500
                 for i in range(0, len(upsert_data), batch_size):
-                    c.upsert(collection_name=coll_name, data=upsert_data[i:i+batch_size])
+                    # partial_update=True: 只更新 sparse_vector，保留 vector/text 等其余字段。
+                    # 默认 upsert 是整行替换，缺字段会抛 DataNotMatchException。
+                    c.upsert(collection_name=coll_name, data=upsert_data[i:i+batch_size], partial_update=True)
                 print(f"✅ 已成功局部更新 {len(upsert_data)} 条历史数据的稀疏向量字段！")
                 print("BM25模型已全量重新拟合，旧数据的稀疏索引已局部更新完毕。请在 config.py 中将 REFRESH_BM25 改回 False，避免下次重复运行。")
 

@@ -7,4 +7,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends fonts-noto-cjk && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir pandas numpy matplotlib
+RUN pip install --no-cache-dir \
+    "pandas==2.3.3" \
+    "numpy==2.2.6" \
+    "matplotlib==3.10.9"
