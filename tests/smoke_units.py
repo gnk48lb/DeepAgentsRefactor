@@ -350,6 +350,73 @@ def test_k_memory_extractor_is_none():
     assert _is_none_reply("component") is False
 
 
+def test_l_neo4j_schema_constraints():
+    from app.knowledge.media import builder
+
+    executed = []
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def run(self, stmt, **kw):
+            executed.append(stmt)
+
+    class FakeDriver:
+        def __init__(self):
+            self.closed = False
+
+        def session(self):
+            return FakeSession()
+
+        def close(self):
+            self.closed = True
+
+    # 1. 断言 6 条语句都带 IF NOT EXISTS 且都被执行
+    fake_driver = FakeDriver()
+    builder.ensure_graph_schema(fake_driver)
+    assert len(executed) == 6, f"预期执行 6 条约束语句，实际执行: {len(executed)}"
+    for stmt in executed:
+        assert "IF NOT EXISTS" in stmt, f"缺少 IF NOT EXISTS: {stmt}"
+        assert "IS UNIQUE" in stmt, f"缺少 IS UNIQUE: {stmt}"
+        assert "REQUIRE" in stmt, f"缺少 REQUIRE: {stmt}"
+
+    # 确保涵盖 6 类节点实体
+    for entity in ("Work", "Actress", "Actor", "Tag", "Series", "Year"):
+        assert any(f":{entity}" in s for s in executed), f"缺少针对实体 {entity} 的约束"
+
+    # 2. session.run 抛异常时 ensure_graph_schema 只告警不中断
+    class FailingSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def run(self, stmt, **kw):
+            raise RuntimeError("Simulated Neo4j session run error")
+
+    class FailingDriver:
+        def session(self):
+            return FailingSession()
+
+    # 不抛异常即为通过
+    builder.ensure_graph_schema(FailingDriver())
+
+    # 3. MediaDataBuilder.close 关闭 driver 测试
+    b = builder.MediaDataBuilder.__new__(builder.MediaDataBuilder)
+    test_driver = FakeDriver()
+    b.neo4j_driver = test_driver
+    b.close()
+    assert test_driver.closed is True
+    assert b.neo4j_driver is None
+    # 幂等调用
+    b.close()
+
+
 SCENARIOS = [
     ("A config._resolve_path", test_a_resolve_path),
     ("B bootstrap os.rename 兜底补丁", test_b_bootstrap_rename_fallback),
@@ -362,6 +429,7 @@ SCENARIOS = [
     ("I milvus_client 生命周期与双重检查锁", test_i_milvus_client_lifecycle),
     ("J Docker 沙箱加固与隔离", test_j_docker_sandbox_hardening),
     ("K memory.extractor._is_none_reply 判定", test_k_memory_extractor_is_none),
+    ("L Neo4j 图约束确保与异常容错", test_l_neo4j_schema_constraints),
 ]
 
 

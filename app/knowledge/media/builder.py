@@ -13,6 +13,31 @@ from app.infra.milvus_client import get_client
 
 logger = logging.getLogger(__name__)
 
+GRAPH_SCHEMA_STATEMENTS = [
+    "CREATE CONSTRAINT constraint_work_code IF NOT EXISTS FOR (w:Work) REQUIRE w.code IS UNIQUE",
+    "CREATE CONSTRAINT constraint_actress_name IF NOT EXISTS FOR (a:Actress) REQUIRE a.name IS UNIQUE",
+    "CREATE CONSTRAINT constraint_actor_name IF NOT EXISTS FOR (ac:Actor) REQUIRE ac.name IS UNIQUE",
+    "CREATE CONSTRAINT constraint_tag_name IF NOT EXISTS FOR (t:Tag) REQUIRE t.name IS UNIQUE",
+    "CREATE CONSTRAINT constraint_series_name IF NOT EXISTS FOR (s:Series) REQUIRE s.name IS UNIQUE",
+    "CREATE CONSTRAINT constraint_year_value IF NOT EXISTS FOR (y:Year) REQUIRE y.value IS UNIQUE",
+]
+
+
+def ensure_graph_schema(driver) -> None:
+    """确保 Neo4j 唯一性约束与索引已创建（幂等）。
+
+    Neo4j 不可用或约束创建失败时只打印警告，不得影响系统启动或数据构建。
+    """
+    if driver is None:
+        return
+    try:
+        with driver.session() as session:
+            for stmt in GRAPH_SCHEMA_STATEMENTS:
+                session.run(stmt)
+        logger.info("✅ Neo4j 图数据库唯一性约束与索引已就绪。")
+    except Exception as e:
+        print(f"⚠️ 警告：Neo4j 约束创建失败或服务不可用 (非致命): {e}")
+
 
 def init_av_graph_rag():
     """
@@ -20,6 +45,7 @@ def init_av_graph_rag():
     1. 检查 av_works_collection 集合。
     2. 如果集合不存在或为空，则触发 DataBuilder 进行初始化和数据构建。
     """
+    db_builder = None
     try:
         db_builder = MediaDataBuilder()
         c = get_client()
@@ -44,10 +70,14 @@ def init_av_graph_rag():
             else:
                 print(f"⚠️ 警告：未找到专有媒体库源文件 {data_file}，跳过构建。")
         else:
+            ensure_graph_schema(db_builder.neo4j_driver)
             print(f"✅ 专有媒体库 '{coll_name}' 已就绪。")
             
     except Exception as e:
         print(f"❌ [专有媒体库初始化失败]: {e}")
+    finally:
+        if db_builder is not None:
+            db_builder.close()
 
 
 class MediaDataBuilder:
@@ -59,6 +89,16 @@ class MediaDataBuilder:
         self.client = get_client()
         self.collection_name = config.MEDIA_COLLECTION_NAME
         self._init_milvus_collection()
+
+    def close(self):
+        """关闭 Neo4j 驱动连接并置空。"""
+        if hasattr(self, "neo4j_driver") and self.neo4j_driver is not None:
+            try:
+                self.neo4j_driver.close()
+            except Exception as e:
+                logger.warning(f"关闭 Neo4j driver 异常: {e}")
+            finally:
+                self.neo4j_driver = None
 
     def _init_milvus_collection(self):
         if getattr(config, "REFRESH_COLLECTION", False):
@@ -105,6 +145,7 @@ class MediaDataBuilder:
             self.client.load_collection(self.collection_name)
 
     def build_from_file(self, file_path: str, batch_size: int = 500):
+        ensure_graph_schema(self.neo4j_driver)
         records = []
         all_texts = []
         
@@ -265,4 +306,8 @@ class MediaDataBuilder:
 
 
 if __name__ == "__main__":
-    MediaDataBuilder().build_from_file(config.MEDIA_SOURCE_FILE)
+    builder = MediaDataBuilder()
+    try:
+        builder.build_from_file(config.MEDIA_SOURCE_FILE)
+    finally:
+        builder.close()
