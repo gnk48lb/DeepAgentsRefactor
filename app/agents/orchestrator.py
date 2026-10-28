@@ -44,10 +44,7 @@ def _register_harness_profiles():
 
 _register_harness_profiles()
 
-try:
-    from langchain.agents.middleware import ToolCallLimitMiddleware
-except ImportError:
-    ToolCallLimitMiddleware = None
+from langchain.agents.middleware import ToolCallLimitMiddleware
 
 
 _DECLARATIVE_SPECS = [
@@ -115,17 +112,13 @@ async def build_main_agent(
     await mcp_service.initialize_mcp()
 
     # 配置中间件
-    middleware = []
-    if ToolCallLimitMiddleware is not None:
-        middleware.append(
-            ToolCallLimitMiddleware(
-                tool_name="task",
-                run_limit=12,
-                exit_behavior="continue",
-            )
+    middleware = [
+        ToolCallLimitMiddleware(
+            tool_name="task",
+            run_limit=12,
+            exit_behavior="continue",
         )
-    else:
-        print("[-] Warning: ToolCallLimitMiddleware not available, task tool limit disabled.")
+    ]
 
     subagents = _declarative_subagents()
     file_subagent, desktop_subagent = await _local_subagents()

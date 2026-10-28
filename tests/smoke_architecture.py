@@ -370,9 +370,16 @@ assert models.bm25_ef is not models.av_bm25_ef, "bm25_ef 与 av_bm25_ef 不应�
 
 def test_h_mcp_config():
     """H mcp_servers.json 配置文件参数有效性。"""
+    from app import config
+    from app.infra.mcp_service import _resolve_placeholder
+
     config_file = ROOT / "mcp_servers.json"
     assert config_file.exists(), "mcp_servers.json 配置文件不存在"
     data = json.loads(config_file.read_text(encoding="utf-8"))
+    assert "desktop" in data, "缺少 desktop MCP 服务"
+    assert "cwd" in data["desktop"], "desktop 配置必须包含 cwd"
+    assert _resolve_placeholder("${PROJECT_ROOT}") == config.PROJECT_ROOT
+
     for server_name, server_cfg in data.items():
         args = server_cfg.get("args", [])
         for arg in args:

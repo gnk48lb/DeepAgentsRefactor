@@ -21,6 +21,7 @@
       "run",
       "mcp_servers/windows_desktop.py"
     ],
+    "cwd": "${PROJECT_ROOT}",
     "transport": "stdio"
   }
 }

@@ -167,6 +167,82 @@ def test_g_rag_image_description_dedup():
         config.DATA_DIR = orig_data_dir
 
 
+def test_h_browser_close_idempotent():
+    import asyncio
+    from app.infra import browser_service
+
+    # Case 1: _browser is None
+    browser_service._browser = None
+    asyncio.run(browser_service.close_browser())
+    assert browser_service._browser is None
+
+    # Case 2: _browser exists, kill called and set to None
+    kill_called = 0
+
+    class MockBrowser:
+        async def kill(self):
+            nonlocal kill_called
+            kill_called += 1
+
+    browser_service._browser = MockBrowser()
+    asyncio.run(browser_service.close_browser())
+    assert kill_called == 1
+    assert browser_service._browser is None
+
+    # Case 3: Idempotent call
+    asyncio.run(browser_service.close_browser())
+    assert kill_called == 1
+
+
+def test_i_milvus_client_lifecycle():
+    import concurrent.futures
+    import time
+    from app.infra import milvus_client
+
+    # Case 1: client is None
+    milvus_client.client = None
+    milvus_client.close_client()
+    assert milvus_client.client is None
+
+    # Case 2: client exists, close called and set to None
+    close_called = 0
+
+    class MockClient:
+        def close(self):
+            nonlocal close_called
+            close_called += 1
+
+    milvus_client.client = MockClient()
+    milvus_client.close_client()
+    assert close_called == 1
+    assert milvus_client.client is None
+
+    # Case 3: Idempotent call
+    milvus_client.close_client()
+    assert close_called == 1
+
+    # Case 4: Thread-safe double-checked lock on get_client
+    created = 0
+
+    class FakeMilvusClient:
+        def __init__(self, *args, **kwargs):
+            nonlocal created
+            created += 1
+            time.sleep(0.01)
+
+    orig_mc = milvus_client.MilvusClient
+    try:
+        milvus_client.MilvusClient = FakeMilvusClient
+        milvus_client.client = None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            results = list(pool.map(lambda _: milvus_client.get_client(), range(5)))
+        assert created == 1, f"Expected 1 client created, got {created}"
+        assert len(set(results)) == 1, "Expected identical singleton client instance"
+    finally:
+        milvus_client.client = None
+        milvus_client.MilvusClient = orig_mc
+
+
 SCENARIOS = [
     ("A config._resolve_path", test_a_resolve_path),
     ("B bootstrap os.rename 兜底补丁", test_b_bootstrap_rename_fallback),
@@ -175,6 +251,8 @@ SCENARIOS = [
     ("E DesktopAgent 未应答 tool_calls", test_e_unanswered_tool_calls),
     ("F SQL 加固与超时只读", test_f_sql_hardening),
     ("G rag 同源图片描述只展开一次", test_g_rag_image_description_dedup),
+    ("H browser_service 幂等关闭", test_h_browser_close_idempotent),
+    ("I milvus_client 生命周期与双重检查锁", test_i_milvus_client_lifecycle),
 ]
 
 

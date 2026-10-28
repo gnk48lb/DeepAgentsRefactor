@@ -89,9 +89,11 @@ async def shutdown_service() -> None:
     """关闭系统服务并释放 MCP 资源"""
     global _initialized, _agent, _checkpointer
     print("🛑 [chat_service] 正在关闭服务...")
-    from app.infra import mcp_service
+    from app.infra import mcp_service, browser_service, milvus_client
     from app.tools import amap
     await mcp_service.shutdown_mcp()
+    await browser_service.close_browser()
+    milvus_client.close_client()
     await amap.aclose()
     _agent = None
     _checkpointer = None

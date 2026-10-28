@@ -36,6 +36,21 @@ async def init_browser():
             raise e
     return _browser
 
+
+async def close_browser() -> None:
+    """
+    幂等关闭浏览器实例并释放进程资源。
+    """
+    global _browser
+    if _browser is not None:
+        try:
+            await _browser.kill()
+            print("[BrowserService] ✅ 浏览器进程已关闭。")
+        except Exception as e:
+            print(f"[BrowserService] ❌ 关闭浏览器失败: {e}")
+        finally:
+            _browser = None
+
 # browser_service.py
 
 BROWSER_ACTION_RULES = (
