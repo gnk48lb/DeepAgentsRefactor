@@ -53,6 +53,22 @@ def _build_context(best_hits) -> tuple[list[str], list[str]]:
     return context_docs, image_paths
 
 
+def is_below_threshold(best_hits: list, min_score: float) -> bool:
+    """纯函数：判断 rerank 结果是否低于相关度阈值。
+
+    规则：
+    - 若 best_hits 为空：视为低于阈值 (True)。
+    - 若任一命中项的分数为 None（代表 reranker 不可用并已降级退回）：不做阈值过滤，返回 False。
+    - 若分数全部可用：当最高分（max(scores)）低于 min_score 时，返回 True；否则返回 False。
+    """
+    if not best_hits:
+        return True
+    scores = [s for s, _ in best_hits]
+    if any(s is None for s in scores):
+        return False
+    return max(scores) < min_score
+
+
 @tool
 def rag(query: str):
     """从 Milvus 本地知识库中检索相关信息（包含游戏攻略、菜谱等项目内部文档）。"""
@@ -104,6 +120,15 @@ def rag(query: str):
         # 取 Top-3 (可根据需要调整)
         top_k = 3
         best_hits = rerank_candidates(query, candidates, unique_hits, top_k=top_k)
+
+        # 每次检索打印前 3 名分数便于调参
+        score_logs = [f"{s:.4f}" if s is not None else "None" for s, _ in best_hits[:3]]
+        print(f"[RAG Rerank] Top-{len(score_logs)} 分数: {score_logs} (阈值: {config.RAG_MIN_RERANK_SCORE})")
+
+        # 阈值判断：rerank 分数可用且最高分低于阈值时，返回固定文案
+        if is_below_threshold(best_hits, config.RAG_MIN_RERANK_SCORE):
+            print(f"[Tool Result] 最高重排分数低于阈值 {config.RAG_MIN_RERANK_SCORE}，判定为无相关知识。")
+            return "No relevant information found in the knowledge base."
         
         context_docs, image_paths = _build_context(best_hits)
             

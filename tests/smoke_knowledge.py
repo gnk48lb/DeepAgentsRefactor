@@ -7,6 +7,7 @@ tests/smoke_knowledge.py
   C 混合检索(稀疏+稠密),校验 source_path 仍是"相对 data 目录"的相对路径(兼容已入库的旧数据)
   D 长期记忆:写入 / 语义去重 / 阈值过滤检索
   E 重复初始化幂等
+  F reranker 阈值过滤与不可用降级
 所有数据写入临时目录:通过改写 config 属性重定向路径,同时验证"路径只来自 config 常量"。
 """
 import hashlib
@@ -111,6 +112,54 @@ def test_e_idempotent(n_now):
     assert _count(config.KNOWLEDGE_COLLECTION_NAME) == n_now, "重复初始化不应重复入库"
 
 
+def test_f_reranker_threshold_and_fallback():
+    from app.tools.knowledge_tools import rag, is_below_threshold
+    orig_reranker = models._cache.get("reranker")
+    orig_threshold = config.RAG_MIN_RERANK_SCORE
+    try:
+        config.RAG_MIN_RERANK_SCORE = 0.1
+
+        # 1. 纯函数断言
+        assert is_below_threshold([(0.05, {})], 0.1) is True
+        assert is_below_threshold([(0.15, {})], 0.1) is False
+        assert is_below_threshold([(None, {})], 0.1) is False
+        assert is_below_threshold([], 0.1) is True
+
+        # 2. 注入低于阈值的假 reranker
+        class LowScoreReranker:
+            def predict(self, pairs):
+                return [0.05] * len(pairs)
+
+        models._cache["reranker"] = LowScoreReranker()
+        res_low = rag.invoke({"query": "女武神"})
+        assert res_low == "No relevant information found in the knowledge base.", f"低于阈值应返回无相关提示，实际: {res_low}"
+
+        # 3. 注入高于阈值的假 reranker
+        class HighScoreReranker:
+            def predict(self, pairs):
+                return [0.85] * len(pairs)
+
+        models._cache["reranker"] = HighScoreReranker()
+        res_high = rag.invoke({"query": "女武神"})
+        assert "女武神" in str(res_high) and res_high != "No relevant information found in the knowledge base.", f"高于阈值应返回上下文，实际: {res_high}"
+
+        # 4. 注入抛出 RerankerUnavailable 的假 reranker
+        class UnavailableReranker:
+            def predict(self, pairs):
+                raise models.RerankerUnavailable("Connection refused")
+
+        models._cache["reranker"] = UnavailableReranker()
+        res_unavail = rag.invoke({"query": "女武神"})
+        assert "女武神" in str(res_unavail) and res_unavail != "No relevant information found in the knowledge base.", f"Reranker不可用时应退回输入顺序且不被误判为无相关，实际: {res_unavail}"
+
+    finally:
+        config.RAG_MIN_RERANK_SCORE = orig_threshold
+        if orig_reranker is not None:
+            models._cache["reranker"] = orig_reranker
+        else:
+            models._cache.pop("reranker", None)
+
+
 def main():
     print("=" * 70)
     print("开始运行知识库 / 长期记忆数据层离线冒烟测试...")
@@ -123,6 +172,7 @@ def main():
         ("C 混合检索与 source_path 相对路径", test_c_hybrid_search),
         ("D 长期记忆 写入/去重/阈值检索", test_d_memory),
         ("E 重复初始化幂等", lambda: test_e_idempotent(state["n"])),
+        ("F reranker 阈值过滤与不可用降级", test_f_reranker_threshold_and_fallback),
     ]
     try:
         for name, fn in steps:

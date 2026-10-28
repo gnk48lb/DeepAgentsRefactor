@@ -36,7 +36,11 @@ def rerank_candidates(query: str, candidates: list, hits: list, top_k: int = 10)
     if not candidates or not hits:
         return []
     pairs = [[query, doc] for doc in candidates]
-    scores = models.reranker.predict(pairs)
+    try:
+        scores = models.reranker.predict(pairs)
+    except models.RerankerUnavailable as e:
+        print(f"⚠️ 警告：Reranker 服务不可用 ({e})，退回输入顺序。")
+        return [(None, hit) for hit in hits[:top_k]]
     
     scored_hits = list(zip(scores, hits))
     scored_hits.sort(key=lambda x: x[0], reverse=True)

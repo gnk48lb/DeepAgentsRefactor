@@ -99,6 +99,11 @@ class SiliconFlowEmbeddings(BaseModel, Embeddings):
         return self.embed_documents([text])[0]
 
 
+class RerankerUnavailable(Exception):
+    """当重排模型 (Reranker) 服务不可用、网络异常或响应非预期时抛出。"""
+    pass
+
+
 # Initialize SiliconFlow Reranker
 class SiliconFlowReranker:
     def __init__(self, model_name, api_key):
@@ -121,19 +126,29 @@ class SiliconFlowReranker:
             "documents": [p[1] for p in pairs],
             "top_n": len(pairs)
         }
-        resp = requests.post(
-            self.url,
-            json=payload,
-            headers=headers,
-            timeout=SILICONFLOW_RERANK_TIMEOUT,
-        )
-        data = resp.json()
-        if "results" not in data:
-            logger.warning(
-                f"[SiliconFlowReranker] API 未返回 results (状态码 {resp.status_code}): "
-                f"{data.get('message', '未知错误')}"
+        try:
+            resp = requests.post(
+                self.url,
+                json=payload,
+                headers=headers,
+                timeout=SILICONFLOW_RERANK_TIMEOUT,
             )
-            return [0.0] * len(pairs)
+            if resp.status_code != 200:
+                raise RerankerUnavailable(
+                    f"[SiliconFlowReranker] HTTP {resp.status_code}: {resp.text}"
+                )
+            data = resp.json()
+            if "results" not in data:
+                raise RerankerUnavailable(
+                    f"[SiliconFlowReranker] API 未返回 results (状态码 {resp.status_code}): "
+                    f"{data.get('message', '未知错误')}"
+                )
+        except requests.RequestException as e:
+            raise RerankerUnavailable(f"[SiliconFlowReranker] 网络请求异常: {e}") from e
+        except Exception as e:
+            if isinstance(e, RerankerUnavailable):
+                raise
+            raise RerankerUnavailable(f"[SiliconFlowReranker] 响应解析异常: {e}") from e
         
         # SiliconFlow 返回格式: {"results": [{"index": 0, "relevance_score": 0.9}, ...]}
         # 需要还原到原始 list 的顺序

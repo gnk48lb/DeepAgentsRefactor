@@ -91,6 +91,7 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD") or "password"
 # Model Configuration
 EMBEDDING_MODEL = "BAAI/bge-m3"
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
+RAG_MIN_RERANK_SCORE = float(os.getenv("RAG_MIN_RERANK_SCORE", "0.1"))
 
 # 文字模型 LLM (Worker)
 WORKER_LLM_MODEL = "gemini-3.5-flash-lite"
