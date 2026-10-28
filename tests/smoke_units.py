@@ -322,6 +322,34 @@ def test_j_docker_sandbox_hardening():
         sandbox.docker.from_env = orig_from_env
 
 
+def test_k_memory_extractor_is_none():
+    from app.memory.extractor import _is_none_reply
+
+    # 1. 应当判定为无记忆的场景（含空白、不同大小写、各种中英文标点包裹）
+    assert _is_none_reply("NONE") is True
+    assert _is_none_reply("none") is True
+    assert _is_none_reply("None") is True
+    assert _is_none_reply("  NONE  ") is True
+    assert _is_none_reply("NONE.") is True
+    assert _is_none_reply("NONE。") is True
+    assert _is_none_reply("【NONE】") is True
+    assert _is_none_reply("【NONE】。") is True
+    assert _is_none_reply("(none)!") is True
+
+    # 2. 空字符串或仅标点非 NONE
+    assert _is_none_reply("") is False
+    assert _is_none_reply("   ") is False
+    assert _is_none_reply("...") is False
+    assert _is_none_reply("。") is False
+
+    # 3. 应当保留的有效记忆（包含 NONE 子串但不是纯 NONE）
+    assert _is_none_reply("NONE OF THE ABOVE") is False
+    assert _is_none_reply("用户家在Noneville") is False
+    assert _is_none_reply("用户最喜欢NONE品牌") is False
+    assert _is_none_reply("用户对海鲜严重过敏") is False
+    assert _is_none_reply("component") is False
+
+
 SCENARIOS = [
     ("A config._resolve_path", test_a_resolve_path),
     ("B bootstrap os.rename 兜底补丁", test_b_bootstrap_rename_fallback),
@@ -333,6 +361,7 @@ SCENARIOS = [
     ("H browser_service 幂等关闭", test_h_browser_close_idempotent),
     ("I milvus_client 生命周期与双重检查锁", test_i_milvus_client_lifecycle),
     ("J Docker 沙箱加固与隔离", test_j_docker_sandbox_hardening),
+    ("K memory.extractor._is_none_reply 判定", test_k_memory_extractor_is_none),
 ]
 
 

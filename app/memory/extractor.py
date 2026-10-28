@@ -1,5 +1,6 @@
 """后台异步长期记忆提取与持久化 (所在层: L2)"""
 
+import string
 import time
 import asyncio
 from app.infra import models
@@ -33,6 +34,16 @@ MEMORY_EXTRACTOR_PROMPT = """你是一个极其冷酷、挑剔且吝啬的“个
 """
 
 
+_PUNCTUATION = string.punctuation + "。，、！？；：“”‘’（）《》【】…— \t\r\n"
+
+
+def _is_none_reply(text: str) -> bool:
+    """纯函数：去掉首尾空白与标点后 upper() == 'NONE' 才算无记忆。"""
+    if not text:
+        return False
+    return text.strip(_PUNCTUATION).upper() == "NONE"
+
+
 async def extract_and_store_memory(recent_chat: str):
     """后台异步执行记忆提取与保存，不阻塞主流程"""
     try:
@@ -45,7 +56,7 @@ async def extract_and_store_memory(recent_chat: str):
         )
         mem_elapsed = time.perf_counter() - mem_start
         content = extract_text(res.content).strip()
-        if content and content.upper() != "NONE" and "NONE" not in content.upper():
+        if content and not _is_none_reply(content):
             await asyncio.to_thread(memory_store.insert_memory, content)
             print(f"--- \033[92m[后台记忆保存] (耗时 {mem_elapsed:.2f}s)\033[0m: {content} ---", flush=True)
         else:

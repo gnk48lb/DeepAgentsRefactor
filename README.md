@@ -45,7 +45,7 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 2. **MediaAgent**: 成人影视专家，同时挂载 Neo4j 知识图谱检索 (`av_graph_rag`) 与 MySQL 只读查询 (`execute_sql`)：图谱负责实体 / 合作关系网络与题材标签，数据库负责身高、罩杯、出生年份等精确属性过滤与发行年份统计，复合问题由它自己组合完成。
 3. **MapAgent**: 地理与出行专家，挂载高德地图本地工具（共 12 个高德本地 Tool），支持天气查询、周边检索、路径规划与地理编码。约定：路线、周边搜索、测距的位置参数既可传文字地址也可传'经度,纬度'，工具内部自动解析（文字地址跨城有歧义时会报错要求补城市）；只有 maps_regeocode 必须传坐标。
 4. **CodeAgent**: 代码执行专家，通过 Docker 隔离沙箱安全运行 Python 脚本，支持数据分析与 Matplotlib 绘图（绘图规范由 Skill `matplotlib-chart` 提供）。
-5. **BrowserAgent**: 浏览器自动化专家，基于 Playwright/browser-use 操控真实或无头浏览器，处理网页端交互。
+5. **BrowserAgent**: 浏览器自动化专家，基于 Playwright/browser-use 操控真实浏览器（可见模式），处理网页端交互。
 6. **FileAgent (HITL)**: 本地文件专家，内置 FilesystemMiddleware + FilesystemBackend + 原生 HITL。提供工具：`ls`/`glob`/`grep`/`read_file` 免授权，`convert_to_markdown`（由 markitdown-mcp 提供，支持富文档转 Markdown），`write_file`/`edit_file`/`create_directory`/`move_file` 需授权，删除 = 移动到 archive_trash 归档。只能在 workspace 工作区内操作。转换结果过大时会暂存到 `/_artifacts/large_tool_results/<id>`，FileAgent 用 `read_file` 分页读回。
 7. **DesktopAgent (HITL)**: 桌面操作专家，基于网格坐标截屏、模拟点击与键鼠交互。
 
@@ -90,6 +90,9 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 
 ```text
 DeepAgentsRefactor/
+├── .github/                  # GitHub Actions CI 工作流
+│   └── workflows/
+│       └── ci.yml
 ├── app/                      # 核心业务逻辑
 │   ├── config.py             # L0: 全局配置中心 (路径与环境变量规范)
 │   ├── bootstrap.py          # 启动环境补丁 (stdout/stderr UTF-8、第三方日志降噪、Windows os.rename 兜底)
@@ -145,7 +148,9 @@ DeepAgentsRefactor/
 │       ├── startup.py        # 全局数据库与服务初始化入口
 │       └── chat_service.py   # 单用户多模态会话状态机与消息调度服务
 ├── deploy/                   # 部署配置
-│   └── docker-compose.yml    # Neo4j 等后台服务容器编排
+│   ├── docker-compose.yml    # Neo4j 等后台服务容器编排
+│   └── sandbox/              # Docker 沙箱镜像定义
+│       └── Dockerfile
 ├── mcp_servers/              # 独立 MCP 服务实现
 │   └── windows_desktop.py
 ├── plugins/                  # NoneBot2 插件层
@@ -158,20 +163,26 @@ DeepAgentsRefactor/
 │   └── matplotlib-chart/     # Matplotlib 绘图规范技能
 ├── tests/                    # 测试用例
 │   ├── fixtures/amap/        # 高德工具契约与 Golden 样本数据
+│   ├── live_amap_golden.py   # 高德在线 Golden 数据集比对测试
 │   ├── run_smoke.py          # 一键运行全部离线冒烟测试
-│   ├── smoke_architecture.py # 架构分层、规范与契约冒烟测试
-│   ├── smoke_file_agent.py   # FileAgent 离线冒烟测试
-│   ├── smoke_budget.py       # 专家工具调用预算（独立停止条件）冒烟测试
-│   ├── smoke_skills.py       # Skills 规范与 Backend 路由冒烟测试
 │   ├── smoke_amap_contract.py# 高德工具快照与契约冒烟测试
 │   ├── smoke_amap_http.py    # 高德工具 HTTP 异常与密钥脱敏测试
-│   └── smoke_chat_service.py # chat_service 服务层离线冒烟测试
+│   ├── smoke_architecture.py # 架构分层、规范与契约冒烟测试
+│   ├── smoke_budget.py       # 专家工具调用预算（独立停止条件）冒烟测试
+│   ├── smoke_chat_service.py # chat_service 服务层离线冒烟测试
+│   ├── smoke_file_agent.py   # FileAgent 离线冒烟测试
+│   ├── smoke_knowledge.py    # 知识库 / 长期记忆离线冒烟测试
+│   ├── smoke_markitdown_e2e.py # MarkItDown 端到端离线冒烟测试
+│   ├── smoke_orchestrator.py # 主管编排与专家装配冒烟测试
+│   ├── smoke_skills.py       # Skills 规范与 Backend 路由冒烟测试
+│   └── smoke_units.py        # 纯函数单元冒烟测试
 ├── storage/                  # 运行时持久化目录（Milvus DB、浏览器配置等，已忽略）
 ├── workspace/                # FileAgent 操作工作区（已忽略）
 ├── bot.py                    # NoneBot2 QQ 机器人启动入口
 ├── main.py                   # 本地控制台多轮对话入口 (合并了原 CLI 功能)
 ├── mcp_servers.json          # MCP 服务配置文件
-└── pyproject.toml            # 依赖与项目元数据 (uv)
+├── pyproject.toml            # 依赖与项目元数据 (uv)
+└── requirements.txt          # 导出依赖列表 (pip 兼容)
 ```
 
 ---
@@ -280,16 +291,16 @@ uv run python -m app.knowledge.media.builder
 uv run python tests/run_smoke.py
 ```
 
-测试包含以下 10 个测试套件（共 84 个场景）：
+测试包含以下 10 个测试套件（共 85 个场景）：
 1. `tests/smoke_architecture.py`：分层单向依赖、语法禁令、空 `__init__`、提示词单例、专家规格、轻量隔离导入、无 Key 安全导入与 MCP 路径校验（8 个场景）。
 2. `tests/smoke_file_agent.py`：FileAgent 离线冒烟测试（含 MarkItDown 路径安全拦截、越界隔离、HITL 恢复映射等 16 个场景）。
 3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试。
 4. `tests/smoke_amap_contract.py`：高德地图 12 个本地工具契约与 Schema 快照测试（5 个场景）。
 5. `tests/smoke_amap_http.py`：高德工具 HTTP 异常与密钥脱敏测试（13 个场景）。
 6. `tests/smoke_chat_service.py`：多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复与 `/reset` 测试（6 个场景）。
-7. `tests/smoke_knowledge.py`：知识库建库、pending 增量入库、混合检索与长期记忆与 Reranker 阈值/降级离线冒烟测试（6 个场景）。
+7. `tests/smoke_knowledge.py`：知识库建库、pending 增量入库、混合检索、长期记忆与 Reranker 阈值/降级离线冒烟测试（6 个场景）。
 8. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（4 个场景，含主管时间工具与专家预算装配）。
-9. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Docker沙箱加固与隔离等 10 个场景）。
+9. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Docker沙箱加固与隔离、记忆提取NONE判定等 11 个场景）。
 10. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、生产递归上限下失控保护等 15 个场景）。
 
 ---
