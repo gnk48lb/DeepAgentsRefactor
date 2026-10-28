@@ -1,13 +1,11 @@
-"""
-app/sandbox.py
-==============
-本地 Docker 代码执行沙箱。
+"""Docker 隔离代码执行沙箱服务 (所在层: L1)
 
+本地 Docker 代码执行沙箱。
 功能：
   1. 将用户提交的 Python 代码写入临时目录中的 main.py。
-  2. 启动 Docker 容器（无网络，内存受限）执行代码。
+  2. 启动 Docker 容器（无网络，内存受限，pids 与 CPU 配额限制，删除所有 capabilities，禁止提权）执行代码。
   3. 截断过长的 stdout/stderr，防止撑爆 LLM 上下文。
-  4. 扫描 outputs/ 目录，将生成的图片压缩为 Base64 返回。
+  4. 扫描 outputs/ 目录，将生成的图片压缩为 Base64 返回（单次最多收集 SANDBOX_MAX_IMAGES 张）。
   5. 清理临时目录。
 
 返回格式：
@@ -17,8 +15,6 @@ app/sandbox.py
     "images": list[str]   # base64 编码的图片列表
   }
 """
-
-"""Docker 隔离代码执行沙箱服务 (L1)"""
 
 import os
 import tempfile
@@ -67,8 +63,8 @@ def run_code_in_sandbox(code: str) -> SandboxResult:
     SandboxResult
         包含 stdout、stderr 和 images（Base64 列表）的字典。
     """
-    # 确保在项目根目录下创建一个隐藏的临时沙箱根目录，规避 Windows 跨盘符挂载 Docker 报错
-    sandbox_tmp_root = os.path.join(config.WORKSPACE_DIR, ".sandbox_tmp")
+    # 在 storage 目录下创建临时沙箱根目录，规避 Windows 跨盘符挂载 Docker 报错并避免污染 FileAgent 工作区
+    sandbox_tmp_root = config.SANDBOX_TMP_DIR
     os.makedirs(sandbox_tmp_root, exist_ok=True)
 
     tmp_dir = tempfile.mkdtemp(prefix="sandbox_", dir=sandbox_tmp_root)
@@ -101,6 +97,11 @@ def run_code_in_sandbox(code: str) -> SandboxResult:
                 volumes=volumes,
                 working_dir="/workspace",
                 mem_limit=config.DOCKER_MAX_MEM,
+                memswap_limit=config.DOCKER_MAX_MEM,
+                pids_limit=config.DOCKER_PIDS_LIMIT,
+                nano_cpus=config.DOCKER_NANO_CPUS,
+                cap_drop=["ALL"],
+                security_opt=["no-new-privileges"],
                 network_disabled=True,
                 detach=True,
                 stdout=True,
@@ -110,14 +111,22 @@ def run_code_in_sandbox(code: str) -> SandboxResult:
             try:
                 # 等待容器结束，支持超时
                 wait_res = container.wait(timeout=_TIMEOUT_SECONDS)
-                # 获取所有日志
-                logs = container.logs().decode("utf-8", errors="replace")
-                stdout_text = _truncate(logs)
                 
-                # 如果退出码不为 0，记录到 stderr
+                # 分别获取 stdout 与 stderr 日志并各自截断
+                raw_stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
+                stdout_text = _truncate(raw_stdout)
+
+                raw_stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")
+                stderr_text = _truncate(raw_stderr)
+                
+                # 如果退出码不为 0，追加在 stderr 末尾而不是替换它
                 exit_code = wait_res.get("StatusCode", 0)
                 if exit_code != 0:
-                    stderr_text = f"容器以错误码 {exit_code} 退出。"
+                    exit_msg = f"容器以错误码 {exit_code} 退出。"
+                    if stderr_text:
+                        stderr_text = f"{stderr_text}\n{exit_msg}"
+                    else:
+                        stderr_text = exit_msg
             except Exception as e:
                 # 超时处理
                 container.kill()
@@ -132,12 +141,26 @@ def run_code_in_sandbox(code: str) -> SandboxResult:
         except Exception as e:
             stderr_text = _truncate(f"Docker 启动失败: {type(e).__name__}: {e}")
 
-        # 扫描 outputs/ 目录，收集图片
+        # 扫描 outputs/ 目录，收集图片（最多收集 config.SANDBOX_MAX_IMAGES 张）
+        img_paths = []
         for ext in ("*.png", "*.jpg", "*.jpeg"):
-            for img_path in glob.glob(os.path.join(outputs_dir, ext)):
-                b64 = compress_image_to_base64(img_path, max_size=(800, 800), quality=80)
-                if b64:
-                    images.append(b64)
+            img_paths.extend(glob.glob(os.path.join(outputs_dir, ext)))
+        img_paths.sort()
+
+        max_images = getattr(config, "SANDBOX_MAX_IMAGES", 4)
+        if len(img_paths) > max_images:
+            excess = len(img_paths) - max_images
+            notice = f"\n[提示] 单次执行生成图片超过上限 ({max_images} 张)，已忽略超出部分的 {excess} 张图片。"
+            if stdout_text:
+                stdout_text = f"{stdout_text}{notice}"
+            else:
+                stdout_text = notice.strip()
+            img_paths = img_paths[:max_images]
+
+        for img_path in img_paths:
+            b64 = compress_image_to_base64(img_path, max_size=(800, 800), quality=80)
+            if b64:
+                images.append(b64)
 
     finally:
         # 无论成功与否，清理临时目录

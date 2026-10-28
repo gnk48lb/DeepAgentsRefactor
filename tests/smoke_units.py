@@ -243,6 +243,85 @@ def test_i_milvus_client_lifecycle():
         milvus_client.MilvusClient = orig_mc
 
 
+def test_j_docker_sandbox_hardening():
+    from PIL import Image
+    from app.infra import sandbox
+
+    captured_kwargs = {}
+    wait_called = False
+    remove_called = False
+    created_tmp_dirs = []
+
+    class FakeContainer:
+        def wait(self, timeout=None):
+            nonlocal wait_called
+            wait_called = True
+            return {"StatusCode": 2}
+
+        def logs(self, stdout=False, stderr=False):
+            if stdout:
+                return b"standard output line\n"
+            if stderr:
+                return b"standard error line\n"
+            return b"combined\n"
+
+        def kill(self):
+            pass
+
+        def remove(self, force=False):
+            nonlocal remove_called
+            remove_called = True
+
+    class FakeContainers:
+        def run(self, *args, **kwargs):
+            nonlocal captured_kwargs
+            captured_kwargs = kwargs
+            for host_dir in kwargs.get("volumes", {}):
+                created_tmp_dirs.append(host_dir)
+                out_dir = os.path.join(host_dir, "outputs")
+                os.makedirs(out_dir, exist_ok=True)
+                for i in range(6):
+                    img = Image.new("RGB", (10, 10), color="red")
+                    img.save(os.path.join(out_dir, f"plot_{i}.png"))
+            return FakeContainer()
+
+    class FakeClient:
+        containers = FakeContainers()
+
+    orig_from_env = sandbox.docker.from_env
+    try:
+        sandbox.docker.from_env = lambda: FakeClient()
+        res = sandbox.run_code_in_sandbox("print('hello')")
+
+        # 1. 新参数全部传入
+        assert captured_kwargs.get("pids_limit") == config.DOCKER_PIDS_LIMIT
+        assert captured_kwargs.get("nano_cpus") == config.DOCKER_NANO_CPUS
+        assert captured_kwargs.get("mem_limit") == config.DOCKER_MAX_MEM
+        assert captured_kwargs.get("memswap_limit") == config.DOCKER_MAX_MEM
+        assert captured_kwargs.get("cap_drop") == ["ALL"]
+        assert captured_kwargs.get("security_opt") == ["no-new-privileges"]
+        assert captured_kwargs.get("network_disabled") is True
+
+        # 2. stderr 与 stdout 分离，非零退出码追加在 stderr 末尾
+        assert "standard output line" in res["stdout"]
+        assert "standard error line" in res["stderr"]
+        assert "容器以错误码 2 退出" in res["stderr"]
+        assert res["stderr"].endswith("容器以错误码 2 退出。")
+
+        # 3. 图片数量上限生效（生成 6 张，收集 4 张，并在 stdout 提示）
+        assert len(res["images"]) == config.SANDBOX_MAX_IMAGES
+        assert "超过上限" in res["stdout"] or "已忽略" in res["stdout"]
+
+        # 4. 临时目录被清理，且位于 config.SANDBOX_TMP_DIR 下
+        assert len(created_tmp_dirs) == 1
+        tmp_dir = created_tmp_dirs[0]
+        assert not os.path.exists(tmp_dir), f"临时目录未被清理: {tmp_dir}"
+        assert os.path.abspath(tmp_dir).startswith(os.path.abspath(config.SANDBOX_TMP_DIR))
+        assert wait_called and remove_called
+    finally:
+        sandbox.docker.from_env = orig_from_env
+
+
 SCENARIOS = [
     ("A config._resolve_path", test_a_resolve_path),
     ("B bootstrap os.rename 兜底补丁", test_b_bootstrap_rename_fallback),
@@ -253,6 +332,7 @@ SCENARIOS = [
     ("G rag 同源图片描述只展开一次", test_g_rag_image_description_dedup),
     ("H browser_service 幂等关闭", test_h_browser_close_idempotent),
     ("I milvus_client 生命周期与双重检查锁", test_i_milvus_client_lifecycle),
+    ("J Docker 沙箱加固与隔离", test_j_docker_sandbox_hardening),
 ]
 
 

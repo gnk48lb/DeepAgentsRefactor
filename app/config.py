@@ -51,6 +51,7 @@ BM25_MODEL_PATH = os.path.join(PROJECT_ROOT, "storage", "bm25_model.json")
 AV_BM25_MODEL_PATH = os.path.join(PROJECT_ROOT, "storage", "av_bm25_model.json")
 BROWSER_PROFILE_DIR = os.path.join(PROJECT_ROOT, "storage", "browser_profile")
 OUTBOX_DEBUG_DIR = os.path.join(PROJECT_ROOT, "storage", "outbox_debug")
+SANDBOX_TMP_DIR = os.path.join(STORAGE_DIR, "sandbox_tmp")
 
 # 设置环境变量供 Hugging Face 和 Tavily 等库自动识别
 if HUGGINGFACEHUB_API_TOKEN:
@@ -121,6 +122,9 @@ ENABLE_QUERY_TRANSFORM = False
 # Docker Sandbox Configuration
 DOCKER_IMAGE_NAME = "python-ds:latest"
 DOCKER_MAX_MEM = "256m"
+DOCKER_PIDS_LIMIT = int(os.getenv("DOCKER_PIDS_LIMIT", "128"))
+DOCKER_NANO_CPUS = int(os.getenv("DOCKER_NANO_CPUS", "1000000000"))
+SANDBOX_MAX_IMAGES = int(os.getenv("SANDBOX_MAX_IMAGES", "4"))
 
 REFRESH_COLLECTION = False
 CLEAR_MEMORY_ON_STARTUP = False
