@@ -98,11 +98,12 @@ def test_c_hybrid_search():
 
 def test_d_memory():
     store.init_memory_collection()
-    store.insert_memory("用户家住在济南市文化东路42号")
-    store.insert_memory("用户家住在济南市文化东路42号")          # 相同文本:应语义去重覆盖,而不是写两条
-    assert _count(config.MEMORY_COLLECTION_NAME) == 1, "语义去重失败"
-    store.insert_memory("用户对海鲜严重过敏")
-    assert _count(config.MEMORY_COLLECTION_NAME) == 2
+    coll = store.collection_name()
+    store.add_memory("用户家住在济南市文化东路42号", evidence="济南市文化东路42号")
+    store.add_memory("用户家住在济南市文化东路42号", evidence="济南市文化东路42号")          # 相同文本:幂等检查跳过,不重复写入
+    assert _count(coll) == 1, "相同文本不重复写入失败"
+    store.add_memory("用户对海鲜严重过敏", evidence="海鲜严重过敏")
+    assert _count(coll) == 2
     got = store.search_memory("用户家住在济南市文化东路42号", top_k=3)
     assert got == ["用户家住在济南市文化东路42号"], f"阈值过滤后应只命中相同文本,实际: {got}"
 

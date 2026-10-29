@@ -60,8 +60,8 @@ def _stub(pkg, name, **attrs):
 mem_calls = []
 
 
-async def _fake_extract_memory(recent_chat):
-    mem_calls.append(recent_chat)
+async def _fake_extract_memory(user_text):
+    mem_calls.append(user_text)
 
 
 _stub(app.agents, "orchestrator", build_main_agent=None)
@@ -181,8 +181,9 @@ async def test_a_multi_turn_hitl():
     r = await cs.process_message("你好")
     await asyncio.sleep(0.05)
     assert r.text == "你好呀" and not r.awaiting_approval, r
-    assert mem_calls and "human: 你好" in mem_calls[0], mem_calls
+    assert mem_calls and mem_calls[0] == "你好", mem_calls
 
+    mem_calls.clear()
     r = await cs.process_message("写个文件")
     assert r.awaiting_approval and "write_file" in r.text and "workspace/a.txt" in r.text and r.images == [], r.text
 
@@ -191,7 +192,9 @@ async def test_a_multi_turn_hitl():
     assert r.awaiting_approval and "当前正在等待授权确认" in r.text and fam.idx == idx_before, r.text
 
     r = await cs.process_message("y")
+    await asyncio.sleep(0.05)
     assert (not r.awaiting_approval) and r.text == "写好了" and _files(root) == ["a.txt"], (r.text, _files(root))
+    assert mem_calls == ["写个文件"], f"HITL 流程结束后只记录一次最初原话，实际: {mem_calls}"
 
     r = await cs.process_message("再写一个")
     assert r.awaiting_approval and "workspace/b.txt" in r.text, r.text
@@ -281,6 +284,19 @@ async def test_f_reset_command():
     assert r.text == "新会话回复" and _files(root) == [] and fam.idx == 1, (r.text, _files(root), fam.idx)
 
 
+
+
+async def test_g_image_turn_no_memory():
+    """G 图片轮不触发记忆提取。"""
+    from app.infra import models
+    models._cache["vlm"] = ScriptedModel(script=[AIMessage(content="分析图里的苹果")])
+    root, fam, mm = _install([AIMessage(content="看图回复")], [FA_DONE])
+    mem_calls.clear()
+    r = await cs.process_message("看这个图", image_url="data:image/png;base64,AAAA")
+    await asyncio.sleep(0.05)
+    assert r.text == "看图回复"
+    assert len(mem_calls) == 0, f"图片轮不应触发记忆提取，实际: {mem_calls}"
+
 SCENARIOS = [
     ("A 多轮 HITL（批准/无关消息/拒绝）", test_a_multi_turn_hitl),
     ("B HITL 前的图片随最终回复发出", test_b_outbox_continuity),
@@ -288,6 +304,7 @@ SCENARIOS = [
     ("D 并行中断一次 Y 放行", test_d_parallel_interrupts),
     ("E 超时后会话可继续", test_e_timeout_recovery),
     ("F /reset 丢弃挂起的授权与历史", test_f_reset_command),
+    ("G 图片轮不触发记忆提取", test_g_image_turn_no_memory),
 ]
 
 

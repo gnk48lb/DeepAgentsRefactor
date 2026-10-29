@@ -228,7 +228,7 @@ def test_d_prompt_uniqueness_and_identity():
     from langchain_core.messages import SystemMessage
     from app.runtime.cli_logger import _identify_agent
     from app.agents.prompts import MAIN_AGENT_PROMPT
-    from app.memory.extractor import MEMORY_EXTRACTOR_PROMPT
+    from app.memory.extractor import MEMORY_EXTRACTOR_PROMPT, MEMORY_RECONCILER_PROMPT
     from app.agents.experts import (
         knowledge_agent,
         media_agent,
@@ -244,6 +244,7 @@ def test_d_prompt_uniqueness_and_identity():
 
     assert ident(MAIN_AGENT_PROMPT) == "MainAgent (Orchestrator)"
     assert ident(MEMORY_EXTRACTOR_PROMPT) == "MemoryExtractor"
+    assert ident(MEMORY_RECONCILER_PROMPT) == "MemoryExtractor"
     assert ident(knowledge_agent.PROMPT) == "KnowledgeAgent"
     assert ident(media_agent.PROMPT) == "MediaAgent"
     assert ident(map_agent.PROMPT) == "MapAgent"

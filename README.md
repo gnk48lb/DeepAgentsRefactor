@@ -63,12 +63,28 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 各 MCP 服务进程在机器人启动时由专属后台 Runner 统一拉起并常驻运行，退出时自动回收，大幅降低工具调用开销。
 运行时支持并发调用与调用超时熔断（默认 60s）；若检测到服务异常断开或进程挂死，将自动触发重连与会话重建。
 
-### 2.6 长期记忆
-系统基于 Milvus 向量库维护跨会话长期记忆：
-- **检索过滤**：检索时通过 `config.MEMORY_MIN_SCORE` 进行相似度阈值过滤，低于阈值的记忆视为与当前问题无关，不注入对话上下文。
-- **写入去重**：写入时通过 `config.MEMORY_DEDUP_SCORE` 进行语义去重，与已有记忆相似度高于该阈值时自动覆盖旧记忆。
-- **日志审计**：记忆检索阶段输出 `[记忆检索]` 标签日志，明确标注每条命中条目的分数与采用/丢弃状态。
-- **注入控制**：注入条数由 config.MEMORY_TOP_K 控制（默认 3），相似度阈值由 MEMORY_MIN_SCORE 控制，可参考日志里的 [记忆检索] 分数调整。
+### 2.6 长期记忆 (两阶段召回对账与版本化)
+系统基于 Milvus 向量库维护跨会话长期记忆，采用两阶段（提取 → 召回对账 → 版本化）架构：
+- **输入隔离**：仅信任当轮用户原话输入，绝不向提取器灌入 AI 回复、工具结果或系统 `<long_term_memory>` 块；图片轮（输入为 VLM 翻译指令）及超过 `MEMORY_EXTRACT_MAX_USER_CHARS`（800 字符，疑似粘贴文本）均不提取。跨 HITL 人工授权时保持用户最初原话，不记录单字符 "y"。
+- **两阶段写入**：
+  - **阶段 1（原子陈述提取）**：每轮 1 次 LLM 调用，严格冷酷提取用户关于自己的原子事实断言（`facts`）或撤回请求（`retractions`），无事实则输出空列表。
+  - **阶段 2（语义召回与对账）**：仅在有提取陈述且库中存在候选时触发。先按向量相似度召回 top-K（`MEMORY_RECALL_TOP_K=5`，不设分数下限）合并候选记忆并赋予内部别名（S1.., M1..），交给 LLM 仲裁判别操作类型（`ADD` / `UPDATE` / `DELETE` / `NONE`）。
+- **版本化与软删除**：
+  - **UPDATE**：新插入一行（`status="active"`, `supersedes=旧id`），并将旧行状态置为 `superseded`，保留版本演进链。
+  - **DELETE**：将目标行状态置为 `deleted`，并记录撤回原话（`retired_evidence`）。
+  - **检索与注入**：仅针对 `status == "active" and kind == "fact"` 进行检索，通过 `MEMORY_MIN_SCORE` 阈值过滤，最多注入 `MEMORY_TOP_K` 条。旧值在运行时永不物理删除。
+- **代码护栏 (Fail-Closed)**：
+  - **证据溯源**：每条陈述必须包含逐字摘自用户原话的 `evidence`（NFKC + 空白折叠 + casefold 子串匹配且长度 ≥ 2）。
+  - **文本合规**：字符数 ≤ `MEMORY_TEXT_MAX_CHARS`（200）、无换行/制表符、无 `<` 或 `>`、不含 `long_term_memory`。
+  - **别名与操作校验**：别名非法、重复占用同一 target、阶段 2 漏报陈述均安全丢弃；阶段 2 严禁产出陈述外的新文本。
+  - **幂等去重**：`ADD` 写入前做规范化文本完全相同检查，相同则自动跳过。
+- **并发与持久化保证**：
+  - 单调客户端 INT64 主键（毫秒级微秒时间戳），避免 Milvus 服务端 autoID upsert 换主键问题。
+  - 全写操作在单进程 `threading.RLock` 内执行 check-and-set，向量计算在锁外完成。
+- **数据迁移与旧集合备份**：
+  - 新版本集合命名为 `user_memory_v2`（基于 `MEMORY_SCHEMA_VERSION=2`），全显式声明标量字段，关闭 dynamic fields 避免 Arrow KeyError。
+  - 启动时自动从旧集合 `user_memory` 进行幂等、非破坏性平滑迁移（复用向量，不重复调用 embedding；旧集合永久保留作为备份）。
+  - 迁移成功后在 `storage/memory_v2_migrated.flag` 写入标记文件，标记存在时永不重复迁移；`CLEAR_MEMORY_ON_STARTUP=True` 清空新库并写标记，避免旧数据复活；`REFRESH_COLLECTION` 不影响记忆库。
 
 ### 2.7 Skills 扩展机制
 系统采用 deepagents 官方 Skills 机制扩展专家的专业技能：
@@ -119,9 +135,10 @@ DeepAgentsRefactor/
 │   │       ├── retriever.py  # 媒体混合检索器 (Neo4j + Milvus)
 │   │       └── intent.py     # 媒体意图识别
 │   ├── memory/               # L2: 跨会话长期记忆
-│   │   ├── store.py          # Milvus 记忆集合初始化、检索与去重写入
+│   │   ├── store.py          # Milvus 记忆集合初始化、版本化维护与语义检索
 │   │   ├── injector.py       # 对话初次消息记忆注入与过滤
-│   │   └── extractor.py      # 后台记忆抽取与异步落盘
+│   │   ├── extractor.py      # 后台两阶段记忆抽取、对账与异步持久化
+│   │   └── guards.py         # 记忆纯函数代码护栏（证据校验/文本合规/对账规则）
 │   ├── tools/                # L3: 工具集合与适配器
 │   │   ├── knowledge_tools.py# RAG / Tavily / 时间查询工具
 │   │   ├── media_tools.py    # 媒体图谱检索工具
@@ -157,7 +174,7 @@ DeepAgentsRefactor/
 │   └── chat.py               # QQ 机器人消息接收与 ChatService 调度
 ├── scripts/                  # 运维与工具脚本
 │   ├── login_setup.py        # 浏览器自动化持久化登录引导脚本
-│   ├── manage_memory.py      # Milvus 长期记忆查看与清理工具
+│   ├── manage_memory.py      # Milvus 长期记忆管理工具 (list/delete/restore)
 │   └── migrate_to_mysql.py   # 数据迁移至 MySQL
 ├── skills/                   # deepagents 官方 Skills 目录
 │   └── matplotlib-chart/     # Matplotlib 绘图规范技能
@@ -171,8 +188,9 @@ DeepAgentsRefactor/
 │   ├── smoke_budget.py       # 专家工具调用预算（独立停止条件）冒烟测试
 │   ├── smoke_chat_service.py # chat_service 服务层离线冒烟测试
 │   ├── smoke_file_agent.py   # FileAgent 离线冒烟测试
-│   ├── smoke_knowledge.py    # 知识库 / 长期记忆离线冒烟测试
+│   ├── smoke_knowledge.py    # 知识库离线冒烟测试
 │   ├── smoke_markitdown_e2e.py # MarkItDown 端到端离线冒烟测试
+│   ├── smoke_memory.py       # 长期记忆两阶段召回对账与版本化离线冒烟测试
 │   ├── smoke_orchestrator.py # 主管编排与专家装配冒烟测试
 │   ├── smoke_skills.py       # Skills 规范与 Backend 路由冒烟测试
 │   └── smoke_units.py        # 纯函数单元冒烟测试
@@ -324,17 +342,18 @@ uv run python main.py --rebuild
 uv run python tests/run_smoke.py
 ```
 
-测试包含以下 10 个测试套件（共 86 个场景）：
+测试包含以下 11 个测试套件（共 97 个场景）：
 1. `tests/smoke_architecture.py`：分层单向依赖、语法禁令、空 `__init__`、提示词单例、专家规格、轻量隔离导入、无 Key 安全导入与 MCP 路径校验（8 个场景）。
 2. `tests/smoke_file_agent.py`：FileAgent 离线冒烟测试（含 MarkItDown 路径安全拦截、越界隔离、HITL 恢复映射等 16 个场景）。
 3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试。
 4. `tests/smoke_amap_contract.py`：高德地图 12 个本地工具契约与 Schema 快照测试（5 个场景）。
 5. `tests/smoke_amap_http.py`：高德工具 HTTP 异常与密钥脱敏测试（13 个场景）。
-6. `tests/smoke_chat_service.py`：多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复与 `/reset` 测试（6 个场景）。
+6. `tests/smoke_chat_service.py`：多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复、`/reset` 与图片轮不提取测试（7 个场景）。
 7. `tests/smoke_knowledge.py`：知识库建库、pending 增量入库、混合检索、长期记忆与 Reranker 阈值/降级离线冒烟测试（6 个场景）。
-8. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（4 个场景，含主管时间工具与专家预算装配）。
-9. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Docker沙箱加固与隔离、记忆提取NONE判定、Neo4j图约束确保等 12 个场景）。
-10. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、生产递归上限下失控保护等 15 个场景）。
+8. `tests/smoke_memory.py`：长期记忆两阶段召回对账、版本化演进、代码护栏、输入隔离、fail-closed、多线程并发与平滑迁移离线冒烟测试（9 个场景）。
+9. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（4 个场景，含主管时间工具与专家预算装配）。
+10. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Docker沙箱加固与隔离、Neo4j图约束确保等 11 个场景）。
+11. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、生产递归上限下失控保护等 18 个场景）。
 
 ---
 
@@ -344,3 +363,6 @@ uv run python tests/run_smoke.py
 2. **MemorySaver 会话重启丢失**: 当前状态保存器为内存级 `MemorySaver`，机器人进程重启后进行中的上下文与未决 HITL 中断会丢失。长期事实依赖 Milvus 后台抽取持久化。
 3. **专家单次委派有工具调用预算**: 每个专家单次委派内的工具调用次数受 `config.SUBAGENT_TOOL_LIMITS` 限制（见 2.8；FileAgent 默认 20 次，授权恢复后重新计数），触顶后调用被拦截、专家以已有结果收尾，复杂任务可能因此汇报不完整；`write_file` 对已存在文件会整体覆盖。
 4. **增量入库不是事务**: 图片/PDF 的 VLM 摘要生成、写入 Milvus、把文件从 `data/pending/` 移到 `data/source/` 是三个独立步骤，失败不会回滚。若 VLM 调用失败（或摘要已生成但入库前进程中断），而同一批还有其它成功入库的文档，该文件仍会被移动到 `data/source/`，其摘要块之后不会被自动补入，表现为“文件已归档，但检索不到”。恢复方式：修复后执行 `uv run python main.py --rebuild`；若文件仍卡在 `data/pending/`，先删除对应的 `data/pipeline/summaries/<hash>.md`，并确保 `REFRESH_BM25=False` 后重新启动。
+5. **记忆提取仅信任用户原话**: 只记录用户原话，用户用“对/是的”确认 AI 转述不会被记住。
+6. **历史会话记忆块不自动回溯清洗**: 会话历史里旧的 `<long_term_memory>` 块不会随记忆更新而清理。
+7. **相似度检索局限**: 相似度检索可能漏掉与当前问题无关的重要事实。

@@ -36,6 +36,7 @@ _initialized: bool = False
 _agent = None
 _chat_lock = asyncio.Lock()              # 同一时刻只处理一条消息（防止连发消息并发踩同一会话 / HITL 中断状态）
 _pending_outbox: Optional[list] = None   # HITL 中断期间暂存本轮已产生的图片
+_turn_user_text: Optional[str] = None    # 跨 HITL 中断保持的用户本轮原话（无图片时记录，有图片时保持 None）
 _checkpointer = None                     # init_service 里保存，/reset 时用它清空固定会话
 RESET_COMMANDS = {"/reset", "/new", "/新对话"}
 _background_tasks: Set[asyncio.Task] = set()
@@ -103,10 +104,11 @@ async def shutdown_service() -> None:
 
 async def _handle_reset(turn_start: float) -> ChatReply:
     """清空固定会话：丢弃挂起中的授权与历史上下文。"""
-    global _pending_outbox
+    global _pending_outbox, _turn_user_text
     if _checkpointer is not None:
         await _checkpointer.adelete_thread(THREAD_ID)
     _pending_outbox = None
+    _turn_user_text = None
     cli_logger.log_turn_end("已清空对话上下文，开始新的对话。", 0, False, time.perf_counter() - turn_start)
     return ChatReply("已清空对话上下文，开始新的对话。", [])
 
@@ -148,6 +150,8 @@ async def _prepare_round_input(
     turn_start: float,
 ) -> tuple[Optional[list], Optional[ChatReply]]:
     """新消息前置准备：图片 VLM 意图翻译、记忆注入与初次消息拼装。"""
+    global _turn_user_text
+    _turn_user_text = None
     processed_text = text
     if image_url:
         data_uri = await _load_image_as_data_uri(image_url)
@@ -189,6 +193,11 @@ async def _prepare_round_input(
         cli_logger.log_turn_end("（空消息）", 0, False, time.perf_counter() - turn_start)
         return None, None
 
+    if image_url is None:
+        _turn_user_text = text.strip()
+    else:
+        _turn_user_text = None
+
     outbox.begin()
     messages = await asyncio.to_thread(
         injector.build_initial_messages,
@@ -214,7 +223,7 @@ async def _finalize_round(
     turn_start: float,
 ) -> ChatReply:
     """回合收尾：检查中断状态、提取最终回复、收集发件箱图片并调度后台记忆提取。"""
-    global _pending_outbox
+    global _pending_outbox, _turn_user_text
     after_state = await agent.aget_state(agent_config)
     if hitl.has_pending_interrupts(after_state):
         _pending_outbox = outbox.current()
@@ -242,15 +251,10 @@ async def _finalize_round(
     round_images = outbox.current()
 
     try:
-        last_human_text = ""
-        for m in reversed(state_msgs):
-            if isinstance(m, HumanMessage):
-                last_human_text = extract_text(getattr(m, "content", "")).strip()
-                break
-
-        if last_human_text and final_text:
-            recent_chat = f"human: {last_human_text}\nai: {final_text}"
-            mem_task = asyncio.create_task(extractor.extract_and_store_memory(recent_chat))
+        user_text_to_extract = _turn_user_text
+        _turn_user_text = None
+        if user_text_to_extract:
+            mem_task = asyncio.create_task(extractor.extract_and_store_memory(user_text_to_extract))
             _background_tasks.add(mem_task)
             mem_task.add_done_callback(_background_tasks.discard)
     except Exception as bg_err:

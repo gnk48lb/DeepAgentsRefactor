@@ -69,10 +69,14 @@ MILVUS_DB_PATH = _resolve_path(
     os.getenv("MILVUS_DB_PATH") or "storage/gnk48_agent_collection.db"
 )
 
-# 长期记忆相似度阈值（IP 分数；向量归一化时等价于余弦相似度）
+# 长期记忆配置 (Schema v2 两阶段版本化记忆)
+MEMORY_SCHEMA_VERSION = 2
 MEMORY_MIN_SCORE = 0.45
-MEMORY_DEDUP_SCORE = 0.92
 MEMORY_TOP_K = 3  # 每轮最多注入的长期记忆条数
+MEMORY_RECALL_TOP_K = 5  # 阶段2对账候选召回 top-k
+MEMORY_TEXT_MAX_CHARS = 200  # 单条记忆最大字符数
+MEMORY_EXTRACT_MAX_USER_CHARS = 800  # 用户单轮原话提取上限，超过视为粘贴文本不提取
+MEMORY_MAX_STATEMENTS_PER_TURN = 4  # 单轮最多提取并处理的陈述条数
 
 # MySQL Configuration
 MYSQL_HOST = os.getenv("MYSQL_HOST") or "localhost"
