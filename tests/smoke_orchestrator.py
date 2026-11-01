@@ -27,7 +27,7 @@ EXPECTED_TOOLS = {
     "KnowledgeAgent": ["rag", "web_search"],
     "MediaAgent": ["av_graph_rag", "execute_sql"],
     "CodeAgent": ["execute_python_code"],
-    "BrowserAgent": ["read_webpage_content", "get_bilibili_profile", "execute_complex_browser_action"],
+    "BrowserAgent": ["read_webpage_content", "execute_complex_browser_action"],
 }
 BANNED = {"write_file", "edit_file", "delete", "execute", "ls", "glob", "grep"}
 

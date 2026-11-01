@@ -184,13 +184,20 @@ def get_current_time(placeholder: str = "default") -> str:
 def web_search(query: str) -> str:
     """【优先级最低：兜底工具】只有当 rag 工具未能从本地知识库返回任何有效信息时，才允许调用此工具搜索全网实时信息或百科。"""
     print(f"\n[Tool Call: web_search] Query: {query}")
+    api_key = (getattr(config, "TAVILY_API_KEY", None) or "").strip()
+    if not api_key:
+        return "Error: 未配置 TAVILY_API_KEY，网络搜索不可用。"
     try:
         # 注意：TavilySearchResults 会自动读取环境变量 TAVILY_API_KEY
-        search = TavilySearchResults(max_results=3)
+        search = TavilySearchResults(max_results=3, tavily_api_key=api_key)
         results = search.run(query)
+        if isinstance(results, str):
+            return f"Error: 网络搜索失败: {results}"
+        if not results:
+            return "未搜索到相关网络结果。"
         return str(results)
     except Exception as e:
-        return f"网络搜索失败: {str(e)}"
+        return f"Error: 网络搜索失败: {str(e)}"
 
 
 # get_current_time 只由主管挂载，不属于 KnowledgeAgent。

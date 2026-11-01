@@ -1,10 +1,21 @@
 """Playwright 浏览器自动化与网页抓取服务 (L1)"""
 
+import json
 import os
+import urllib.parse
+import httpx
 from browser_use import Agent, Browser
 from app import config
 
 _browser = None
+_http_client: httpx.AsyncClient | None = None
+
+
+def _redact_key(text: str, key: str) -> str:
+    """脱敏字符串中出现的敏感 API Key"""
+    if key and key in text:
+        return text.replace(key, "***")
+    return text
 
 async def init_browser():
     """
@@ -128,78 +139,80 @@ async def run_browser_task(task_description: str) -> str:
         print(f"\n[BrowserAgent Error]\n{traceback.format_exc()}")
         return error_msg
         
-def _extract_text_from_html(html: str) -> str:
-    """从 HTML 中剥离无用标签，提取干净的正文文本"""
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
-    # 移除噪音标签
-    for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside"]):
-        tag.decompose()
-
-    # 优先提取主内容区（role=main, main, article, 或 body）
-    main_content = (
-        soup.find(attrs={"role": "main"})
-        or soup.find("main")
-        or soup.find("article")
-        or soup.find("div", class_=lambda c: c and any(k in str(c).lower() for k in ["content", "article", "post", "main", "body"]))
-        or soup.body
-        or soup
-    )
-    text = main_content.get_text(separator="\n", strip=True)
-    import re
-    return re.sub(r"\n{3,}", "\n\n", text)
-
-
 async def fetch_generic_webpage_content(url: str) -> str:
-    import httpx
+    """使用 Tavily Extract API 云端提取网页 Markdown 内容 (L1)"""
+    clean_url = (url or "").strip()
+    try:
+        parsed = urllib.parse.urlparse(clean_url)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+            return "Error: 无效的 URL，必须是以 http:// 或 https:// 开头的完整网址。"
+    except Exception:
+        return "Error: 无效的 URL，必须是以 http:// 或 https:// 开头的完整网址。"
 
-    default_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        )
+    api_key = (getattr(config, "TAVILY_API_KEY", None) or "").strip()
+    if not api_key:
+        return "Error: 未配置 TAVILY_API_KEY，无法调用云端网页解析服务。"
+
+    endpoint = "https://api.tavily.com/extract"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "urls": [clean_url],
+        "extract_depth": "basic",
+        "format": "markdown",
     }
 
-    # 1. 优先尝试 Jina Reader（若配置了 JINA_API_KEY 或未被风控）
-    jina_key = config.JINA_API_KEY
-    jina_headers = dict(default_headers)
-    if jina_key:
-        jina_headers["Authorization"] = f"Bearer {jina_key}"
-
     try:
-        jina_url = f"https://r.jina.ai/{url}"
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            response = await client.get(jina_url, headers=jina_headers)
-            if response.status_code == 200 and response.text.strip():
-                return response.text
-            # 若 Jina 出现 401（匿名 IP 风控）/ 402 / 403 / 429 等，输出提示并自动回退为本地直连抓取
-            print(f"[BrowserService] ℹ️ Jina API 返回状态码 {response.status_code}，自动降级为本地直接抓取: {url}")
-    except Exception as e:
-        print(f"[BrowserService] ℹ️ Jina API 请求异常 ({e})，自动降级为本地直接抓取: {url}")
+        if _http_client is not None:
+            response = await _http_client.post(endpoint, json=payload, headers=headers)
+        else:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                response = await client.post(endpoint, json=payload, headers=headers)
 
-    # 2. 本地直接抓取降级方案（Direct HTTP Fetch + BeautifulSoup Text Extraction）
-    try:
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, headers=default_headers) as client:
-            resp = await client.get(url)
-            if resp.status_code == 200:
-                return _extract_text_from_html(resp.text)
-            return f"Error: 抓取网页失败，目标网站响应状态码 HTTP {resp.status_code}。"
-    except Exception as e:
-        return f"Error fetching webpage: {str(e)}"
+        if response.status_code != 200:
+            err_detail = ""
+            try:
+                err_json = response.json()
+                if isinstance(err_json, dict):
+                    err_detail = (
+                        err_json.get("detail")
+                        or err_json.get("error")
+                        or err_json.get("message")
+                        or response.text[:200]
+                    )
+                else:
+                    err_detail = response.text[:200]
+            except Exception:
+                err_detail = response.text[:200]
+            safe_err = _redact_key(str(err_detail or ""), api_key)
+            return f"Error: Tavily Extract 接口请求失败 (HTTP {response.status_code}): {safe_err}"
 
-async def fetch_bilibili_profile_data(uid: str) -> str:
-    from bilibili_api import user
-    import json
-    try:
-        u = user.User(int(uid))
-        info = await u.get_user_info()
-        dynamics = await u.get_dynamics(offset=0)
-        
-        result = {
-            "user_info": info,
-            "recent_dynamics": dynamics.get("cards", [])[:10] if isinstance(dynamics, dict) else dynamics[:10]
-        }
-        return json.dumps(result, ensure_ascii=False, indent=2)
+        try:
+            data = response.json()
+        except (ValueError, json.JSONDecodeError):
+            return "Error: Tavily Extract 返回了非法的 JSON 响应。"
+
+        results = data.get("results") or []
+        failed_results = data.get("failed_results") or []
+
+        if results and isinstance(results[0], dict):
+            raw_content = (results[0].get("raw_content") or "").strip()
+            if raw_content:
+                return raw_content
+
+        if failed_results and isinstance(failed_results[0], dict):
+            err_msg = failed_results[0].get("error") or "Unknown extraction error"
+            safe_msg = _redact_key(str(err_msg), api_key)
+            return f"Error: 网页内容提取失败 ({clean_url}): {safe_msg}"
+
+        return f"Error: 网页内容提取为空 ({clean_url})，目标页面可能无有效正文或受反爬限制。"
+
+    except httpx.TimeoutException:
+        return f"Error: 网页内容提取超时 ({clean_url})。"
     except Exception as e:
-        return f"Error fetching Bilibili profile: {str(e)}"
+        safe_err = _redact_key(str(e), api_key)
+        return f"Error: 网页内容提取请求异常: {safe_err}"
+
+

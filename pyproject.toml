@@ -5,7 +5,6 @@ description = "基于 DeepAgents 与 LangGraph 的多智能体 QQ 机器人与�
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
-    "bilibili-api-python>=17.4.1",
     "browser-use>=0.12.6",
     "docker>=7.0.0",
     "httpx>=0.28.1",

@@ -278,7 +278,7 @@ def test_e_expert_spec_table():
             browser_agent.SPEC,
             "BrowserAgent",
             "worker_llm",
-            ["read_webpage_content", "get_bilibili_profile", "execute_complex_browser_action"],
+            ["read_webpage_content", "execute_complex_browser_action"],
             (),
         ),
     ]

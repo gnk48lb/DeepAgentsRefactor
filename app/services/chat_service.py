@@ -31,14 +31,19 @@ class ChatReply:
     awaiting_approval: bool = False
 
 # ── 单用户模式：全局只有一个 Agent、一把锁、一个固定会话 ──
-THREAD_ID = "main"                       # 固定 thread_id：私聊 / 群聊共用同一份对话上下文
+# 固定 thread_id：私聊 / 群聊共用同一份对话上下文
+THREAD_ID = "main"                       
 _initialized: bool = False
 _agent = None
-_chat_lock = asyncio.Lock()              # 同一时刻只处理一条消息（防止连发消息并发踩同一会话 / HITL 中断状态）
-_pending_outbox: Optional[list] = None   # HITL 中断期间暂存本轮已产生的图片
-_turn_user_text: Optional[str] = None    # 跨 HITL 中断保持的用户本轮原话（无图片时记录，有图片时保持 None）
-_checkpointer = None                     # init_service 里保存，/reset 时用它清空固定会话
-RESET_COMMANDS = {"/reset", "/new", "/新对话"}
+# 同一时刻只处理一条消息（防止连发消息并发踩同一会话 / HITL 中断状态）
+_chat_lock = asyncio.Lock()              
+# HITL 中断期间暂存本轮已产生的图片
+_pending_outbox: Optional[list] = None   
+# 跨 HITL 中断保持的用户本轮原话（无图片时记录，有图片时保持 None）
+_turn_user_text: Optional[str] = None    
+# init_service 里保存，/reset 时用它清空固定会话
+_checkpointer = None                     
+RESET_COMMANDS = {"/reset", "/new"}
 _background_tasks: Set[asyncio.Task] = set()
 
 

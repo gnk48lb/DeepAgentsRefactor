@@ -9,6 +9,15 @@ tests/smoke_units.py
   E DesktopAgent 未应答 tool_calls 的判定
   F SQL 加固与超时只读
   G rag 同源图片描述只展开一次
+  H browser_service 幂等关闭
+  I milvus_client 生命周期与双重检查锁
+  J Docker 沙箱加固与隔离
+  K Neo4j 图约束确保与异常容错
+  L1 Tavily Extract 正常提取与截断
+  L2 Tavily Extract failed_results 容错
+  L3 Tavily Extract 状态码错误与 Key 脱敏
+  L4 Tavily Extract 非法 URL 与缺失 Key 拦截
+  L5 web_search 异常字符串识别与加固
 """
 import base64
 import os
@@ -389,6 +398,274 @@ def test_k_neo4j_schema_constraints():
     b.close()
 
 
+
+
+def test_l1_webpage_extract_and_truncate():
+    """L1 Tavily Extract 正常提取与截断验证"""
+    import asyncio
+    import json
+    import httpx
+    from app.infra import browser_service
+    from app.tools.browser_tools import read_webpage_content
+
+    orig_key = getattr(config, "TAVILY_API_KEY", None)
+    orig_client = browser_service._http_client
+    max_chars = getattr(config, "WEBPAGE_MAX_CHARS", 30000)
+    long_md = "# Long Markdown\n" + ("abcdefghij" * 4000)  # 40016 chars > 30000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert str(request.url) == "https://api.tavily.com/extract"
+        assert request.headers.get("Authorization") == "Bearer mock_tavily_key"
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["urls"] == ["https://example.com/test-article"]
+        assert body["extract_depth"] == "basic"
+        assert body["format"] == "markdown"
+        return httpx.Response(200, json={
+            "results": [{"url": "https://example.com/test-article", "raw_content": long_md}],
+            "failed_results": []
+        })
+
+    try:
+        config.TAVILY_API_KEY = "mock_tavily_key"
+        browser_service._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        # 1. 验证 fetch_generic_webpage_content 原样返回完整 Markdown，不截断
+        raw_res = asyncio.run(browser_service.fetch_generic_webpage_content("https://example.com/test-article"))
+        assert raw_res == long_md, "fetch_generic_webpage_content 应原样返回 Markdown 正文"
+
+        # 2. 验证 read_webpage_content 按 config.WEBPAGE_MAX_CHARS 正确截断
+        truncated = asyncio.run(read_webpage_content.ainvoke({"url": "https://example.com/test-article"}))
+        assert truncated.startswith(long_md[:max_chars]), "read_webpage_content 应保留前 WEBPAGE_MAX_CHARS 字符"
+        assert f"…（内容过长，已截断至前 {max_chars} 字符）" in truncated
+        assert len(truncated) == max_chars + len(f"\n…（内容过长，已截断至前 {max_chars} 字符）")
+    finally:
+        config.TAVILY_API_KEY = orig_key
+        browser_service._http_client = orig_client
+
+
+def test_l2_webpage_failed_results():
+    """L2 Tavily Extract failed_results 容错与空正文处理"""
+    import asyncio
+    import httpx
+    from app.infra import browser_service
+
+    orig_key = getattr(config, "TAVILY_API_KEY", None)
+    orig_client = browser_service._http_client
+
+    def handler_failed(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "results": [],
+            "failed_results": [{"url": "https://example.com/failed", "error": "Failed to retrieve content"}]
+        })
+
+    def handler_empty(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "results": [{"url": "https://example.com/empty", "raw_content": "   "}],
+            "failed_results": []
+        })
+
+    try:
+        config.TAVILY_API_KEY = "mock_tavily_key"
+
+        # 1. failed_results 数组非空
+        browser_service._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler_failed))
+        res_fail = asyncio.run(browser_service.fetch_generic_webpage_content("https://example.com/failed"))
+        assert res_fail.startswith("Error:"), f"预期以 Error: 开头，实际: {res_fail}"
+        assert "Failed to retrieve content" in res_fail
+        assert "https://example.com/failed" in res_fail
+
+        # 2. results raw_content 为空
+        browser_service._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler_empty))
+        res_empty = asyncio.run(browser_service.fetch_generic_webpage_content("https://example.com/empty"))
+        assert res_empty.startswith("Error:"), f"预期以 Error: 开头，实际: {res_empty}"
+        assert "网页内容提取为空" in res_empty
+    finally:
+        config.TAVILY_API_KEY = orig_key
+        browser_service._http_client = orig_client
+
+
+def test_l3_webpage_errors_and_redaction():
+    """L3 Tavily Extract 状态码错误、网络异常与 API Key 脱敏"""
+    import asyncio
+    import httpx
+    from app.infra import browser_service
+
+    orig_key = getattr(config, "TAVILY_API_KEY", None)
+    orig_client = browser_service._http_client
+    sensitive_key = "tvly-secret-key-123456789abcdef"
+
+    try:
+        config.TAVILY_API_KEY = sensitive_key
+
+        # 1. HTTP 401 携带 Key 明文响应
+        def handler_401(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={"detail": f"Unauthorized key: {sensitive_key}"})
+
+        browser_service._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler_401))
+        res_401 = asyncio.run(browser_service.fetch_generic_webpage_content("https://example.com"))
+        assert res_401.startswith("Error: Tavily Extract 接口请求失败 (HTTP 401):"), res_401
+        assert sensitive_key not in res_401, "API Key 未脱敏"
+        assert "***" in res_401
+
+        # 2. HTTP 429 配额耗尽
+        def handler_429(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(429, json={"error": f"Quota exceeded for {sensitive_key}"})
+
+        browser_service._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler_429))
+        res_429 = asyncio.run(browser_service.fetch_generic_webpage_content("https://example.com"))
+        assert res_429.startswith("Error: Tavily Extract 接口请求失败 (HTTP 429):"), res_429
+        assert sensitive_key not in res_429, "API Key 未脱敏"
+        assert "***" in res_429
+
+        # 3. HTTP 500 非 JSON 响应
+        def handler_500(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text=f"Crash dump with {sensitive_key}")
+
+        browser_service._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler_500))
+        res_500 = asyncio.run(browser_service.fetch_generic_webpage_content("https://example.com"))
+        assert res_500.startswith("Error: Tavily Extract 接口请求失败 (HTTP 500):"), res_500
+        assert sensitive_key not in res_500, "API Key 未脱敏"
+        assert "***" in res_500
+
+        # 4. HTTP 200 非法 JSON
+        def handler_bad_json(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text="not a valid json")
+
+        browser_service._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler_bad_json))
+        res_json = asyncio.run(browser_service.fetch_generic_webpage_content("https://example.com"))
+        assert res_json == "Error: Tavily Extract 返回了非法的 JSON 响应。"
+
+        # 5. 超时异常 (TimeoutException)
+        def handler_timeout(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout(f"Timed out with key {sensitive_key}")
+
+        browser_service._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler_timeout))
+        res_timeout = asyncio.run(browser_service.fetch_generic_webpage_content("https://example.com"))
+        assert res_timeout == "Error: 网页内容提取超时 (https://example.com)。"
+        assert sensitive_key not in res_timeout
+
+        # 6. 网络连接错误 (HTTPError / Exception)
+        def handler_net_err(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError(f"Connection refused with {sensitive_key}")
+
+        browser_service._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler_net_err))
+        res_err = asyncio.run(browser_service.fetch_generic_webpage_content("https://example.com"))
+        assert res_err.startswith("Error: 网页内容提取请求异常:"), res_err
+        assert sensitive_key not in res_err, "API Key 未脱敏"
+        assert "***" in res_err
+
+    finally:
+        config.TAVILY_API_KEY = orig_key
+        browser_service._http_client = orig_client
+
+
+def test_l4_webpage_url_and_key_guard():
+    """L4 Tavily Extract 非法 URL 与缺失 API Key 短路拦截"""
+    import asyncio
+    import httpx
+    from app.infra import browser_service
+
+    orig_key = getattr(config, "TAVILY_API_KEY", None)
+    orig_client = browser_service._http_client
+
+    def guard_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("短路校验失败：不应发起任何网络请求！")
+
+    try:
+        browser_service._http_client = httpx.AsyncClient(transport=httpx.MockTransport(guard_handler))
+        config.TAVILY_API_KEY = "mock_tavily_key"
+
+        # 1. 非法 URL 拦截测试
+        bad_urls = ["", "   ", "ftp://example.com/file", "javascript:alert(1)", "http://", "relative/path"]
+        for bad_url in bad_urls:
+            res = asyncio.run(browser_service.fetch_generic_webpage_content(bad_url))
+            assert res == "Error: 无效的 URL，必须是以 http:// 或 https:// 开头的完整网址。", (
+                f"URL '{bad_url}' 未被正确拦截: {res}"
+            )
+
+        # 2. 缺失 API Key 拦截测试
+        config.TAVILY_API_KEY = ""
+        res_nokey = asyncio.run(browser_service.fetch_generic_webpage_content("https://example.com"))
+        assert res_nokey == "Error: 未配置 TAVILY_API_KEY，无法调用云端网页解析服务。", res_nokey
+
+        config.TAVILY_API_KEY = "   "
+        res_space = asyncio.run(browser_service.fetch_generic_webpage_content("https://example.com"))
+        assert res_space == "Error: 未配置 TAVILY_API_KEY，无法调用云端网页解析服务。", res_space
+
+    finally:
+        config.TAVILY_API_KEY = orig_key
+        browser_service._http_client = orig_client
+
+
+def test_l5_web_search_hardening():
+    """L5 web_search 异常字符串识别、空结果与 Key 守卫"""
+    from app.tools import knowledge_tools
+
+    orig_key = getattr(config, "TAVILY_API_KEY", None)
+    orig_cls = knowledge_tools.TavilySearchResults
+
+    try:
+        # 1. 未配置 TAVILY_API_KEY
+        config.TAVILY_API_KEY = ""
+        res_nokey = knowledge_tools.web_search.invoke({"query": "python"})
+        assert res_nokey == "Error: 未配置 TAVILY_API_KEY，网络搜索不可用。", res_nokey
+
+        # 2. 模拟 TavilySearchResults.run 返回异常 repr 字符串
+        config.TAVILY_API_KEY = "mock_key"
+
+        class MockTavilySearchError:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self, query: str):
+                return "HTTPError('401 Client Error')"
+
+        knowledge_tools.TavilySearchResults = MockTavilySearchError
+        res_err_str = knowledge_tools.web_search.invoke({"query": "python"})
+        assert res_err_str == "Error: 网络搜索失败: HTTPError('401 Client Error')", res_err_str
+
+        # 3. 模拟 TavilySearchResults.run 返回空列表 []
+        class MockTavilySearchEmpty:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self, query: str):
+                return []
+
+        knowledge_tools.TavilySearchResults = MockTavilySearchEmpty
+        res_empty = knowledge_tools.web_search.invoke({"query": "python"})
+        assert res_empty == "未搜索到相关网络结果。", res_empty
+
+        # 4. 模拟 TavilySearchResults.run 返回正常列表
+        class MockTavilySearchNormal:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self, query: str):
+                return [{"url": "https://python.org", "content": "Python documentation"}]
+
+        knowledge_tools.TavilySearchResults = MockTavilySearchNormal
+        res_normal = knowledge_tools.web_search.invoke({"query": "python"})
+        assert res_normal == str([{"url": "https://python.org", "content": "Python documentation"}]), res_normal
+
+        # 5. 模拟抛出 Exception
+        class MockTavilySearchRaise:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self, query: str):
+                raise RuntimeError("Search socket closed")
+
+        knowledge_tools.TavilySearchResults = MockTavilySearchRaise
+        res_raise = knowledge_tools.web_search.invoke({"query": "python"})
+        assert res_raise == "Error: 网络搜索失败: Search socket closed", res_raise
+
+    finally:
+        config.TAVILY_API_KEY = orig_key
+        knowledge_tools.TavilySearchResults = orig_cls
+
+
 SCENARIOS = [
     ("A config._resolve_path", test_a_resolve_path),
     ("B bootstrap os.rename 兜底补丁", test_b_bootstrap_rename_fallback),
@@ -401,6 +678,11 @@ SCENARIOS = [
     ("I milvus_client 生命周期与双重检查锁", test_i_milvus_client_lifecycle),
     ("J Docker 沙箱加固与隔离", test_j_docker_sandbox_hardening),
     ("K Neo4j 图约束确保与异常容错", test_k_neo4j_schema_constraints),
+    ("L1 Tavily Extract 正常提取与截断", test_l1_webpage_extract_and_truncate),
+    ("L2 Tavily Extract failed_results 容错", test_l2_webpage_failed_results),
+    ("L3 Tavily Extract 状态码错误与 Key 脱敏", test_l3_webpage_errors_and_redaction),
+    ("L4 Tavily Extract 非法 URL 与缺失 Key 拦截", test_l4_webpage_url_and_key_guard),
+    ("L5 web_search 异常字符串识别与加固", test_l5_web_search_hardening),
 ]
 
 
