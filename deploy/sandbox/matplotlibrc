@@ -1,0 +1,12 @@
+font.sans-serif: Noto Sans CJK SC, Noto Sans CJK JP, DejaVu Sans
+axes.unicode_minus: False
+savefig.dpi: 150
+savefig.bbox: tight
+figure.figsize: 10, 6
+axes.titlesize: 16
+axes.labelsize: 12
+axes.grid: True
+grid.alpha: 0.3
+axes.spines.top: False
+axes.spines.right: False
+axes.prop_cycle: cycler('color', ['4C78A8', 'F58518', '54A24B', 'E45756', '72B7B2', 'B279A2'])

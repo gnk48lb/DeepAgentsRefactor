@@ -51,7 +51,6 @@ BM25_MODEL_PATH = os.path.join(PROJECT_ROOT, "storage", "bm25_model.json")
 AV_BM25_MODEL_PATH = os.path.join(PROJECT_ROOT, "storage", "av_bm25_model.json")
 BROWSER_PROFILE_DIR = os.path.join(PROJECT_ROOT, "storage", "browser_profile")
 OUTBOX_DEBUG_DIR = os.path.join(PROJECT_ROOT, "storage", "outbox_debug")
-SANDBOX_TMP_DIR = os.path.join(STORAGE_DIR, "sandbox_tmp")
 
 # 设置环境变量供 Hugging Face 和 Tavily 等库自动识别
 if HUGGINGFACEHUB_API_TOKEN:
@@ -126,10 +125,20 @@ ENABLE_QUERY_TRANSFORM = False
 
 # Docker Sandbox Configuration
 DOCKER_IMAGE_NAME = "python-ds:latest"
-DOCKER_MAX_MEM = "256m"
+DOCKER_MAX_MEM = os.getenv("DOCKER_MAX_MEM", "1g")
 DOCKER_PIDS_LIMIT = int(os.getenv("DOCKER_PIDS_LIMIT", "128"))
 DOCKER_NANO_CPUS = int(os.getenv("DOCKER_NANO_CPUS", "1000000000"))
+SANDBOX_TIMEOUT_SECONDS = int(os.getenv("SANDBOX_TIMEOUT_SECONDS", "60"))
+SANDBOX_IDLE_TTL_SECONDS = int(os.getenv("SANDBOX_IDLE_TTL_SECONDS", "1800"))
+SANDBOX_MAX_STDOUT_CHARS = int(os.getenv("SANDBOX_MAX_STDOUT_CHARS", "8000"))
+SANDBOX_MAX_STDERR_CHARS = int(os.getenv("SANDBOX_MAX_STDERR_CHARS", "3000"))
+SANDBOX_WORK_TMPFS_MB = int(os.getenv("SANDBOX_WORK_TMPFS_MB", "256"))
+SANDBOX_MOUNT_WORKSPACE = os.getenv("SANDBOX_MOUNT_WORKSPACE", "true").lower() in ("1", "true", "yes")
+SANDBOX_IMAGE_VERSION = os.getenv("SANDBOX_IMAGE_VERSION", "2")
 SANDBOX_MAX_IMAGES = int(os.getenv("SANDBOX_MAX_IMAGES", "4"))
+SANDBOX_MAX_IMAGE_MB = int(os.getenv("SANDBOX_MAX_IMAGE_MB", "10"))
+SANDBOX_USER_IMAGE_MAX_SIDE = int(os.getenv("SANDBOX_USER_IMAGE_MAX_SIDE", "1600"))
+SANDBOX_MODEL_IMAGE_MAX_SIDE = int(os.getenv("SANDBOX_MODEL_IMAGE_MAX_SIDE", "768"))
 
 REFRESH_COLLECTION = False
 CLEAR_MEMORY_ON_STARTUP = False
@@ -151,7 +160,7 @@ SUBAGENT_TOOL_LIMITS = {
     "KnowledgeAgent": 5,
     "MediaAgent": 10,
     "MapAgent": 12,
-    "CodeAgent": 8,
+    "CodeAgent": 10,
     "BrowserAgent": 6,
     "FileAgent": 20,
     "DesktopAgent": 20,

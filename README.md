@@ -44,7 +44,7 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 1. **KnowledgeAgent**: 知识检索专家，优先检索本地 Milvus 知识库 (`rag`)，无果且具时效性时通过 Tavily 全网搜索 (`web_search`)；时间类问题由主 Agent 通过自己挂载的 get_current_time 就地回答，KnowledgeAgent 不挂载该工具。
 2. **MediaAgent**: 成人影视专家，同时挂载 Neo4j 知识图谱检索 (`av_graph_rag`) 与 MySQL 只读查询 (`execute_sql`)：图谱负责实体 / 合作关系网络与题材标签，数据库负责身高、罩杯、出生年份等精确属性过滤与发行年份统计，复合问题由它自己组合完成。
 3. **MapAgent**: 地理与出行专家，挂载高德地图本地工具（共 12 个高德本地 Tool），支持天气查询、周边检索、路径规划与地理编码。约定：路线、周边搜索、测距的位置参数既可传文字地址也可传'经度,纬度'，工具内部自动解析（文字地址跨城有歧义时会报错要求补城市）；只有 maps_regeocode 必须传坐标。
-4. **CodeAgent**: 代码执行专家，通过 Docker 隔离沙箱安全运行 Python 脚本，支持数据分析与 Matplotlib 绘图（绘图规范由 Skill `matplotlib-chart` 提供）。
+4. **CodeAgent**: 代码执行专家，通过会话级常驻 Docker 沙箱安全运行 Python 脚本，支持只读访问用户工作区（`/workspace/...`），进行数学计算、数据处理与图表绘制（绘图规范由 Skill `matplotlib-chart` 提供，数据分析规范由 Skill `data-analysis` 提供）。沙箱预置中文字体、热启动支持与流式输出截断。
 5. **BrowserAgent**: 浏览器自动化专家，基于 Playwright/browser-use 操控真实浏览器（可见模式），处理网页端交互。
 6. **FileAgent (HITL)**: 本地文件专家，内置 FilesystemMiddleware + FilesystemBackend + 原生 HITL。提供工具：`ls`/`glob`/`grep`/`read_file` 免授权，`convert_to_markdown`（由 markitdown-mcp 提供，支持富文档转 Markdown），`write_file`/`edit_file`/`create_directory`/`move_file` 需授权，删除 = 移动到 archive_trash 归档。只能在 workspace 工作区内操作。转换结果过大时会暂存到 `/_artifacts/large_tool_results/<id>`，FileAgent 用 `read_file` 分页读回。
 7. **DesktopAgent (HITL)**: 桌面操作专家，基于网格坐标截屏、模拟点击与键鼠交互。
@@ -99,6 +99,15 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 - **实现方式**：声明式专家与 FileAgent 用 langchain 的 `ToolCallLimitMiddleware` + `ModelCallLimitMiddleware`；DesktopAgent 是手写子图，按已执行的工具步数手动计数，超限直接返回确定性汇报（不再调用模型）。
 - **FileAgent 与 HITL**：授权恢复后计数重新开始；超预算被拦下的写入类调用不再弹授权。
 - 预算是“止损阈值”而不是常规用量：日志里出现 `Tool call limit exceeded` / `Model call limits exceeded` 说明某个专家触顶，按真实用量调整 `SUBAGENT_TOOL_LIMITS`。
+
+### 2.9 代码沙箱设计取舍与演进路径
+系统在代码沙箱的设计上遵循严格的权责分离与最小暴露面原则：
+- **为什么 v1 坚持 CodeAgent 单一工具面（不接 FilesystemMiddleware）**：
+  - **权责分明与降低认知负荷**：`FileAgent` 专属负责工作区文件的写、改、删与格式转换，受 HITL 人工审批约束；`CodeAgent` 专属负责执行 Python 代码进行数据分析、数学计算与图表绘制，其沙箱内工作区通过 `/workspace` **只读**挂载，杜绝代码执行误删或破坏用户真实工程。
+  - **消除冗余与工具争抢**：若 CodeAgent 同时挂载 shell、write_file、read_file 与 execute_python_code，LLM 极易在“是用 Python 脚本读文件”还是“用 read_file 工具读文件”之间摇摆，反而降低任务规划效率。
+- **平滑演进通道（BaseSandbox 契约）**：
+  - `DockerSandbox` 严格对齐并实现了 `deepagents.backends.sandbox.BaseSandbox` 抽象基类契约（包含 `id`、`execute(command, *, timeout=None)`、`upload_files`、`download_files` 规范以及对 `timeout=0` 的默认时限回落处理）。
+  - 该抽象接口使得底层沙箱与标准 `FilesystemBackend` 协议完全兼容。一旦未来决定为 `CodeAgent` 开放文件交互能力，只需在专家装配层将其 backend 配置为 `CompositeBackend(primary=docker_sandbox, secondary=...)`，无缝挂接 `FilesystemMiddleware`，而底层的 Docker 隔离与执行逻辑无需任何侵入性改动。
 
 ---
 
@@ -231,7 +240,10 @@ uv sync
 - **MySQL**:
   - 存储女优与作品结构化关系数据，供 `MediaAgent` 的 `execute_sql` 工具精确筛选查询。MySQL 需用户自备（`deploy/docker-compose.yml` 中不包含）。建议为该工具分配专用只读账号（如 `GRANT SELECT ON av_db.* TO 'readonly'@'%'`），并在 `.env` 中配置对应的 `MYSQL_USER` 与 `MYSQL_PASSWORD`。
 - **Docker Python 沙箱**:
-  - 供 `CodeAgent` 启动轻量容器 (`python-ds:latest`) 安全运行数据分析与绘图代码。可通过 `docker build -t python-ds:latest deploy/sandbox` 构建镜像。
+  - 供 `CodeAgent` 启动轻量容器 (`python-ds:latest`) 安全运行数据分析与绘图代码。
+  - 镜像基于 `python:3.13-slim`，预置了完整的数据科学常用依赖（pandas, numpy, matplotlib, seaborn, scipy, scikit-learn, openpyxl, xlrd, tabulate, pyyaml, sympy 等）与开箱即用的中文字体（Noto Sans CJK SC/JP），并预热了 matplotlib 字体缓存以实现亚秒级热启动。
+  - 可通过 `docker build -t python-ds:latest deploy/sandbox` 构建镜像。
+  - > **注意**：修改 `deploy/sandbox/Dockerfile`、`requirements.txt` 或 `matplotlibrc` 后，需重新执行镜像构建命令；若已有常驻沙箱容器正在运行，需重启机器人进程或等待空闲 TTL（`SANDBOX_IDLE_TTL_SECONDS=1800`）触发容器自动重建后方可生效。
 
 ### 4.4 QQ 机器人配置 (仅 bot.py 需要)
 若使用 QQ 官方机器人（通过 `bot.py` 启动），需在 `.env` 中配置以下环境变量（NoneBot2 自动读取）：
@@ -342,18 +354,21 @@ uv run python main.py --rebuild
 uv run python tests/run_smoke.py
 ```
 
-测试包含以下 11 个测试套件（共 97 个场景）：
+测试包含以下 12 个测试套件（共 113 个场景）：
 1. `tests/smoke_architecture.py`：分层单向依赖、语法禁令、空 `__init__`、提示词单例、专家规格、轻量隔离导入、无 Key 安全导入与 MCP 路径校验（8 个场景）。
 2. `tests/smoke_file_agent.py`：FileAgent 离线冒烟测试（含 MarkItDown 路径安全拦截、越界隔离、HITL 恢复映射等 16 个场景）。
-3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试。
+3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试（2 个场景）。
 4. `tests/smoke_amap_contract.py`：高德地图 12 个本地工具契约与 Schema 快照测试（5 个场景）。
 5. `tests/smoke_amap_http.py`：高德工具 HTTP 异常与密钥脱敏测试（13 个场景）。
 6. `tests/smoke_chat_service.py`：多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复、`/reset` 与图片轮不提取测试（7 个场景）。
 7. `tests/smoke_knowledge.py`：知识库建库、pending 增量入库、混合检索、长期记忆与 Reranker 阈值/降级离线冒烟测试（6 个场景）。
 8. `tests/smoke_memory.py`：长期记忆两阶段召回对账、版本化演进、代码护栏、输入隔离、fail-closed、多线程并发与平滑迁移离线冒烟测试（9 个场景）。
 9. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（4 个场景，含主管时间工具与专家预算装配）。
-10. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Docker沙箱加固与隔离、Neo4j图约束确保等 11 个场景）。
-11. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、生产递归上限下失控保护等 18 个场景）。
+10. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Neo4j图约束确保、图片编码与自检等 15 个场景）。
+11. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、生产递归上限下失控保护等 17 个场景）。
+12. `tests/smoke_sandbox.py`：Docker 沙箱架构契约与防护离线冒烟测试（含配置参数校验、单例跨调用复用与 TTL 超时重建、执行超时防护、输出洪泛头尾截断、多模态产物解析与安全防御、Docker 未启动友好引导、只读挂载降级与软链接防御、BaseSandbox 与 CompositeBackend 抽象基类契约、资源释放幂等性、并发串行化、code_tools 工具层与 Outbox 旁路集成等 11 个场景）。
+
+此外还提供 `tests/live_sandbox.py` 真机验收测试套件（包含 9 项端到端用例，需在已启动 Docker 守护进程的环境下执行 `uv run python tests/live_sandbox.py --live` 运行）。
 
 ---
 
@@ -366,3 +381,7 @@ uv run python tests/run_smoke.py
 5. **记忆提取仅信任用户原话**: 只记录用户原话，用户用“对/是的”确认 AI 转述不会被记住。
 6. **历史会话记忆块不自动回溯清洗**: 会话历史里旧的 `<long_term_memory>` 块不会随记忆更新而清理。
 7. **相似度检索局限**: 相似度检索可能漏掉与当前问题无关的重要事实。
+8. **沙箱 /work 为临时内存文件系统**: 沙箱中的工作目录 `/work` 基于 256MB tmpfs 内存文件系统，机器人进程重启或会话空闲超过 `SANDBOX_IDLE_TTL_SECONDS` 触发清理重建后内容清空，非持久化存储。
+9. **沙箱产物导出目前仅支持图片**: 目前沙箱多模态解析仅自动识别并导出 `/work/outputs/` 下的有效图片（PNG/JPEG/WebP/GIF），非图片产物（CSV/JSON/HTML 等中间结果）v1 暂不导出。
+10. **沙箱会话级单例模式**: 沙箱在单机器人进程中采用单例设计与固定容器标签（`gnk48.sandbox=1`）。若在同一宿主机上并发启动多个机器人实例，可能发生容器抢占或清理冲突（建议单实例运行）。
+11. **沙箱镜像更新需手动重新构建**: 修改 `deploy/sandbox/` 下的 Dockerfile 或配置文件后需手动执行 `docker build` 重新构建；运行中的常驻沙箱容器不会自动感知镜像变更，需重启机器人或待空闲 TTL 触发重建。

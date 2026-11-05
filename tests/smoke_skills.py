@@ -20,8 +20,6 @@ if hasattr(sys.stderr, "reconfigure"):
 # 确保项目根目录在 sys.path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-
-
 # 仅导入 app.agents.skills，严禁导入 app.infra.models / app.agents.orchestrator
 from app.agents.skills import build_skills_backend, SKILLS_ROUTE, SKILLS_DIR
 
@@ -108,18 +106,31 @@ def run_checks() -> bool:
         else:
             print(f"  ✅ 描述检查: 非空且长度 {len(desc)} ≤ 1024")
 
-        # 检查关键字 /workspace/outputs/ 与 plt.show
-        if "/workspace/outputs/" not in text:
-            print("  ❌ 错误: SKILL.md 未包含 '/workspace/outputs/'")
-            all_passed = False
-        else:
-            print("  ✅ 关键字检查: 包含 '/workspace/outputs/'")
+        # 按技能分别断言关键字
+        if skill_dir_name == "matplotlib-chart":
+            if "/work/outputs/" not in text:
+                print("  ❌ 错误: matplotlib-chart SKILL.md 未包含 '/work/outputs/'")
+                all_passed = False
+            else:
+                print("  ✅ 关键字检查: 包含 '/work/outputs/'")
 
-        if "plt.show" not in text:
-            print("  ❌ 错误: SKILL.md 未包含 'plt.show'")
-            all_passed = False
-        else:
-            print("  ✅ 关键字检查: 包含 'plt.show'")
+            if "plt.show" not in text:
+                print("  ❌ 错误: matplotlib-chart SKILL.md 未包含 'plt.show'")
+                all_passed = False
+            else:
+                print("  ✅ 关键字检查: 包含 'plt.show'")
+        elif skill_dir_name == "data-analysis":
+            if "/workspace" not in text:
+                print("  ❌ 错误: data-analysis SKILL.md 未包含 '/workspace'")
+                all_passed = False
+            else:
+                print("  ✅ 关键字检查: 包含 '/workspace'")
+
+            if "/work" not in text:
+                print("  ❌ 错误: data-analysis SKILL.md 未包含 '/work'")
+                all_passed = False
+            else:
+                print("  ✅ 关键字检查: 包含 '/work'")
 
     # 2. backend 装配与虚拟路径检查
     print(f"\n[检查 Backend 装配与路由]:")
@@ -150,7 +161,7 @@ def run_checks() -> bool:
         elif isinstance(read_res, str):
             content = read_res
 
-        if content and "/workspace/outputs/" in content and "matplotlib-chart" in content:
+        if content and "/work/outputs/" in content and "matplotlib-chart" in content:
             print(f"  ✅ backend.read('{target_skill_path}') 成功读取内容 ({len(content)} 字符)")
         else:
             print(f"  ❌ 错误: backend.read 内容不符合预期: {read_res}")
@@ -162,7 +173,7 @@ def run_checks() -> bool:
     # 检查 download_files (SkillsMiddleware 使用的加载方法)
     try:
         dl_res = backend.download_files([target_skill_path])
-        if dl_res and len(dl_res) > 0 and dl_res[0].content and b"/workspace/outputs/" in dl_res[0].content:
+        if dl_res and len(dl_res) > 0 and dl_res[0].content and b"/work/outputs/" in dl_res[0].content:
             print(f"  ✅ backend.download_files(['{target_skill_path}']) 成功下载 ({len(dl_res[0].content)} 字节)")
         else:
             print(f"  ❌ 错误: backend.download_files 返回异常: {dl_res}")

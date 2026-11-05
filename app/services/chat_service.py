@@ -101,6 +101,11 @@ async def shutdown_service() -> None:
     await browser_service.close_browser()
     milvus_client.close_client()
     await amap.aclose()
+    try:
+        from app.infra import sandbox
+        await asyncio.to_thread(sandbox.shutdown_sandbox)
+    except Exception as e:
+        print(f"⚠️ 警告：沙箱销毁失败 (非致命): {e}")
     _agent = None
     _checkpointer = None
     _initialized = False
@@ -112,6 +117,11 @@ async def _handle_reset(turn_start: float) -> ChatReply:
     global _pending_outbox, _turn_user_text
     if _checkpointer is not None:
         await _checkpointer.adelete_thread(THREAD_ID)
+    try:
+        from app.infra import sandbox
+        await asyncio.to_thread(sandbox.reset_sandbox)
+    except Exception as e:
+        print(f"⚠️ 警告：沙箱重置失败 (非致命): {e}")
     _pending_outbox = None
     _turn_user_text = None
     cli_logger.log_turn_end("已清空对话上下文，开始新的对话。", 0, False, time.perf_counter() - turn_start)
