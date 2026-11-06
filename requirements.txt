@@ -38,8 +38,6 @@ anyio==4.12.1
     #   sse-starlette
     #   starlette
     #   watchfiles
-apscheduler==3.11.2
-    # via bilibili-api-python
 attrs==26.1.0
     # via
     #   aiohttp
@@ -48,15 +46,9 @@ attrs==26.1.0
 backoff==2.2.1
     # via posthog
 beautifulsoup4==4.14.3
-    # via
-    #   bilibili-api-python
-    #   markdownify
-bilibili-api-python==17.4.1
-    # via gnk48-agent
+    # via markdownify
 bracex==3.0.1
     # via wcmatch
-brotli==1.2.0
-    # via bilibili-api-python
 browser-use==0.12.6
     # via gnk48-agent
 browser-use-sdk==2.0.15
@@ -86,12 +78,10 @@ click==8.3.1
     #   uvicorn
 cloudpickle==3.1.2
     # via browser-use
-colorama==0.4.6
+colorama==0.4.6 ; sys_platform == 'win32'
     # via
-    #   bilibili-api-python
     #   click
     #   loguru
-    #   qrcode
     #   tqdm
     #   uvicorn
 cryptography==46.0.7
@@ -247,7 +237,9 @@ langchain==1.4.0
     #   deepagents
     #   gnk48-agent
 langchain-anthropic==1.7.1
-    # via deepagents
+    # via
+    #   deepagents
+    #   gnk48-agent
 langchain-classic==1.0.7
     # via langchain-community
 langchain-community==0.4.1
@@ -307,9 +299,7 @@ langsmith==0.12.2
 loguru==0.7.3
     # via nonebot2
 lxml==6.1.0
-    # via
-    #   bilibili-api-python
-    #   python-docx
+    # via python-docx
 markdown-it-py==4.2.0
     # via rich
 markdownify==1.2.2
@@ -386,10 +376,8 @@ pfzy==0.3.4
     # via inquirerpy
 pillow==12.1.1
     # via
-    #   bilibili-api-python
     #   browser-use
     #   gnk48-agent
-    #   qrcode-terminal
     #   reportlab
 playwright==1.59.0
     # via gnk48-agent
@@ -427,8 +415,6 @@ pyautogui==0.9.54
     # via gnk48-agent
 pycparser==3.0 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
     # via cffi
-pycryptodomex==3.23.0
-    # via bilibili-api-python
 pydantic==2.12.5
     # via
     #   anthropic
@@ -469,9 +455,7 @@ pygments==2.20.0
 pygtrie==2.5.0
     # via nonebot2
 pyjwt==2.12.1
-    # via
-    #   bilibili-api-python
-    #   mcp
+    # via mcp
 pymilvus==3.0.0
     # via gnk48-agent
 pymilvus-model==0.3.2
@@ -1252,19 +1236,12 @@ pywin32==311 ; sys_platform == 'win32'
     #   portalocker
 pyyaml==6.0.3
     # via
-    #   bilibili-api-python
     #   huggingface-hub
     #   langchain-classic
     #   langchain-community
     #   langchain-core
     #   transformers
     #   uvicorn
-qrcode==8.2
-    # via
-    #   bilibili-api-python
-    #   qrcode-terminal
-qrcode-terminal==0.8
-    # via bilibili-api-python
 referencing==0.37.0
     # via
     #   jsonschema
@@ -1413,11 +1390,7 @@ typing-inspection==0.4.2
     #   pydantic
     #   pydantic-settings
 tzdata==2026.2 ; sys_platform == 'emscripten' or sys_platform == 'win32'
-    # via
-    #   pandas
-    #   tzlocal
-tzlocal==5.3.1
-    # via apscheduler
+    # via pandas
 uritemplate==4.2.0
     # via google-api-python-client
 urllib3==2.7.0
@@ -1461,7 +1434,6 @@ xxhash==3.7.0
 yarl==1.23.0
     # via
     #   aiohttp
-    #   bilibili-api-python
     #   nonebot-adapter-qq
     #   nonebot2
 zstandard==0.25.0

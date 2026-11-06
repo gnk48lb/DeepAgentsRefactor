@@ -15,6 +15,7 @@ SMOKES = [
     "tests/smoke_knowledge.py",
     "tests/smoke_memory.py",
     "tests/smoke_orchestrator.py",
+    "tests/smoke_models.py",
     "tests/smoke_units.py",
     "tests/smoke_sandbox.py",
 ]

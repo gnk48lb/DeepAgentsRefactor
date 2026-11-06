@@ -17,6 +17,8 @@ tests/smoke_units.py
   L3 Tavily Extract 状态码错误与 Key 脱敏
   L4 Tavily Extract 非法 URL 与缺失 Key 拦截
   L5 web_search 异常字符串识别与加固
+  M DesktopAgent thinking/redacted_thinking 签名块保留
+  N browser_use provider 客户端选择（不启动浏览器）
 """
 import base64
 import os
@@ -586,6 +588,68 @@ def test_l5_web_search_hardening():
         knowledge_tools.TavilySearchResults = orig_cls
 
 
+def test_m_desktop_thinking_preservation():
+    original = [
+        {"type": "thinking", "thinking": "reasoning", "signature": "signed"},
+        {"type": "redacted_thinking", "data": "opaque"},
+        {"type": "text", "text": "visible"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+    ]
+    ai = AIMessage(
+        content=original,
+        tool_calls=[{"name": "take_grid_screenshot", "args": {}, "id": "shot1"}],
+        additional_kwargs={"marker": "keep"},
+    )
+    out = da._sanitize_messages_for_llm([ai])[0]
+    assert [part["type"] for part in out.content] == ["thinking", "redacted_thinking", "text", "image_url"]
+    assert out.content[0]["signature"] == "signed"
+    assert out.content[1]["data"] == "opaque"
+    assert out.tool_calls == ai.tool_calls
+    assert out.additional_kwargs["marker"] == "keep"
+
+
+def test_n_browser_client_selection():
+    from app.infra import browser_service
+
+    names = (
+        "BROWSER_VLM_PROVIDER", "BROWSER_VLM_MODEL", "GEMINI_API_KEY",
+        "MAGPIE_API_KEY", "MAGPIE_BASE_URL", "MAGPIE_MAX_TOKENS",
+        "MAGPIE_TIMEOUT_SECONDS", "MAGPIE_MAX_RETRIES",
+    )
+    original = {name: getattr(config, name) for name in names}
+    try:
+        config.BROWSER_VLM_PROVIDER = "magpie"
+        config.BROWSER_VLM_MODEL = "test-magpie-model"
+        config.MAGPIE_API_KEY = "local"
+        config.MAGPIE_BASE_URL = "http://127.0.0.1:3425"
+        config.MAGPIE_MAX_TOKENS = 1234
+        config.MAGPIE_TIMEOUT_SECONDS = 45.0
+        config.MAGPIE_MAX_RETRIES = 3
+        magpie = browser_service._build_browser_llm()
+        assert type(magpie).__name__ == "ChatAnthropic"
+        assert magpie.provider == "anthropic"
+        assert magpie.model == "test-magpie-model"
+        assert str(magpie.base_url) == "http://127.0.0.1:3425"
+        assert magpie.max_tokens == 1234 and magpie.max_retries == 3
+
+        config.BROWSER_VLM_PROVIDER = "gemini"
+        config.BROWSER_VLM_MODEL = "gemini-test"
+        config.GEMINI_API_KEY = "dummy"
+        gemini = browser_service._build_browser_llm()
+        assert type(gemini).__name__ == "ChatGoogle"
+
+        config.BROWSER_VLM_PROVIDER = "unknown"
+        try:
+            browser_service._build_browser_llm()
+        except ValueError as e:
+            assert "BROWSER_VLM_PROVIDER" in str(e)
+        else:
+            raise AssertionError("未知浏览器 provider 应报错")
+    finally:
+        for name, value in original.items():
+            setattr(config, name, value)
+
+
 SCENARIOS = [
     ("A config._resolve_path", test_a_resolve_path),
     ("B bootstrap os.rename 兜底补丁", test_b_bootstrap_rename_fallback),
@@ -602,6 +666,8 @@ SCENARIOS = [
     ("L3 Tavily Extract 状态码错误与 Key 脱敏", test_l3_webpage_errors_and_redaction),
     ("L4 Tavily Extract 非法 URL 与缺失 Key 拦截", test_l4_webpage_url_and_key_guard),
     ("L5 web_search 异常字符串识别与加固", test_l5_web_search_hardening),
+    ("M DesktopAgent thinking 签名块保留", test_m_desktop_thinking_preservation),
+    ("N browser_use provider 客户端选择", test_n_browser_client_selection),
 ]
 
 

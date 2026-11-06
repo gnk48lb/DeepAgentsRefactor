@@ -61,6 +61,9 @@ def _sanitize_messages_for_llm(messages: list) -> list:
                     clean_parts.append({"type": "text", "text": str(text_val)})
                 elif item.get("type") == "image_url":
                     clean_parts.append(item)
+                elif item.get("type") in ("thinking", "redacted_thinking"):
+                    # Anthropic 推理块含签名，后续工具轮次必须原样保留。
+                    clean_parts.append(item)
             content = clean_parts if clean_parts else ""
 
         # 使用 model_copy 仅更新 content，保留其余所有元数据（thought_signature, tool_calls, id 等）

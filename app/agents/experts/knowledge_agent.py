@@ -24,5 +24,5 @@ SPEC = ExpertSpec(
     description=DESCRIPTION,
     system_prompt=PROMPT,
     tools_factory=lambda: knowledge_tools.TOOLS,
-    model_key="vlm",
+    model_key="knowledge_llm",
 )

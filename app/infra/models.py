@@ -6,6 +6,7 @@ import threading
 import requests
 from pydantic import BaseModel
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
+from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI, HarmCategory, HarmBlockThreshold
 from pymilvus.model.sparse import BM25EmbeddingFunction
 from langchain_core.embeddings import Embeddings
@@ -21,6 +22,8 @@ logging.getLogger("jieba").setLevel(logging.WARNING)
 logging.getLogger("google").setLevel(logging.WARNING)
 logging.getLogger("google_genai").setLevel(logging.WARNING)
 logging.getLogger("langchain_google_genai").setLevel(logging.WARNING)
+logging.getLogger("anthropic").setLevel(logging.WARNING)
+logging.getLogger("langchain_anthropic").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -173,11 +176,40 @@ def _require_gemini_key():
         raise ValueError("未配置 GEMINI_API_KEY（或 GOOGLE_API_KEY）")
 
 
+_MIGRATED_ROLE_CONFIG = {
+    "WORKER_LLM": (config.WORKER_LLM_PROVIDER, config.WORKER_LLM_MODEL),
+    "ORCHESTRATOR_LLM": (config.ORCHESTRATOR_LLM_PROVIDER, config.ORCHESTRATOR_LLM_MODEL),
+    "KNOWLEDGE_LLM": (config.KNOWLEDGE_LLM_PROVIDER, config.KNOWLEDGE_LLM_MODEL),
+    "INGESTION_VLM": (config.INGESTION_VLM_PROVIDER, config.INGESTION_VLM_MODEL),
+    "BROWSER_VLM": (config.BROWSER_VLM_PROVIDER, config.BROWSER_VLM_MODEL),
+    "DESKTOP_VLM": (config.DESKTOP_VLM_PROVIDER, config.DESKTOP_VLM_MODEL),
+}
+
+
+def _validate_role_config(role: str, provider: str, model_name: str):
+    if provider not in ("gemini", "magpie"):
+        raise ValueError(f"{role}_PROVIDER 仅支持 gemini 或 magpie，当前为 {provider!r}")
+    if not model_name.strip():
+        raise ValueError(f"{role}_MODEL 不能为空")
+    if provider == "magpie":
+        if not config.MAGPIE_BASE_URL.strip():
+            raise ValueError("使用 Magpie 时 MAGPIE_BASE_URL 不能为空")
+        if not config.MAGPIE_API_KEY.strip():
+            raise ValueError("使用 Magpie 时 MAGPIE_API_KEY 不能为空（本地网关可填 local）")
+
+
 def validate_required_keys():
+    # 原实现（保留用于迁移对照）：
+    # if not config.GEMINI_API_KEY:
+    #     raise ValueError("未配置 GEMINI_API_KEY（或 GOOGLE_API_KEY）")
+    # if not config.SILICON_FLOW_API_KEY:
+    #     raise ValueError("未配置 SILICON_FLOW_API_KEY（知识库/记忆的嵌入与重排依赖它）")
     if not config.GEMINI_API_KEY:
-        raise ValueError("未配置 GEMINI_API_KEY（或 GOOGLE_API_KEY）")
+        raise ValueError("未配置 GEMINI_API_KEY（或 GOOGLE_API_KEY）；轻量工具、聊天 VLM 与记忆提取仍依赖它")
     if not config.SILICON_FLOW_API_KEY:
         raise ValueError("未配置 SILICON_FLOW_API_KEY（知识库/记忆的嵌入与重排依赖它）")
+    for role, (provider, model_name) in _MIGRATED_ROLE_CONFIG.items():
+        _validate_role_config(role, provider, model_name)
 
 
 _analyzer = None
@@ -223,50 +255,85 @@ def _make_reranker():
     return SiliconFlowReranker(config.RERANKER_MODEL, config.SILICON_FLOW_API_KEY or "")
 
 
-def _make_worker_llm():
+def _make_gemini_chat(model_name: str):
     _require_gemini_key()
     return ChatGoogleGenerativeAI(
-        model=config.WORKER_LLM_MODEL,
+        model=model_name,
         google_api_key=config.GEMINI_API_KEY,
         safety_settings=DEFAULT_SAFETY_SETTINGS,
     )
+
+
+def _make_magpie_chat(model_name: str):
+    return ChatAnthropic(
+        model=model_name,
+        base_url=config.MAGPIE_BASE_URL,
+        api_key=config.MAGPIE_API_KEY,
+        max_tokens=config.MAGPIE_MAX_TOKENS,
+        timeout=config.MAGPIE_TIMEOUT_SECONDS,
+        max_retries=config.MAGPIE_MAX_RETRIES,
+    )
+
+
+def _make_role_chat(role: str):
+    provider, model_name = _MIGRATED_ROLE_CONFIG[role]
+    _validate_role_config(role, provider, model_name)
+    if provider == "magpie":
+        return _make_magpie_chat(model_name)
+    return _make_gemini_chat(model_name)
+
+
+def _make_worker_llm():
+    # Gemini 原实现（保留用于回退对照）：
+    # _require_gemini_key()
+    # return ChatGoogleGenerativeAI(
+    #     model=config.WORKER_LLM_MODEL,
+    #     google_api_key=config.GEMINI_API_KEY,
+    #     safety_settings=DEFAULT_SAFETY_SETTINGS,
+    # )
+    return _make_role_chat("WORKER_LLM")
 
 
 def _make_orchestrator_llm():
-    _require_gemini_key()
-    return ChatGoogleGenerativeAI(
-        model=config.ORCHESTRATOR_LLM_MODEL,
-        google_api_key=config.GEMINI_API_KEY,
-        safety_settings=DEFAULT_SAFETY_SETTINGS,
-    )
-
+    # Gemini 原实现（保留用于回退对照）：
+    # _require_gemini_key()
+    # return ChatGoogleGenerativeAI(
+    #     model=config.ORCHESTRATOR_LLM_MODEL,
+    #     google_api_key=config.GEMINI_API_KEY,
+    #     safety_settings=DEFAULT_SAFETY_SETTINGS,
+    # )
+    return _make_role_chat("ORCHESTRATOR_LLM")
 
 
 def _make_desktop_llm():
-    _require_gemini_key()
-    return ChatGoogleGenerativeAI(
-        model=config.DESKTOP_VLM_MODEL,
-        google_api_key=config.GEMINI_API_KEY,
-        safety_settings=DEFAULT_SAFETY_SETTINGS,
-    )
+    # Gemini 原实现（保留用于回退对照）：
+    # _require_gemini_key()
+    # return ChatGoogleGenerativeAI(
+    #     model=config.DESKTOP_VLM_MODEL,
+    #     google_api_key=config.GEMINI_API_KEY,
+    #     safety_settings=DEFAULT_SAFETY_SETTINGS,
+    # )
+    return _make_role_chat("DESKTOP_VLM")
+
+
+def _make_knowledge_llm():
+    return _make_role_chat("KNOWLEDGE_LLM")
+
+
+def _make_ingestion_vlm():
+    return _make_role_chat("INGESTION_VLM")
+
+
+def _make_utility_llm():
+    return _make_gemini_chat(config.UTILITY_LLM_MODEL)
 
 
 def _make_vlm():
-    _require_gemini_key()
-    return ChatGoogleGenerativeAI(
-        model=config.VLM_MODEL,
-        google_api_key=config.GEMINI_API_KEY,
-        safety_settings=DEFAULT_SAFETY_SETTINGS,
-    )
+    return _make_gemini_chat(config.VLM_MODEL)
 
 
 def _make_extractor_llm():
-    _require_gemini_key()
-    return ChatGoogleGenerativeAI(
-        model=config.EXTRACTOR_LLM_MODEL,
-        google_api_key=config.GEMINI_API_KEY,
-        safety_settings=DEFAULT_SAFETY_SETTINGS,
-    )
+    return _make_gemini_chat(config.EXTRACTOR_LLM_MODEL)
 
 
 _lock = threading.RLock()
@@ -280,6 +347,9 @@ _FACTORIES = {
     "worker_llm": _make_worker_llm,
     "orchestrator_llm": _make_orchestrator_llm,
     "desktop_llm": _make_desktop_llm,
+    "knowledge_llm": _make_knowledge_llm,
+    "ingestion_vlm": _make_ingestion_vlm,
+    "utility_llm": _make_utility_llm,
     "vlm": _make_vlm,
     "extractor_llm": _make_extractor_llm,
 }

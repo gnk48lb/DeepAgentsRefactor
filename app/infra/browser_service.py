@@ -73,20 +73,44 @@ BROWSER_ACTION_RULES = (
     "3. 【处理弹窗】：上传完封面或勾选协议时，网页常会弹出“确认/确定”的蒙版遮罩弹窗。你必须优先寻找并点击该弹窗中的“确定”按钮（若点击失效，用 JS evaluate 强行清除或点击），直到弹窗彻底消失，才能去操作底部的后续按钮（如“提交稿件”）。"
 )
 
+def _build_browser_llm():
+    """按显式 provider 构造 browser_use 自己的模型客户端（非 LangChain 接口）。"""
+    provider = config.BROWSER_VLM_PROVIDER
+    if provider == "magpie":
+        from browser_use.llm.anthropic.chat import ChatAnthropic
+        return ChatAnthropic(
+            model=config.BROWSER_VLM_MODEL,
+            api_key=config.MAGPIE_API_KEY,
+            base_url=config.MAGPIE_BASE_URL,
+            max_tokens=config.MAGPIE_MAX_TOKENS,
+            timeout=config.MAGPIE_TIMEOUT_SECONDS,
+            max_retries=config.MAGPIE_MAX_RETRIES,
+        )
+    if provider == "gemini":
+        from browser_use.llm.google.chat import ChatGoogle
+        return ChatGoogle(
+            model=config.BROWSER_VLM_MODEL,
+            api_key=config.GEMINI_API_KEY,
+        )
+
+    # 原 Gemini-only 实现（保留用于迁移对照）：
+    # if "gemini" in config.BROWSER_VLM_MODEL.lower():
+    #     from browser_use.llm.google.chat import ChatGoogle
+    #     browser_llm = ChatGoogle(
+    #         model=config.BROWSER_VLM_MODEL,
+    #         api_key=config.GEMINI_API_KEY,
+    #     )
+    # else:
+    #     raise ValueError("BROWSER_VLM_MODEL 必须是 Gemini 模型")
+    raise ValueError(f"BROWSER_VLM_PROVIDER 仅支持 gemini 或 magpie，当前为 {provider!r}")
+
+
 async def run_browser_task(task_description: str) -> str:
     """
     运行 BrowserAgent 任务
     """
     try:
-        if "gemini" in config.BROWSER_VLM_MODEL.lower():
-            from browser_use.llm.google.chat import ChatGoogle
-            browser_llm = ChatGoogle(
-                model=config.BROWSER_VLM_MODEL,
-                api_key=config.GEMINI_API_KEY,
-            )
-        else:
-            raise ValueError("BROWSER_VLM_MODEL 必须是 Gemini 模型")
-            
+        browser_llm = _build_browser_llm()
         browser = await init_browser()
 
         # ── 🛡️ 路径绝对化与安全白名单升级 ──

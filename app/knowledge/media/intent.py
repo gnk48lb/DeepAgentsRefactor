@@ -24,7 +24,7 @@ class QueryIntent(BaseModel):
 
 class MediaQueryTranslator:
     def __init__(self):
-        self.llm = models.worker_llm
+        self.llm = models.utility_llm
         
     def translate(self, query: str) -> QueryIntent:
         parser = PydanticOutputParser(pydantic_object=QueryIntent)

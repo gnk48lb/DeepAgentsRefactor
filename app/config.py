@@ -96,23 +96,56 @@ EMBEDDING_MODEL = "BAAI/bge-m3"
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 RAG_MIN_RERANK_SCORE = float(os.getenv("RAG_MIN_RERANK_SCORE", "0.1"))
 
-# 文字模型 LLM (Worker)
-WORKER_LLM_MODEL = "gemini-3.5-flash-lite"
+# Magpie 本地网关（Anthropic Messages 协议；SDK 自动拼接 /v1/messages）
+MAGPIE_BASE_URL = os.getenv("MAGPIE_BASE_URL") or "http://127.0.0.1:3425"
+MAGPIE_API_KEY = os.getenv("MAGPIE_API_KEY") or "local"
+MAGPIE_MODEL = os.getenv("MAGPIE_MODEL") or "minimax-code-global/MiniMax-M3.1-Flash"
+MAGPIE_MAX_TOKENS = int(os.getenv("MAGPIE_MAX_TOKENS", "16384"))
+MAGPIE_TIMEOUT_SECONDS = float(os.getenv("MAGPIE_TIMEOUT_SECONDS", "600"))
+MAGPIE_MAX_RETRIES = int(os.getenv("MAGPIE_MAX_RETRIES", "2"))
 
-# 文字模型 LLM (Orchestrator)
-ORCHESTRATOR_LLM_MODEL = "gemini-3.5-flash-lite"
 
-# 多模态模型 VLM
-VLM_MODEL = "gemini-3.5-flash-lite"
+def _llm_provider(env_name: str) -> str:
+    return (os.getenv(env_name) or "magpie").strip().lower()
 
-# 浏览器多模态模型 (BrowserAgent)
-BROWSER_VLM_MODEL = "gemini-3.5-flash-lite"
 
-# 桌面多模态模型 (DesktopAgent)
-DESKTOP_VLM_MODEL = "gemini-3.5-flash-lite"
+def _role_model(env_name: str, provider: str, gemini_default: str) -> str:
+    """未显式覆盖模型时，让 provider 回退自动选回对应的 Gemini 型号。"""
+    return os.getenv(env_name) or (MAGPIE_MODEL if provider == "magpie" else gemini_default)
 
-# 记忆提取模型 (Memory Extraction)
-EXTRACTOR_LLM_MODEL = os.getenv("EXTRACTOR_LLM_MODEL") or "gemini-3.1-flash-lite"
+
+# 原硬编码 Gemini 配置（保留用于迁移对照）：
+# WORKER_LLM_MODEL = "gemini-3.5-flash-lite"
+# ORCHESTRATOR_LLM_MODEL = "gemini-3.5-flash-lite"
+# VLM_MODEL = "gemini-3.5-flash-lite"
+# BROWSER_VLM_MODEL = "gemini-3.5-flash-lite"
+# DESKTOP_VLM_MODEL = "gemini-3.5-flash-lite"
+
+# 重任务：主管与各工具型专家（Anthropic / Magpie，可逐角色回退 Gemini）
+WORKER_LLM_PROVIDER = _llm_provider("WORKER_LLM_PROVIDER")
+WORKER_LLM_MODEL = _role_model("WORKER_LLM_MODEL", WORKER_LLM_PROVIDER, "gemini-3.5-flash-lite")
+
+ORCHESTRATOR_LLM_PROVIDER = _llm_provider("ORCHESTRATOR_LLM_PROVIDER")
+ORCHESTRATOR_LLM_MODEL = _role_model("ORCHESTRATOR_LLM_MODEL", ORCHESTRATOR_LLM_PROVIDER, "gemini-3.5-flash-lite")
+
+KNOWLEDGE_LLM_PROVIDER = _llm_provider("KNOWLEDGE_LLM_PROVIDER")
+KNOWLEDGE_LLM_MODEL = _role_model("KNOWLEDGE_LLM_MODEL", KNOWLEDGE_LLM_PROVIDER, "gemini-3.5-flash-lite")
+
+INGESTION_VLM_PROVIDER = _llm_provider("INGESTION_VLM_PROVIDER")
+INGESTION_VLM_MODEL = _role_model("INGESTION_VLM_MODEL", INGESTION_VLM_PROVIDER, "gemini-3.5-flash-lite")
+
+BROWSER_VLM_PROVIDER = _llm_provider("BROWSER_VLM_PROVIDER")
+BROWSER_VLM_MODEL = _role_model("BROWSER_VLM_MODEL", BROWSER_VLM_PROVIDER, "gemini-3.5-flash-lite")
+
+DESKTOP_VLM_PROVIDER = _llm_provider("DESKTOP_VLM_PROVIDER")
+DESKTOP_VLM_MODEL = _role_model("DESKTOP_VLM_MODEL", DESKTOP_VLM_PROVIDER, "gemini-3.5-flash-lite")
+
+# 轻量、低延迟调用：固定保留 Gemini
+UTILITY_LLM_MODEL = os.getenv("UTILITY_LLM_MODEL") or "gemini-3.5-flash-lite"
+VLM_MODEL = os.getenv("VLM_MODEL") or "gemini-3.5-flash-lite"
+
+# 记忆提取模型 (Memory Extraction)：后台结构化任务，固定保留 Gemini
+EXTRACTOR_LLM_MODEL = os.getenv("EXTRACTOR_LLM_MODEL") or "gemini-3.5-flash-lite"
 
 # SiliconFlow 相关配置 (暂时注释)
 SILICON_FLOW_BASE_URL = "https://api.siliconflow.cn/v1"

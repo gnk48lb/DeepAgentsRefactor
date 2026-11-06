@@ -28,7 +28,7 @@ from app.agents.experts import (
 
 
 def _register_harness_profiles():
-    for _provider in ("google_genai", "openai"):
+    for _provider in ("google_genai", "openai", "anthropic"):
         try:
             register_harness_profile(
                 _provider,
@@ -60,6 +60,8 @@ def _declarative_subagents() -> list:
 
 
 async def _local_subagents() -> tuple[CompiledSubAgent, CompiledSubAgent, CompiledSubAgent]:
+    # CodeAgent / FileAgent 由 create_agent 独立编译；上方 HarnessProfile 只作用于主图与声明式专家，
+    # 不会接管这两个 CompiledSubAgent 自己声明的工具白名单与 HITL。
     code_runnable = code_agent.build_code_agent_runnable(
         llm=models.worker_llm,
         system_prompt=code_agent.PROMPT,

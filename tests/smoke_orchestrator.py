@@ -4,19 +4,22 @@ tests/smoke_orchestrator.py
 编排层装配离线冒烟测试:桩掉 MCP 子进程,用真实的 prompt / 工具 / 专家规格装配主 Agent。
   A subagents 顺序(task 工具向 LLM 展示的顺序)
   B 各声明式专家的工具名顺序 / skills 与规格表一致
-  C 生产模型(ChatGoogleGenerativeAI)解析到的 HarnessProfile 仍排除 write_file/edit_file/delete/execute,
+  C 生产模型(ChatAnthropic / ChatGoogleGenerativeAI)解析到的 HarnessProfile 仍排除 write_file/edit_file/delete/execute,
     并且禁用了内置 general-purpose。这是防止 LLM 通过 /skills/ 路由写真实磁盘的唯一屏障,
     deepagents 升级后一旦失效必须立刻暴露。
   D 主管直接挂载 get_current_time;各声明式专家挂载[软停止, 硬停止]预算中间件且数值与 config 一致。
-不需要真实 API Key / 网络:Gemini 客户端用占位 key 构造,构造时不会发请求。
+不需要真实 API Key / 网络:模型客户端用占位 key 构造,构造时不会发请求。
 """
 import asyncio
 import os
 import sys
 import traceback
 
-for _k in ("GEMINI_API_KEY", "SILICON_FLOW_API_KEY", "HUGGINGFACEHUB_API_TOKEN", "AMAP_API_KEY"):
+for _k in ("GEMINI_API_KEY", "SILICON_FLOW_API_KEY", "HUGGINGFACEHUB_API_TOKEN", "AMAP_API_KEY", "MAGPIE_API_KEY"):
     os.environ[_k] = "dummy"   # 显式覆盖:本测试绝不应使用真实 key
+for _role in ("WORKER_LLM", "ORCHESTRATOR_LLM", "KNOWLEDGE_LLM", "INGESTION_VLM", "BROWSER_VLM", "DESKTOP_VLM"):
+    os.environ[f"{_role}_PROVIDER"] = "magpie"
+    os.environ.pop(f"{_role}_MODEL", None)
 
 from app.infra import mcp_service, models  # noqa: E402
 from app.agents import orchestrator  # noqa: E402
@@ -75,8 +78,10 @@ def test_c_harness_profile():
         from deepagents.graph import _harness_profile_for_model
     except ImportError as e:   # deepagents 没有公开的 profile 查询接口,只能依赖这个私有函数
         raise AssertionError(f"deepagents 内部 API 已变化({e!r}):请人工复核 excluded_tools 是否仍然生效!")
-    for label in ("orchestrator_llm", "worker_llm"):
-        prof = _harness_profile_for_model(getattr(models, label), None)
+    for label in ("orchestrator_llm", "worker_llm", "knowledge_llm"):
+        llm = getattr(models, label)
+        assert llm._get_ls_params()["ls_provider"] == "anthropic", f"{label} 应走 Anthropic 协议"
+        prof = _harness_profile_for_model(llm, None)
         missing = BANNED - set(prof.excluded_tools)
         assert not missing, f"{label} 的 HarnessProfile 未排除 {sorted(missing)}:LLM 将重新获得写工具!"
         assert "read_file" not in prof.excluded_tools, f"{label} 的 HarnessProfile 误排除了 read_file!"

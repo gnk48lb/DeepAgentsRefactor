@@ -235,11 +235,35 @@ uv sync
 
 ### 4.2 配置环境变量
 参考 `.env.example` 在根目录下创建 `.env` 文件并填入相应 API 密钥：
-- `GEMINI_API_KEY`（或 `GOOGLE_API_KEY`）：必填，Gemini 模型 API 密钥。
+- `GEMINI_API_KEY`（或 `GOOGLE_API_KEY`）：必填，轻量工具调用、聊天图片意图翻译与记忆提取仍使用 Gemini。
 - `AMAP_API_KEY`：高德地图 Web 服务 API Key。
 - `TAVILY_API_KEY`：Tavily 搜索 API Key。
 - `SILICON_FLOW_API_KEY`：硅基流动 Embedding / Reranker API Key。
 - `HUGGINGFACEHUB_API_TOKEN`：Hugging Face 访问令牌。
+
+#### LLM 角色与 Magpie 网关
+
+较重的 agentic 角色默认通过 **Anthropic Messages 协议**访问本机 Magpie；轻量、低延迟或当前已稳定的结构化调用保留 Gemini。Magpie 的 base URL 是 `http://127.0.0.1:3425`（不要在后面追加 `/v1`），本地网关默认使用占位 key `local`。
+
+| 角色配置前缀 | 默认 provider | 用途 |
+|---|---|---|
+| `ORCHESTRATOR_LLM` | Magpie | 主管规划、委派与综合 |
+| `WORKER_LLM` | Magpie | Media / Map / 外层 Browser / Code / File |
+| `KNOWLEDGE_LLM` | Magpie | KnowledgeAgent，RAG 结果可能含图 |
+| `INGESTION_VLM` | Magpie | 知识库图片摘要（批量） |
+| `BROWSER_VLM` | Magpie | 嵌套 browser_use 视觉浏览器自动化 |
+| `DESKTOP_VLM` | Magpie | DesktopAgent 视觉桌面控制 |
+| `UTILITY_LLM` | 固定 Gemini | 媒体意图解析与查询改写 |
+| `VLM` | 固定 Gemini | 聊天图片到文本的低延迟意图翻译 |
+| `EXTRACTOR_LLM` | 固定 Gemini | 后台记忆结构化提取 |
+
+公共网关配置：`MAGPIE_BASE_URL`、`MAGPIE_API_KEY`、`MAGPIE_MODEL`、`MAGPIE_MAX_TOKENS`、`MAGPIE_TIMEOUT_SECONDS`、`MAGPIE_MAX_RETRIES`。默认模型为 `minimax-code-global/MiniMax-M3.1-Flash`，每个迁移角色可用 `<ROLE>_MODEL` 单独覆盖，模型 ID 直接取 Magpie `/v1/models` 返回的值，不加 `anthropic:` 前缀。
+
+每个迁移角色都可独立回退。例如将 `WORKER_LLM_PROVIDER=gemini` 写入 `.env` 并重启进程即可；若设置过 `WORKER_LLM_MODEL`，同时删除它或改为原 Gemini 型号。未显式覆盖模型时，provider 会自动选择对应的默认型号。回退后请开启新会话，不混用不同 provider 的历史推理块。
+
+可替换为其他 Magpie 模型，但工具型 agent 必须支持工具调用；`WORKER_LLM`（图表预览）、`KNOWLEDGE_LLM`、`INGESTION_VLM`、`BROWSER_VLM`、`DESKTOP_VLM` 必须支持图片输入。思考模型需要足够的输出预算，避免整轮只有 thinking 而没有正文或工具调用。
+
+当前应用进程运行在宿主机，Docker 只承载无网络代码沙箱，因此默认 loopback 地址即可。若以后把应用本身容器化，需通过 `MAGPIE_BASE_URL` 改为宿主机网关地址或服务名；明文 HTTP 只应用于 loopback/可信网络。
 
 ### 4.3 基础服务组件与说明
 - **Milvus 向量数据库说明**:
@@ -365,7 +389,7 @@ uv run python main.py --rebuild
 uv run python tests/run_smoke.py
 ```
 
-测试包含以下 12 个测试套件（共 122 个场景）：
+测试包含以下 13 个离线测试套件：
 1. `tests/smoke_architecture.py`：分层单向依赖、语法禁令、空 `__init__`、提示词单例、专家规格、轻量隔离导入、无 Key 安全导入与 MCP 路径校验（8 个场景）。
 2. `tests/smoke_file_agent.py`：FileAgent 离线冒烟测试（含 MarkItDown 路径安全拦截、越界隔离、HITL 恢复映射等 16 个场景）。
 3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试（2 个场景）。
@@ -375,11 +399,14 @@ uv run python tests/run_smoke.py
 7. `tests/smoke_knowledge.py`：知识库建库、pending 增量入库、混合检索、长期记忆与 Reranker 阈值/降级离线冒烟测试（6 个场景）。
 8. `tests/smoke_memory.py`：长期记忆两阶段召回对账、版本化演进、代码护栏、输入隔离、fail-closed、多线程并发与平滑迁移离线冒烟测试（9 个场景）。
 9. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（4 个场景，含主管时间工具与专家预算装配）。
-10. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Neo4j图约束确保、图片编码与自检等 15 个场景）。
+10. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Neo4j图约束确保、图片编码与自检、Anthropic thinking 保留与浏览器 provider 选择等 17 个场景）。
 11. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、生产递归上限下失控保护等 18 个场景）。
 12. `tests/smoke_sandbox.py`：Docker 沙箱架构契约与防护离线冒烟测试（含配置参数校验、单例跨调用复用与 TTL 超时重建、执行超时防护、输出洪泛头尾截断、多模态产物解析与安全防御、Docker 未启动友好引导、只读挂载降级与软链接防御、BaseSandbox 与 CompositeBackend 抽象基类契约、资源释放幂等性、并发串行化、code_tools 工具层与 Outbox 旁路集成、P0 命令包装与输出上限、O 超时细分保留状态、P 客户端缓存与 clamp、Q 指纹去重、R 沙箱工作台装配与 S 多模态中间件等 19 个场景）。
+13. `tests/smoke_models.py`：模型角色默认 provider、Gemini 回退、未知 provider、缺 key 作用域、惰性单例与 thinking 文本隔离测试（5 个场景，构造过程不访问网络）。
 
 此外还提供 `tests/live_sandbox.py` 真机验收测试套件（包含 18 项端到端用例，需在已启动 Docker 守护进程的环境下执行 `uv run python tests/live_sandbox.py --live` 运行；慢测试需追加 `--slow` 参数）。
+
+`tests/live_magpie.py` 是独立的 Magpie 协议探针，覆盖文本、工具轮次、普通图片、工具结果内图片和 browser_use 结构化输出。它不会启动真实浏览器/Desktop，也不会执行真实工具；只有显式设置 `RUN_MAGPIE_LIVE=1` 后运行 `uv run python tests/live_magpie.py` 才会访问网关，且不会加入离线 smoke 或 CI。
 
 ---
 

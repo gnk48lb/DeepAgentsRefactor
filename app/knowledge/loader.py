@@ -109,7 +109,7 @@ def process_pdfs_and_images(source_dir=None, is_incremental=False):
                 )
                 
                 try:
-                    res = models.vlm.invoke([msg])
+                    res = models.ingestion_vlm.invoke([msg])
                     content_res = extract_text(res.content)
                     rel_img_path = os.path.relpath(file_path, config.DATA_DIR)
                     with open(summary_path, "w", encoding="utf-8") as f:

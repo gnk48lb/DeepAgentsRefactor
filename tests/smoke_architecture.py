@@ -270,7 +270,7 @@ def test_e_expert_spec_table():
     from app.agents import orchestrator
 
     expected_specs = [
-        (knowledge_agent.SPEC, "KnowledgeAgent", "vlm", ["rag", "web_search"], ()),
+        (knowledge_agent.SPEC, "KnowledgeAgent", "knowledge_llm", ["rag", "web_search"], ()),
         (media_agent.SPEC, "MediaAgent", "worker_llm", ["av_graph_rag", "execute_sql"], ()),
         (
             browser_agent.SPEC,
@@ -343,10 +343,16 @@ import os, sys, pkgutil, importlib
 keys = [
     "GEMINI_API_KEY", "GOOGLE_API_KEY", "SILICON_FLOW_API_KEY",
     "HUGGINGFACEHUB_API_TOKEN", "AMAP_API_KEY", "TAVILY_API_KEY",
-    "CLOUDFLARE_API_TOKEN"
+    "CLOUDFLARE_API_TOKEN", "MAGPIE_API_KEY", "ANTHROPIC_API_KEY"
 ]
 for k in keys:
     os.environ[k] = ""
+
+# 固定走 Magpie 默认路径，验证没有 Gemini key 也能离线构造 Anthropic 客户端。
+for role in ("WORKER_LLM", "ORCHESTRATOR_LLM", "KNOWLEDGE_LLM", "INGESTION_VLM", "BROWSER_VLM", "DESKTOP_VLM"):
+    os.environ[role + "_PROVIDER"] = "magpie"
+    os.environ.pop(role + "_MODEL", None)
+os.environ["MAGPIE_BASE_URL"] = "http://127.0.0.1:3425"
 
 import app
 for info in pkgutil.walk_packages(app.__path__, "app."):
@@ -354,11 +360,15 @@ for info in pkgutil.walk_packages(app.__path__, "app."):
 
 from app.infra import models
 
-try:
-    _ = models.worker_llm
-    raise AssertionError("models.worker_llm 应在缺少 key 时抛出 ValueError")
-except ValueError:
-    pass
+# 默认 Magpie worker 只需本地配置即可构造，且构造过程不得访问网络。
+_ = models.worker_llm
+
+for model_key in ("utility_llm", "vlm", "extractor_llm"):
+    try:
+        getattr(models, model_key)
+        raise AssertionError(f"models.{model_key} 应在缺少 Gemini key 时抛出 ValueError")
+    except ValueError:
+        pass
 
 try:
     models.validate_required_keys()
