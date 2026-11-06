@@ -268,12 +268,10 @@ def test_e_expert_spec_table():
         browser_agent,
     )
     from app.agents import orchestrator
-    from app.agents.skills import SKILLS_ROUTE
 
     expected_specs = [
         (knowledge_agent.SPEC, "KnowledgeAgent", "vlm", ["rag", "web_search"], ()),
         (media_agent.SPEC, "MediaAgent", "worker_llm", ["av_graph_rag", "execute_sql"], ()),
-        (code_agent.SPEC, "CodeAgent", "worker_llm", ["execute_python_code"], (SKILLS_ROUTE,)),
         (
             browser_agent.SPEC,
             "BrowserAgent",
@@ -291,6 +289,13 @@ def test_e_expert_spec_table():
         )
         assert spec.skills == skills, f"Skills mismatch for {name}: {spec.skills} != {skills}"
 
+    # CodeAgent 已升级为 CompiledSubAgent 工作台，不再是声明式 ExpertSpec
+    assert hasattr(code_agent, "build_code_agent_runnable") and callable(code_agent.build_code_agent_runnable)
+    assert hasattr(code_agent, "SANDBOX_FS_TOOLS")
+    assert "delete" not in code_agent.SANDBOX_FS_TOOLS
+    assert "execute" in code_agent.SANDBOX_FS_TOOLS
+    assert "read_file" in code_agent.SANDBOX_FS_TOOLS
+
     # MapAgent 校验：工具名顺序需与 tools_snapshot.json 一致
     assert map_agent.SPEC.name == "MapAgent"
     assert map_agent.SPEC.model_key == "worker_llm"
@@ -298,8 +303,8 @@ def test_e_expert_spec_table():
     snap_data = json.loads((ROOT / "app/tools/amap/tools_snapshot.json").read_text(encoding="utf-8"))
     assert [t.name for t in map_agent.SPEC.tools_factory()] == [item["name"] for item in snap_data]
 
-    # orchestrator._DECLARATIVE_SPECS 顺序验证
-    expected_order = ["KnowledgeAgent", "MediaAgent", "MapAgent", "CodeAgent", "BrowserAgent"]
+    # orchestrator._DECLARATIVE_SPECS 顺序验证 (不含 CodeAgent/FileAgent/DesktopAgent)
+    expected_order = ["KnowledgeAgent", "MediaAgent", "MapAgent", "BrowserAgent"]
     actual_order = [s.name for s in orchestrator._DECLARATIVE_SPECS]
     assert actual_order == expected_order, f"Declarative specs order mismatch: {actual_order} != {expected_order}"
 

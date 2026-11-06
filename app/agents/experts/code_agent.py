@@ -1,36 +1,144 @@
-"""代码执行与数据分析专家智能体规范与提示词 (所在层: L4)"""
+"""代码执行与数据分析专家智能体构建 (所在层: L4)
 
+CodeAgent：基于 deepagents 的沙箱工作台，挂载 DockerSandbox、FilesystemMiddleware、
+SkillsMiddleware 与 SandboxOutputsMiddleware（产物统一提取与多模态回传）。
+提供工具：ls, read_file, write_file, edit_file, glob, grep, execute 以及 execute_python_code。
+注意：故意不含 delete 工具；/workspace 只读挂载；/skills 走宿主虚拟路径。
+"""
+
+import asyncio
+from typing import Any
+
+from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
+from deepagents.middleware.filesystem import FilesystemMiddleware
+from deepagents.middleware.skills import SkillsMiddleware
+from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import ToolMessage
+
+from app import config
+from app.agents.budget import build_budget_middleware, tool_limit_for
 from app.agents.prompts import WORKER_BASE_PROMPT
-from app.agents.skills import SKILLS_ROUTE
-from app.agents.spec import ExpertSpec
+from app.agents.skills import SKILLS_DIR, SKILLS_ROUTE
+from app.infra import sandbox
 from app.tools import code_tools
 
+NAME = "CodeAgent"
+
 DESCRIPTION = (
-    "代码执行专家，用 Python 解决数学计算、数据处理和绘图任务。"
-    "可只读访问用户工作区文件（/workspace/...）、不能联网、不能修改工作区文件。"
-    "只能写代码运行，不能帮你查资料；需要绘图时必须明确指示它绘图。"
+    "代码与终端专家：在隔离 Docker 沙箱里写代码、跑 Python 与 Linux 命令（rg/jq/unzip…）、"
+    "读写沙箱内文件（/work），只读访问用户工作区（/workspace）；用于计算、数据分析与绘图、批量处理文件。"
+    "不能联网，不能修改用户工作区（新建/修改 workspace 文件一律找 FileAgent）。需要绘图要明确要求。"
 )
 
 PROMPT = (
     WORKER_BASE_PROMPT
-    + "你是 CodeAgent，专职编写和执行 Python 代码解决数学计算、数据分析和绘图任务。\n"
-    + "【运行环境与文件权限 - 极端重要】：\n"
-    + "1. 你运行在会话级常驻的 Docker 沙箱中，不能联网。沙箱预装了 pandas, numpy, matplotlib, scipy, seaborn, openpyxl, xlrd, tabulate, pyyaml, sympy, scikit-learn。\n"
-    + "2. 可只读访问用户工作区文件（/workspace/...），路径与宿主机一致。严禁尝试改写宿主机文件！被要求写/改工作区文件时直接汇报无法完成，严禁尝试写入 /workspace 反复重试！\n"
-    + "3. 沙箱会话目录 /work 可读可写，保存在 /work 里的文件在当前会话跨多次调用保留；Python 变量不跨调用保留；专用产物导出目录为 /work/outputs/（每次执行前清空）。\n"
-    + "【技能规则】：\n"
-    + "1. 绘图：凡是需要输出图表的任务，写代码之前必须先用 read_file 读取技能文件 /skills/matplotlib-chart/SKILL.md，并严格遵循其中的规范（保存路径为 /work/outputs/<英文名>.png、统一样式、水印等）。\n"
-    + "2. 数据分析：凡是需要读取分析用户工作区表格或数据文件（CSV/Excel/JSON等）的任务，写代码之前必须先用 read_file 读取技能文件 /skills/data-analysis/SKILL.md，并遵循其中的规范。\n"
-    + "3. read_file 仍只用于读取 /skills/ 下的技能文件，不能用 read_file 读取用户本地数据文件（数据文件由 execute_python_code 在代码里直接打开 /workspace/...）。纯计算任务无需读取技能。"
+    + "你是 CodeAgent，专职在隔离 Docker 沙箱里编写执行代码、运行 Linux 命令行工具、解决数学计算、数据分析与绘图任务。\n"
+    + "【运行环境与文件权限 - 强制】\n"
+    + "1. 全部使用绝对路径；主管或用户若写成 workspace/xxx，必须规整为 /workspace/xxx。\n"
+    + "2. /workspace 是用户工作区的只读镜像（路径与其他专家一致），只能只读打开（如 pd.read_csv('/workspace/data.csv')），严禁尝试写入或修改，改写工作区文件一律找 FileAgent。\n"
+    + "3. /work 是沙箱会话可读写工作目录（cwd，会话内保留，沙箱超时重建后清空）；多文件脚本写在 /work 下。\n"
+    + "4. /work/outputs/ 是专用交付箱：保存到这里的图片会自动发送给用户，同一文件每个版本只发一次。\n"
+    + "5. /skills/ 是只读技能目录，只能用 read_file(limit=1000) 读，在沙箱 shell 里看不到。\n"
+    + "【工具决策表】\n"
+    + "1. 一次性 Python（计算/分析/绘图）→ execute_python_code（无需写 python -c）。\n"
+    + "2. Shell 命令（ls/rg/jq/unzip/zip/file/tree/wc/head…）→ execute：每次调用都是独立 subshell，cd 与 export 环境变量不跨调用保留，多条命令请用 '&&' 串联；默认 60s，可用 timeout 参数至多 300s。\n"
+    + "3. 多文件/多步脚本 → 用 write_file 写到 /work/xxx.py → execute('python3 /work/xxx.py') 运行 → 局部微调优先用 edit_file 避免整文件重写 → 再次运行。\n"
+    + "4. 读取与检索 → 用 ls / glob / grep / read_file；grep 是字面精确匹配，正则表达式搜索请用 execute('rg <regex> ...')；PDF/Word 等富文档无法在沙箱读取，如实汇报由 FileAgent 转换。\n"
+    + "【行为红线与禁止事项】\n"
+    + "1. 严禁尝试写入 /workspace；\n"
+    + "2. 严禁 pip install（沙箱无网络连接，依赖均已预置）；\n"
+    + "3. 严禁对根目录 '/' 或整个 '/workspace' 盲目递归搜索（必须先用 ls 缩小范围，限定子目录与文件类型）；\n"
+    + "4. 纯计算任务无需读取技能；绘图任务必须先 read_file('/skills/matplotlib-chart/SKILL.md', limit=1000)；数据分析任务必须先 read_file('/skills/data-analysis/SKILL.md', limit=1000)。\n"
+    + "【汇报格式】汇报遵循工作专家标准格式，以“【内部专家汇报 - 来源：CodeAgent】”开头；不向用户暴露沙箱内部临时路径。"
 )
 
 CODE_AGENT_PROMPT = PROMPT
 
-SPEC = ExpertSpec(
-    name="CodeAgent",
-    description=DESCRIPTION,
-    system_prompt=PROMPT,
-    tools_factory=lambda: code_tools.TOOLS,
-    model_key="worker_llm",
-    skills=(SKILLS_ROUTE,),
-)
+# 沙箱工作台挂载的文件系统工具白名单（故意不含 delete）
+SANDBOX_FS_TOOLS = ["ls", "read_file", "write_file", "edit_file", "glob", "grep", "execute"]
+
+
+class SandboxOutputsMiddleware(AgentMiddleware):
+    """拦截 execute 工具调用，统一扫描 /work/outputs 产物并推送到图片发件箱与模型多模态 blocks。"""
+
+    def __init__(self, sandbox_instance: Any):
+        super().__init__()
+        self.sandbox = sandbox_instance
+
+    def _process_outputs(self, result: Any) -> Any:
+        try:
+            if hasattr(self.sandbox, "collect_new_outputs"):
+                outputs = self.sandbox.collect_new_outputs()
+                if outputs.images or outputs.notes or outputs.other_files:
+                    sent_names, model_blocks, fail_notes = code_tools.publish_images(
+                        outputs.images, outputs.notes
+                    )
+                    if isinstance(result, ToolMessage) and (sent_names or model_blocks):
+                        orig_text = result.content if isinstance(result.content, str) else ""
+                        notice = (
+                            f"\n[系统提示] 已向用户发送 {len(sent_names)} 张图片（{', '.join(sent_names)}）；"
+                            f"附带的是缩略预览，仅供你检查"
+                        )
+                        new_content: list[dict[str, Any]] = [
+                            {"type": "text", "text": orig_text + notice},
+                            *model_blocks,
+                        ]
+                        return result.model_copy(update={"content": new_content})
+        except Exception as e:
+            print(f"[-] SandboxOutputsMiddleware warning: {e}")
+        return result
+
+    def wrap_tool_call(self, request: Any, handler: Any) -> Any:
+        result = handler(request)
+        tool_name = getattr(request, "tool_call", {}).get("name")
+        if tool_name == "execute":
+            result = self._process_outputs(result)
+        return result
+
+    async def awrap_tool_call(self, request: Any, handler: Any) -> Any:
+        result = await handler(request)
+        tool_name = getattr(request, "tool_call", {}).get("name")
+        if tool_name == "execute":
+            # 异步执行产物收集，防止阻塞事件循环
+            result = await asyncio.to_thread(self._process_outputs, result)
+        return result
+
+
+def build_code_agent_runnable(
+    llm,
+    system_prompt: str,
+    checkpointer=None,
+    sandbox_backend=None,
+    max_tool_calls=None,
+):
+    """返回可直接放进 CompiledSubAgent(runnable=...) 的已编译 CodeAgent 图。"""
+    if max_tool_calls is None:
+        max_tool_calls = tool_limit_for(NAME)
+
+    sb = sandbox_backend if sandbox_backend is not None else sandbox.get_sandbox()
+    backend = CompositeBackend(
+        default=sb,
+        routes={
+            SKILLS_ROUTE: FilesystemBackend(root_dir=SKILLS_DIR, virtual_mode=True),
+            "/_artifacts/": StateBackend(),
+        },
+        artifacts_root="/_artifacts",
+    )
+
+    return create_agent(
+        model=llm,
+        tools=list(code_tools.TOOLS),
+        system_prompt=system_prompt,
+        middleware=[
+            SandboxOutputsMiddleware(sb),
+            SkillsMiddleware(backend=backend, sources=[SKILLS_ROUTE]),
+            FilesystemMiddleware(
+                backend=backend,
+                tools=SANDBOX_FS_TOOLS,
+                max_execute_timeout=config.SANDBOX_MAX_TIMEOUT_SECONDS,
+            ),
+            *build_budget_middleware(max_tool_calls),
+        ],
+        checkpointer=checkpointer,
+    )

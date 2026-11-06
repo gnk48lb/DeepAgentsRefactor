@@ -7,8 +7,8 @@
   4. 绝不向外抛出异常，所有错误均转为对模型和用户友好的说明文本。
 """
 
-import typing
 import traceback
+import typing
 from langchain_core.tools import tool
 
 from app import config
@@ -16,6 +16,48 @@ from app.infra import sandbox
 from app.infra.sandbox import SandboxUnavailable
 from app.runtime import outbox
 from app.utils.images import encode_image_bytes
+
+
+def publish_images(
+    images: list[sandbox.SandboxImage],
+    notes: list[str] | None = None,
+) -> tuple[list[str], list[dict[str, typing.Any]], list[str]]:
+    """将产物图片推送到 outbox（用户高清版），并生成回传给模型的缩略图多模态 blocks。
+
+    返回: (已发送图片名列表, 模型缩略图 blocks, 失败 notes 列表)
+    """
+    sent_image_names: list[str] = []
+    model_blocks: list[dict[str, typing.Any]] = []
+    fail_notes: list[str] = []
+
+    for img in images:
+        user_b64 = encode_image_bytes(
+            img.data,
+            max_side=config.SANDBOX_USER_IMAGE_MAX_SIDE,
+            quality=88,
+        )
+        model_b64 = encode_image_bytes(
+            img.data,
+            max_side=config.SANDBOX_MODEL_IMAGE_MAX_SIDE,
+            quality=75,
+        )
+
+        if user_b64:
+            outbox.push({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{user_b64}"},
+            })
+            sent_image_names.append(img.name)
+        else:
+            fail_notes.append(f"图片 {img.name} 编码压缩失败，未发送给用户")
+
+        if model_b64:
+            model_blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{model_b64}"},
+            })
+
+    return sent_image_names, model_blocks, fail_notes
 
 
 @tool("execute_python_code")
@@ -27,7 +69,7 @@ def execute_python_code(code: str) -> typing.Any:
 2. 目录布局：
    - /workspace：用户工作区目录，只读挂载！严禁尝试向 /workspace 写入或修改文件；分析数据请直接只读打开（如 pd.read_csv('/workspace/data.csv')）。
    - /work：沙箱会话工作目录（HOME 及当前工作路径），可读可写，会话内跨多次工具调用保留。变量不跨调用保留，但保存在 /work 中的文件会保留供后续调用读取。
-   - /work/outputs/：专用产物导出目录。每次执行前会被清空重建。若需绘图，代码必须用 savefig 将图片保存到 '/work/outputs/<英文名>.png'，禁止调用 plt.show()。
+   - /work/outputs/：专用产物导出目录。图片保存到 /work/outputs/ 即自动发送给用户，同一文件每个版本只发一次。若需绘图，代码必须用 savefig 将图片保存到 '/work/outputs/<英文名>.png'，禁止调用 plt.show()。
 3. 限制：单次执行超时上限为 60 秒，内存上限 1GB。单次最多导出 4 张图片（单张 ≤ 10MB，总像素 ≤ 40M）。输出字符过多会被截断，请勿直接 print 整个超大 DataFrame。
 """
     print(f"\n[Tool Call: execute_python_code] 代码长度: {len(code)} 字符")
@@ -62,33 +104,9 @@ def execute_python_code(code: str) -> typing.Any:
     # Notes 提示信息
     all_notes = list(res.notes)
 
-    # 处理图片
-    sent_image_names: list[str] = []
-    model_images_b64: list[str] = []
-
-    for img in res.images:
-        user_b64 = encode_image_bytes(
-            img.data,
-            max_side=config.SANDBOX_USER_IMAGE_MAX_SIDE,
-            quality=88,
-        )
-        model_b64 = encode_image_bytes(
-            img.data,
-            max_side=config.SANDBOX_MODEL_IMAGE_MAX_SIDE,
-            quality=75,
-        )
-
-        if user_b64:
-            outbox.push({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{user_b64}"},
-            })
-            sent_image_names.append(img.name)
-        else:
-            all_notes.append(f"图片 {img.name} 编码压缩失败，未发送给用户")
-
-        if model_b64:
-            model_images_b64.append(model_b64)
+    # 处理图片与多模态
+    sent_image_names, model_image_blocks, fail_notes = publish_images(res.images, res.notes)
+    all_notes.extend(fail_notes)
 
     if sent_image_names:
         sections.append(f"已向用户发送 {len(sent_image_names)} 张图片（{', '.join(sent_image_names)}）")
@@ -116,13 +134,9 @@ def execute_python_code(code: str) -> typing.Any:
     print(f"  images: {len(res.images)} 张 (已发送: {len(sent_image_names)} 张)")
 
     # 多模态组装：有图片时返回 list，模型可查看缩略图自检
-    if model_images_b64:
+    if model_image_blocks:
         content: list[dict[str, typing.Any]] = [{"type": "text", "text": summary_text}]
-        for b64 in model_images_b64:
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-            })
+        content.extend(model_image_blocks)
         return content
     else:
         return summary_text

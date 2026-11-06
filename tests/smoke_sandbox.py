@@ -44,7 +44,7 @@ from app.runtime import outbox
 
 class FakeImage:
     def __init__(self, labels: dict[str, str] | None = None):
-        self.labels = labels if labels is not None else {"gnk48.sandbox.version": "2"}
+        self.labels = labels if labels is not None else {"gnk48.sandbox.version": config.SANDBOX_IMAGE_VERSION}
 
 
 class FakeImages:
@@ -242,9 +242,9 @@ def test_c_timeout_handling():
 
         res = sb.run_python("while True: pass", timeout=2)
         assert res.timed_out is True
-        assert any("超时" in n for n in res.notes)
-        # 超时后应重建容器以消除死循环残留进程
-        assert sb._container is None
+        assert any("超过" in n or "超时" in n for n in res.notes)
+        # P0-4: 容器内 124 超时保留容器，工作台状态不丢失
+        assert sb._container is not None
     finally:
         shutdown_sandbox()
         set_docker_client(None)
@@ -400,9 +400,9 @@ def test_h_base_sandbox_contract_and_composite():
             ("/invalid_dir/bad.txt", b"bad"),
         ])
         assert len(up_res) == 3
-        assert up_res[0].error == "permission_denied"
+        assert up_res[0].error.startswith("permission_denied")
         assert up_res[1].error is None
-        assert up_res[2].error == "invalid_path"
+        assert up_res[2].error.startswith("invalid_path")
 
         # 4. download_files 校验：文件不存在返回 file_not_found
         dl_res = sb.download_files(["/work/non_existent.txt"])
@@ -501,6 +501,269 @@ def test_k_code_tools_integration_and_outbox():
         set_docker_client(None)
 
 
+
+
+def test_l_p0_1_command_wrapping_list():
+    """L (P0-1) execute 命令包装为 list，不经 shlex，workdir=/work，user=10001:10001。"""
+    fake = FakeDockerClient()
+    set_docker_client(fake)
+    try:
+        sb = get_sandbox()
+        test_cmd = "python3 -c \"import os; print('hello world')\" | grep -F 'hello'"
+        resp = sb.execute(test_cmd, timeout=45)
+        assert resp.exit_code == 0
+        call = fake.api.exec_calls[-1]
+        cmd = call["cmd"]
+        assert isinstance(cmd, list), f"cmd 应为 list，实际为: {type(cmd)}"
+        assert cmd[0] == "timeout"
+        assert cmd[1] == "-k"
+        assert cmd[2] == "3"
+        assert cmd[3] == "45"
+        assert cmd[4] == "bash"
+        assert cmd[5] == "-c"
+        assert cmd[6] == test_cmd
+        assert call.get("workdir") == "/work"
+        assert call.get("user") == "10001:10001"
+    finally:
+        shutdown_sandbox()
+        set_docker_client(None)
+
+
+def test_m_p0_2_protocol_methods_fail_safe():
+    """M (P0-2) 协议方法 (execute/upload/download) 遇故障转为友好结果，绝不向外抛异常。"""
+    fake_err = FakeDockerClient(raise_image_missing=True)
+    set_docker_client(fake_err)
+    try:
+        sb = get_sandbox()
+        # 1. execute 返回 exit_code=1 且包含错误指引，不抛异常
+        exec_res = sb.execute("ls")
+        assert exec_res.exit_code == 1
+        assert "沙箱不可用" in exec_res.output
+
+        # 2. upload_files 逐文件返回 error 字符串，不抛异常
+        up_res = sb.upload_files([("/work/a.py", b"print(1)"), ("/work/b.py", b"print(2)")])
+        assert len(up_res) == 2
+        assert all(r.error and "沙箱不可用" in r.error for r in up_res)
+
+        # 3. download_files 逐文件返回 error 字符串，不抛异常
+        dl_res = sb.download_files(["/work/a.py", "/work/b.py"])
+        assert len(dl_res) == 2
+        assert all(r.error and "沙箱不可用" in r.error for r in dl_res)
+
+        # 4. run_python 仍抛 SandboxUnavailable 给 L3 工具层捕获
+        try:
+            sb.run_python("print(1)")
+            assert False, "应当抛出 SandboxUnavailable"
+        except SandboxUnavailable:
+            pass
+    finally:
+        shutdown_sandbox()
+        set_docker_client(None)
+
+
+def test_n_p0_3_execute_large_output_json_not_truncated():
+    """N (P0-3) execute 使用 SANDBOX_EXECUTE_MAX_OUTPUT_CHARS，大段 JSON 不被截断。"""
+    fake = FakeDockerClient()
+    set_docker_client(fake)
+    try:
+        sb = get_sandbox()
+        import json
+        large_data = {"files": [f"/work/file_{i}.txt" for i in range(5000)]}
+        large_json_bytes = json.dumps(large_data).encode("utf-8")
+        assert len(large_json_bytes) > 50000  # 远大于 8000
+        fake.api.next_stream_chunks = [(large_json_bytes, None)]
+
+        resp = sb.execute("cat /work/large.json")
+        assert resp.truncated is False
+        assert len(resp.output) == len(large_json_bytes)
+        parsed = json.loads(resp.output)
+        assert len(parsed["files"]) == 5000
+    finally:
+        shutdown_sandbox()
+        set_docker_client(None)
+
+
+def test_o_p0_4_timeout_semantics():
+    """O (P0-4) 超时细分处理：124 保留容器；137 耗时 < T 提示超出内存；仅宿主看门狗才销毁容器。"""
+    fake = FakeDockerClient()
+    set_docker_client(fake)
+    try:
+        sb = get_sandbox()
+
+        # 1. exit_code == 124：命令超时终止，但容器保留
+        fake.api.next_exit_code = 124
+        resp = sb.execute("sleep 100", timeout=5)
+        assert "命令超过 5 秒被终止；沙箱状态保留" in resp.output
+        assert sb._container is not None
+
+        # 2. exit_code == 137 且耗时很短：可能 OOM
+        fake.api.next_exit_code = 137
+        resp_oom = sb.execute("python -c 'oom'", timeout=10)
+        assert "超出内存上限" in resp_oom.output
+        assert sb._container is not None
+    finally:
+        shutdown_sandbox()
+        set_docker_client(None)
+
+
+def test_p_p0_5_client_caching_and_timeout_clamp():
+    """P (P0-5) DockerClient 实例级缓存，且 timeout 参数正确 clamp。"""
+    fake = FakeDockerClient()
+    set_docker_client(fake)
+    try:
+        sb = get_sandbox()
+        c1 = sb._get_client()
+        c2 = sb._get_client()
+        assert c1 is c2, "客户端应被缓存复用"
+
+        # timeout clamp: 传入 500 -> clamp 到 300
+        sb.execute("ls", timeout=500)
+        call = fake.api.exec_calls[-1]
+        assert call["cmd"][3] == str(config.SANDBOX_MAX_TIMEOUT_SECONDS)
+
+        # timeout <= 0 或 None -> 回落默认 60
+        sb.execute("ls", timeout=0)
+        assert fake.api.exec_calls[-1]["cmd"][3] == str(config.SANDBOX_TIMEOUT_SECONDS)
+
+        sb.execute("ls", timeout=None)
+        assert fake.api.exec_calls[-1]["cmd"][3] == str(config.SANDBOX_TIMEOUT_SECONDS)
+    finally:
+        shutdown_sandbox()
+        set_docker_client(None)
+
+
+def test_q_collect_new_outputs_fingerprint():
+    """Q (A3) collect_new_outputs 仅投递新增/修改产物，跳过超限并记已见。"""
+    fake = FakeDockerClient()
+    set_docker_client(fake)
+    try:
+        sb = get_sandbox()
+        c, _ = sb._ensure_container()
+
+        # 模拟生成一张图片
+        buf = io.BytesIO()
+        Image.new("RGB", (30, 30), color="green").save(buf, format="PNG")
+        img_bytes = buf.getvalue()
+        c.mock_outputs_tar = None
+
+        # 模拟 find 输出：chart1.png 大小 500, mtime 100.0
+        find_raw = f"chart1.png\t{len(img_bytes)}\t100.0\0".encode("utf-8")
+        orig_exec_run = c.exec_run
+        def mock_exec_run(cmd, **kwargs):
+            if "find /work/outputs" in str(cmd):
+                mock = MagicMock()
+                mock.exit_code = 0
+                mock.output = find_raw
+                return mock
+            return orig_exec_run(cmd, **kwargs)
+        c.exec_run = mock_exec_run
+
+        orig_dl = sb._download_single_file
+        sb._download_single_file = lambda cont, path: img_bytes
+
+        # 第 1 次扫描：发现 chart1.png
+        res1 = sb.collect_new_outputs()
+        assert len(res1.images) == 1
+        assert res1.images[0].name == "chart1.png"
+
+        # 第 2 次扫描：同一指纹不再重复返回
+        res2 = sb.collect_new_outputs()
+        assert len(res2.images) == 0
+
+        # 第 3 次扫描：文件 mtime 变更 -> 再次返回
+        find_raw = f"chart1.png\t{len(img_bytes)}\t200.0\0".encode("utf-8")
+        res3 = sb.collect_new_outputs()
+        assert len(res3.images) == 1
+    finally:
+        shutdown_sandbox()
+        set_docker_client(None)
+
+
+def test_r_code_agent_assembly_and_routing():
+    """R (A1-A2) CodeAgent 编译图装配：包含 7 个文件工具 + execute_python_code，无 delete，技能与工作区正确路由。"""
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+    from app.agents.experts import code_agent
+    from deepagents.backends.sandbox import BaseSandbox
+    from deepagents.backends.protocol import ExecuteResponse, FileDownloadResponse, FileUploadResponse
+
+    calls_log = []
+    class MockSandbox(BaseSandbox):
+        @property
+        def id(self): return "mock-sb"
+        def execute(self, cmd, *, timeout=None):
+            calls_log.append(("execute", cmd))
+            return ExecuteResponse(output="ok\n", exit_code=0)
+        def upload_files(self, files):
+            calls_log.append(("upload", [f[0] for f in files]))
+            return [FileUploadResponse(path=p, error=None) for p, _ in files]
+        def download_files(self, paths):
+            calls_log.append(("download", paths))
+            return [FileDownloadResponse(path=p, content=b"content", error=None) for p in paths]
+
+    msb = MockSandbox()
+    llm = FakeListChatModel(responses=["done"])
+    runnable = code_agent.build_code_agent_runnable(
+        llm=llm,
+        system_prompt=code_agent.PROMPT,
+        sandbox_backend=msb,
+    )
+    tools_node = runnable.nodes["tools"]
+    tool_dict = getattr(tools_node.triggers, "__self__", None) or tools_node.bound
+    names = list(tool_dict._tools_by_name.keys())
+
+    # 工具白名单：7 个 FS 工具 + execute_python_code，严禁包含 delete
+    for expected in ["ls", "read_file", "write_file", "edit_file", "glob", "grep", "execute", "execute_python_code"]:
+        assert expected in names, f"缺少预期工具: {expected}"
+    assert "delete" not in names, "严禁挂载 delete 工具"
+
+    assert "matplotlib-chart" in code_agent.PROMPT
+    assert "data-analysis" in code_agent.PROMPT
+    assert "你是 CodeAgent" in code_agent.PROMPT
+
+
+def test_s_sandbox_outputs_middleware():
+    """S (A3 L4) SandboxOutputsMiddleware：拦截 execute 统一投递并改写 ToolMessage，非 execute 透明透传。"""
+    from langchain_core.messages import ToolMessage
+    from app.agents.experts.code_agent import SandboxOutputsMiddleware
+    from app.infra.sandbox import SandboxImage, OutputsResult
+
+    class FakeOutputsSandbox:
+        def __init__(self):
+            self.called = False
+        def collect_new_outputs(self):
+            self.called = True
+            buf = io.BytesIO()
+            Image.new("RGB", (20, 20), color="red").save(buf, format="PNG")
+            return OutputsResult(images=[SandboxImage(name="chart.png", data=buf.getvalue())])
+
+    fos = FakeOutputsSandbox()
+    mw = SandboxOutputsMiddleware(fos)
+
+    req_execute = MagicMock()
+    req_execute.tool_call = {"name": "execute", "args": {"command": "python chart.py"}, "id": "call_1"}
+
+    outbox.begin()
+    tool_msg = ToolMessage(content="stdout output", tool_call_id="call_1", artifact={"exit_code": 0})
+    res = mw.wrap_tool_call(req_execute, lambda r: tool_msg)
+
+    assert fos.called is True
+    assert len(outbox.current()) == 1
+    assert isinstance(res.content, list)
+    assert res.content[0]["type"] == "text"
+    assert "已向用户发送 1 张图片" in res.content[0]["text"]
+    assert res.content[1]["type"] == "image_url"
+    assert res.artifact == {"exit_code": 0}
+
+    # 非 execute 工具透明透传
+    req_ls = MagicMock()
+    req_ls.tool_call = {"name": "ls", "args": {"path": "/work"}, "id": "call_2"}
+    fos.called = False
+    tool_msg_ls = ToolMessage(content="file.txt", tool_call_id="call_2")
+    res_ls = mw.wrap_tool_call(req_ls, lambda r: tool_msg_ls)
+    assert fos.called is False
+    assert res_ls.content == "file.txt"
+    outbox.begin()
+
 SCENARIOS = [
     ("A 容器创建参数安全与挂载唯一性", test_a_creation_parameters_and_isolation),
     ("B 跨调用复用与空闲 TTL 重建", test_b_lifecycle_reuse_and_idle_ttl),
@@ -513,6 +776,14 @@ SCENARIOS = [
     ("I reset 与 shutdown 幂等性", test_i_reset_and_shutdown_idempotency),
     ("J 多线程并发串行化", test_j_concurrency_serialization),
     ("K code_tools 多模态与错误兜底", test_k_code_tools_integration_and_outbox),
+    ("L P0-1 命令包装为 list", test_l_p0_1_command_wrapping_list),
+    ("M P0-2 协议方法不向外抛异常", test_m_p0_2_protocol_methods_fail_safe),
+    ("N P0-3 execute 200万字符输出上限", test_n_p0_3_execute_large_output_json_not_truncated),
+    ("O P0-4 超时细分与保留容器", test_o_p0_4_timeout_semantics),
+    ("P P0-5 DockerClient 缓存与超时 clamp", test_p_p0_5_client_caching_and_timeout_clamp),
+    ("Q A3 产物指纹去重与状态保留", test_q_collect_new_outputs_fingerprint),
+    ("R A1-A2 CodeAgent 沙箱工作台装配", test_r_code_agent_assembly_and_routing),
+    ("S A3-L4 SandboxOutputsMiddleware 多模态投递", test_s_sandbox_outputs_middleware),
 ]
 
 

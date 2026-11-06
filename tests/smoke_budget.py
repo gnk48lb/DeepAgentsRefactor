@@ -413,6 +413,63 @@ def test_d3_desktop_default_budget_under_production_recursion_limit():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Group E: CodeAgent (沙箱工作台)
+# ══════════════════════════════════════════════════════════════════════════════
+
+from deepagents.backends.sandbox import BaseSandbox
+from deepagents.backends.protocol import ExecuteResponse, FileDownloadResponse, FileUploadResponse
+
+class DummySandbox(BaseSandbox):
+    @property
+    def id(self) -> str:
+        return 'dummy-sandbox'
+
+    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        return ExecuteResponse(output='{"path": "/work/a.py", "is_dir": false}\n', exit_code=0)
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        return [FileUploadResponse(path=p, error=None) for p, _ in files]
+
+    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        return [FileDownloadResponse(path=p, content=b"", error=None) for p in paths]
+
+
+def test_e1_code_agent_soft_stop():
+    from app.agents.experts import code_agent
+    script = ls_calls(3) + [AIMessage(content='【内部专家汇报 - 来源：CodeAgent】分析完成')]
+    cam = ScriptedModel(script=script)
+    runnable = code_agent.build_code_agent_runnable(cam, 'prompt', sandbox_backend=DummySandbox(), max_tool_calls=2)
+    res = runnable.invoke({'messages': [HumanMessage(content='go')]}, config={'recursion_limit': 100})
+    assert cam.idx == 4, f'模型调用数应为 4，实际 {cam.idx}'
+    blocked = tool_msgs(res, 'l2')
+    assert len(blocked) == 1 and LIMIT_ERR in str(blocked[0].content), blocked
+    assert 'CodeAgent' in str(res['messages'][-1].content)
+
+
+def test_e2_code_agent_hard_stop():
+    from app.agents.experts import code_agent
+    cam = ScriptedModel(script=ls_calls(10))
+    runnable = code_agent.build_code_agent_runnable(cam, 'prompt', sandbox_backend=DummySandbox(), max_tool_calls=2)
+    res = runnable.invoke({'messages': [HumanMessage(content='go')]}, config={'recursion_limit': 100})
+    assert cam.idx == 4, f'模型调用数应为 4，实际 {cam.idx}'
+    assert MODEL_LIMIT_ERR in str(res['messages'][-1].content), res['messages'][-1]
+
+
+def test_e3_code_agent_runaway_nested_under_production_recursion_limit():
+    from app.agents.experts import code_agent
+    limit = config.SUBAGENT_TOOL_LIMITS['CodeAgent']
+    cam = ScriptedModel(script=ls_calls(40))
+    sub = CompiledSubAgent(
+        name='CodeAgent',
+        description='代码专家',
+        runnable=code_agent.build_code_agent_runnable(cam, 'prompt', sandbox_backend=DummySandbox()),
+    )
+    _, res = run_parent([task_call('CodeAgent', 't1'), AIMessage(content='完成')], [sub], 'e3')
+    assert cam.idx == limit + 2, f'模型调用数应为 {limit + 2}，实际 {cam.idx}'
+    tr = task_results(res)
+    assert len(tr) == 1 and MODEL_LIMIT_ERR in str(tr[0].content), tr
+
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     print("=" * 70)
@@ -434,6 +491,9 @@ def main():
         ("D1 DesktopAgent·预算截断", test_d1_desktop_budget_cut),
         ("D2 DesktopAgent·正常路径不变", test_d2_desktop_normal_path_unchanged),
         ("D3 DesktopAgent·默认预算+生产递归上限", test_d3_desktop_default_budget_under_production_recursion_limit),
+        ("E1 CodeAgent·软停止", test_e1_code_agent_soft_stop),
+        ("E2 CodeAgent·硬停止", test_e2_code_agent_hard_stop),
+        ("E3 CodeAgent·生产递归上限下失控", test_e3_code_agent_runaway_nested_under_production_recursion_limit),
     ]
     passed = 0
     for name, fn in scenarios:

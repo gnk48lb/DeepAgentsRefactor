@@ -1,6 +1,6 @@
 FROM python:3.13-slim
 
-LABEL gnk48.sandbox.version=2
+LABEL gnk48.sandbox.version=3
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -12,7 +12,7 @@ ENV PYTHONUNBUFFERED=1 \
     HOME=/work
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends fonts-noto-cjk && \
+    apt-get install -y --no-install-recommends fonts-noto-cjk ripgrep jq unzip zip file tree procps && \
     rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -g 10001 sandbox && \

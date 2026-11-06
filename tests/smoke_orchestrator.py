@@ -26,7 +26,6 @@ EXPECTED_ORDER = ["KnowledgeAgent", "MediaAgent", "MapAgent", "CodeAgent",
 EXPECTED_TOOLS = {
     "KnowledgeAgent": ["rag", "web_search"],
     "MediaAgent": ["av_graph_rag", "execute_sql"],
-    "CodeAgent": ["execute_python_code"],
     "BrowserAgent": ["read_webpage_content", "execute_complex_browser_action"],
 }
 BANNED = {"write_file", "edit_file", "delete", "execute", "ls", "glob", "grep"}
@@ -65,10 +64,9 @@ def test_b_specs():
         got = [t.name for t in by_name[name]["tools"]]
         assert got == tools, f"{name} 工具不一致: {got} != {tools}"
     assert len(by_name["MapAgent"]["tools"]) == 12, "MapAgent 应挂载 12 个高德工具"
-    assert by_name["CodeAgent"].get("skills") == ["/skills/"], by_name["CodeAgent"].get("skills")
     for name in ("KnowledgeAgent", "MediaAgent", "MapAgent", "BrowserAgent"):
         assert not by_name[name].get("skills"), f"{name} 不应挂 skills"
-    for name in ("FileAgent", "DesktopAgent"):
+    for name in ("CodeAgent", "FileAgent", "DesktopAgent"):
         assert "runnable" in by_name[name], f"{name} 应是 CompiledSubAgent"
 
 
@@ -97,7 +95,7 @@ def test_d_time_tool_and_budgets():
     by_name = {_name(s): s for s in _captured["subagents"]}
     expert_names = set(EXPECTED_ORDER)
     assert set(config.SUBAGENT_TOOL_LIMITS) == expert_names, set(config.SUBAGENT_TOOL_LIMITS) ^ expert_names
-    for name in ("KnowledgeAgent", "MediaAgent", "MapAgent", "CodeAgent", "BrowserAgent"):
+    for name in ("KnowledgeAgent", "MediaAgent", "MapAgent", "BrowserAgent"):
         mws = by_name[name]["middleware"]
         assert [type(m) for m in mws] == [ToolCallLimitMiddleware, ModelCallLimitMiddleware], name
         limit = config.SUBAGENT_TOOL_LIMITS[name]

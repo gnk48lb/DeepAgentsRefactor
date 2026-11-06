@@ -24,7 +24,7 @@ from app.agents.budget import build_budget_middleware, tool_limit_for
 NAME = "FileAgent"
 
 DESCRIPTION = (
-    "本地文件专家，是唯一能访问本地磁盘（workspace 工作区）的专家：列目录、搜索、读取文本类文件，"
+    "本地文件专家，是唯一能修改本地磁盘（workspace）的专家，也负责富文档读取：列目录、搜索、读取文本类文件，"
     "支持用 convert_to_markdown 读取 PDF、Word、PPT、Excel、HTML、EPub、CSV、ZIP 等文档，"
     "写入、编辑、新建目录、移动或重命名文件（“删除”一律改为移动到 archive_trash 归档）。"
     "写入/编辑/新建目录/移动会暂停并请求人工授权。"

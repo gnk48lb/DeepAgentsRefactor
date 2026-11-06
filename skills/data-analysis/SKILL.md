@@ -9,6 +9,16 @@ description: 在 Docker 沙箱中读取并分析用户工作区（/workspace）�
 - **/workspace**：只读挂载用户工作区（如 `/workspace/data.csv`）。严禁尝试修改、重命名或写入 `/workspace`，否则会触发只读文件系统错误。
 - **/work**：沙箱当前会话可读写工作目录。中间数据、清洗后的临时表请存放在 `/work`（如 `/work/cleaned.parquet`），在当前会话跨多次调用均可读取。
 
+## 执行方式与探查先行
+1. **两种执行方式**：
+   - 快速一次性分析：直接使用 `execute_python_code` 运行 Python 脚本；
+   - 复杂长流程：用 `write_file` 写脚本到 `/work/analysis.py`，再用 `execute("python3 /work/analysis.py")` 执行，后续小改用 `edit_file`。
+2. **快速预检命令**：
+   - 在写复杂 Python 脚本前，可先通过 `execute` 运行 Linux 工具快速探测数据特征：
+     - `execute("file -i /workspace/data.csv")`：快速识别 MIME 类型与字符集（如 utf-8、iso-8859-1）；
+     - `execute("head -n 5 /workspace/data.csv")` 或 `execute("head -c 500 /workspace/data.csv")`：预览文件头部结构与分隔符；
+     - `execute("wc -l /workspace/data.csv")`：快速查看数据行数与规模。
+
 ## 分析流程规范
 1. **探查先行**：在进行深度统计或变换前，先查看数据的基本概况：`df.shape`、`df.dtypes` 以及 `df.head(5)`。
 2. **编码处理（CSV）**：遇到中文乱码或解码错误时，按顺序尝试编码：`encoding="utf-8-sig"` → `encoding="gbk"` → `encoding="gb18030"`。

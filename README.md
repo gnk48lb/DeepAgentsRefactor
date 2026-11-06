@@ -44,7 +44,7 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 1. **KnowledgeAgent**: 知识检索专家，优先检索本地 Milvus 知识库 (`rag`)，无果且具时效性时通过 Tavily 全网搜索 (`web_search`)；时间类问题由主 Agent 通过自己挂载的 get_current_time 就地回答，KnowledgeAgent 不挂载该工具。
 2. **MediaAgent**: 成人影视专家，同时挂载 Neo4j 知识图谱检索 (`av_graph_rag`) 与 MySQL 只读查询 (`execute_sql`)：图谱负责实体 / 合作关系网络与题材标签，数据库负责身高、罩杯、出生年份等精确属性过滤与发行年份统计，复合问题由它自己组合完成。
 3. **MapAgent**: 地理与出行专家，挂载高德地图本地工具（共 12 个高德本地 Tool），支持天气查询、周边检索、路径规划与地理编码。约定：路线、周边搜索、测距的位置参数既可传文字地址也可传'经度,纬度'，工具内部自动解析（文字地址跨城有歧义时会报错要求补城市）；只有 maps_regeocode 必须传坐标。
-4. **CodeAgent**: 代码执行专家，通过会话级常驻 Docker 沙箱安全运行 Python 脚本，支持只读访问用户工作区（`/workspace/...`），进行数学计算、数据处理与图表绘制（绘图规范由 Skill `matplotlib-chart` 提供，数据分析规范由 Skill `data-analysis` 提供）。沙箱预置中文字体、热启动支持与流式输出截断。
+4. **CodeAgent**: 代码执行与数据分析沙箱工作台。基于 deepagents 的 `CompiledSubAgent` 模式，挂载 `FilesystemMiddleware`（提供 `ls`、`read_file`、`write_file`、`edit_file`、`glob`、`grep`、`execute` 7 个沙箱工具，故意不含 `delete` 工具）与快捷通道 `execute_python_code`。通过 `/workspace/...` 只读访问用户工作区，沙箱专属可读写会话工作目录为 `/work/...`（脚本、数据与多文件处理），专属交付箱为 `/work/outputs/...`（生成的图表由 `SandboxOutputsMiddleware` 统一按指纹提取并自动推送到模型与用户发件箱）。绘图规范由 Skill `matplotlib-chart` 提供，数据分析规范由 Skill `data-analysis` 提供。沙箱预置中文字体、热启动支持与流式输出截断。
 5. **BrowserAgent**: 浏览器自动化专家，基于 Playwright/browser-use 操控真实浏览器（可见模式），处理网页端交互。
 6. **FileAgent (HITL)**: 本地文件专家，内置 FilesystemMiddleware + FilesystemBackend + 原生 HITL。提供工具：`ls`/`glob`/`grep`/`read_file` 免授权，`convert_to_markdown`（由 markitdown-mcp 提供，支持富文档转 Markdown），`write_file`/`edit_file`/`create_directory`/`move_file` 需授权，删除 = 移动到 archive_trash 归档。只能在 workspace 工作区内操作。转换结果过大时会暂存到 `/_artifacts/large_tool_results/<id>`，FileAgent 用 `read_file` 分页读回。
 7. **DesktopAgent (HITL)**: 桌面操作专家，基于网格坐标截屏、模拟点击与键鼠交互。
@@ -98,16 +98,27 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 - **硬停止**：模型无视软停止继续要工具时，在第 N+2 次模型调用后强制结束，`task` 返回 `Model call limits exceeded`。
 - **实现方式**：声明式专家与 FileAgent 用 langchain 的 `ToolCallLimitMiddleware` + `ModelCallLimitMiddleware`；DesktopAgent 是手写子图，按已执行的工具步数手动计数，超限直接返回确定性汇报（不再调用模型）。
 - **FileAgent 与 HITL**：授权恢复后计数重新开始；超预算被拦下的写入类调用不再弹授权。
-- 预算是“止损阈值”而不是常规用量：日志里出现 `Tool call limit exceeded` / `Model call limits exceeded` 说明某个专家触顶，按真实用量调整 `SUBAGENT_TOOL_LIMITS`。
+- **预算配置与调优**：未登记专家默认 10 步；`FileAgent` 拥有 20 步预算（涉及富文档转换、分页读取与复杂目录操作）；`CodeAgent` 在升级为沙箱工作台后预算提升至 15 步（支持“写文件 → 运行 → 读结果 → 微调代码 → 再次运行”等多步自动化流水线）。预算是“止损阈值”而不是常规用量，日志里出现 `Tool call limit exceeded` / `Model call limits exceeded` 说明某个专家触顶，可按真实用量微调 `SUBAGENT_TOOL_LIMITS`。
 
 ### 2.9 代码沙箱设计取舍与演进路径
-系统在代码沙箱的设计上遵循严格的权责分离与最小暴露面原则：
-- **为什么 v1 坚持 CodeAgent 单一工具面（不接 FilesystemMiddleware）**：
-  - **权责分明与降低认知负荷**：`FileAgent` 专属负责工作区文件的写、改、删与格式转换，受 HITL 人工审批约束；`CodeAgent` 专属负责执行 Python 代码进行数据分析、数学计算与图表绘制，其沙箱内工作区通过 `/workspace` **只读**挂载，杜绝代码执行误删或破坏用户真实工程。
-  - **消除冗余与工具争抢**：若 CodeAgent 同时挂载 shell、write_file、read_file 与 execute_python_code，LLM 极易在“是用 Python 脚本读文件”还是“用 read_file 工具读文件”之间摇摆，反而降低任务规划效率。
-- **平滑演进通道（BaseSandbox 契约）**：
-  - `DockerSandbox` 严格对齐并实现了 `deepagents.backends.sandbox.BaseSandbox` 抽象基类契约（包含 `id`、`execute(command, *, timeout=None)`、`upload_files`、`download_files` 规范以及对 `timeout=0` 的默认时限回落处理）。
-  - 该抽象接口使得底层沙箱与标准 `FilesystemBackend` 协议完全兼容。一旦未来决定为 `CodeAgent` 开放文件交互能力，只需在专家装配层将其 backend 配置为 `CompositeBackend(primary=docker_sandbox, secondary=...)`，无缝挂接 `FilesystemMiddleware`，而底层的 Docker 隔离与执行逻辑无需任何侵入性改动。
+系统在代码沙箱的设计上遵循严格的权责分离、纵深防御与平滑演进原则：
+- **从 v1 单一执行器到 Phase 2 沙箱工作台**：
+  - **v1 设计**：初期坚持单一 `execute_python_code` 快速通道，保证代码执行轻量、低认知负荷与零文件副作用。
+  - **Phase 2 演进需求**：随着复杂数据分析、批量文本处理与长链任务增多，模型需要编写多文件模块、局部微调脚本（`edit_file`）、运行 Linux 命令行工具（`rg` / `jq` / `unzip` / `file` / `tree` 等）以及排查环境状态，单一 Python 字符串执行已无法满足需求。
+- **权责边界：CodeAgent 与 FileAgent 的本质差异**：
+  - **`FileAgent` (唯一工程改写者)**：系统中**唯一**能够读写、修改与删除宿主本地磁盘工程（用户真实 `workspace`）的专家。具有本地文件系统副作用，因此破坏性写操作必须强受 HITL 人工授权约束。
+  - **`CodeAgent` (隔离沙箱工作台)**：在隔离 Docker 容器中运行，其内部的 `/workspace` 通过只读镜像（`bind: "/workspace", mode: "ro"`）挂载，**严禁向用户工作区写入任何内容**；所有写、改、执行操作仅限于沙箱专属内存工作区 `/work`（256MB tmpfs），超时或重置即清空，绝无可能损坏或污染宿主项目，因此沙箱内文件操作无需弹 HITL 授权。
+- **架构装配与真实签名**：
+  - `DockerSandbox` 继承并完整实现 `deepagents.backends.sandbox.BaseSandbox` 抽象基类契约（包含 `id`、`execute`、`upload_files`、`download_files`、`ls`、`read`、`write`、`edit`、`glob`、`grep` 等核心协议）。
+  - 在装配层通过 `CompositeBackend` 进行路由编排，真实签名严格对齐 deepagents 官方规范：
+    `CompositeBackend(default=docker_sandbox, routes={SKILLS_ROUTE: FilesystemBackend(root_dir=SKILLS_DIR, virtual_mode=True), "/_artifacts/": StateBackend()}, artifacts_root="/_artifacts")`
+  - 既让 CodeAgent 拥有了沙箱文件系统与 Linux 命令执行能力，又让只读技能目录 `/skills/` 走宿主虚拟路径，两不冲突。
+  - 工具白名单显式剔除 `delete` 工具（`SANDBOX_FS_TOOLS = ["ls", "read_file", "write_file", "edit_file", "glob", "grep", "execute"]`），防止模型在沙箱内随意破坏未完成任务的文件。
+- **交互语义与独立 subshell**：
+  - 每次 `execute` 命令均由独立 subshell 运行（通过 `["timeout", "-k", "3", str(effective_timeout), "bash", "-c", command]` 启动），环境变量（`export`）与工作目录（`cd`）不跨调用持久化；多条依赖命令应使用 `&&` 显式串联。默认超时 60s，可通过参数扩展至 300s。
+- **产物统一投递管线**：
+  - 由 `SandboxOutputsMiddleware` 拦截 `execute` 调用，调用底层 `collect_new_outputs()` 按 `(路径: (大小, mtime))` 文件指纹扫描 `/work/outputs/`。
+  - 生成的新图表通过 `publish_images()` 实现双份投递：一份推送到接入层图片发件箱（Outbox）直发给用户，一份压缩编码为低分辨率预览 block 反哺给模型进行图表自检；同一指纹在会话生命周期内不重复投递。
 
 ---
 
@@ -354,7 +365,7 @@ uv run python main.py --rebuild
 uv run python tests/run_smoke.py
 ```
 
-测试包含以下 12 个测试套件（共 113 个场景）：
+测试包含以下 12 个测试套件（共 122 个场景）：
 1. `tests/smoke_architecture.py`：分层单向依赖、语法禁令、空 `__init__`、提示词单例、专家规格、轻量隔离导入、无 Key 安全导入与 MCP 路径校验（8 个场景）。
 2. `tests/smoke_file_agent.py`：FileAgent 离线冒烟测试（含 MarkItDown 路径安全拦截、越界隔离、HITL 恢复映射等 16 个场景）。
 3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试（2 个场景）。
@@ -365,10 +376,10 @@ uv run python tests/run_smoke.py
 8. `tests/smoke_memory.py`：长期记忆两阶段召回对账、版本化演进、代码护栏、输入隔离、fail-closed、多线程并发与平滑迁移离线冒烟测试（9 个场景）。
 9. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（4 个场景，含主管时间工具与专家预算装配）。
 10. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Neo4j图约束确保、图片编码与自检等 15 个场景）。
-11. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、生产递归上限下失控保护等 17 个场景）。
-12. `tests/smoke_sandbox.py`：Docker 沙箱架构契约与防护离线冒烟测试（含配置参数校验、单例跨调用复用与 TTL 超时重建、执行超时防护、输出洪泛头尾截断、多模态产物解析与安全防御、Docker 未启动友好引导、只读挂载降级与软链接防御、BaseSandbox 与 CompositeBackend 抽象基类契约、资源释放幂等性、并发串行化、code_tools 工具层与 Outbox 旁路集成等 11 个场景）。
+11. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、生产递归上限下失控保护等 18 个场景）。
+12. `tests/smoke_sandbox.py`：Docker 沙箱架构契约与防护离线冒烟测试（含配置参数校验、单例跨调用复用与 TTL 超时重建、执行超时防护、输出洪泛头尾截断、多模态产物解析与安全防御、Docker 未启动友好引导、只读挂载降级与软链接防御、BaseSandbox 与 CompositeBackend 抽象基类契约、资源释放幂等性、并发串行化、code_tools 工具层与 Outbox 旁路集成、P0 命令包装与输出上限、O 超时细分保留状态、P 客户端缓存与 clamp、Q 指纹去重、R 沙箱工作台装配与 S 多模态中间件等 19 个场景）。
 
-此外还提供 `tests/live_sandbox.py` 真机验收测试套件（包含 9 项端到端用例，需在已启动 Docker 守护进程的环境下执行 `uv run python tests/live_sandbox.py --live` 运行）。
+此外还提供 `tests/live_sandbox.py` 真机验收测试套件（包含 18 项端到端用例，需在已启动 Docker 守护进程的环境下执行 `uv run python tests/live_sandbox.py --live` 运行；慢测试需追加 `--slow` 参数）。
 
 ---
 

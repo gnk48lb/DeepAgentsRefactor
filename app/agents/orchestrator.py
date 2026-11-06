@@ -51,7 +51,6 @@ _DECLARATIVE_SPECS = [
     knowledge_agent.SPEC,
     media_agent.SPEC,
     map_agent.SPEC,
-    code_agent.SPEC,
     browser_agent.SPEC,
 ]
 
@@ -60,7 +59,17 @@ def _declarative_subagents() -> list:
     return [spec.to_subagent(models) for spec in _DECLARATIVE_SPECS]
 
 
-async def _local_subagents() -> tuple[CompiledSubAgent, CompiledSubAgent]:
+async def _local_subagents() -> tuple[CompiledSubAgent, CompiledSubAgent, CompiledSubAgent]:
+    code_runnable = code_agent.build_code_agent_runnable(
+        llm=models.worker_llm,
+        system_prompt=code_agent.PROMPT,
+    )
+    code_subagent = CompiledSubAgent(
+        name=code_agent.NAME,
+        description=code_agent.DESCRIPTION,
+        runnable=code_runnable,
+    )
+
     desktop_tools = mcp_service.get_tools_by_server("desktop")
 
     markitdown_tools = mcp_service.get_tools_by_server("markitdown")
@@ -88,7 +97,7 @@ async def _local_subagents() -> tuple[CompiledSubAgent, CompiledSubAgent]:
         description=desktop_agent.DESCRIPTION,
         runnable=desktop_agent_subgraph,
     )
-    return file_subagent, desktop_subagent
+    return code_subagent, file_subagent, desktop_subagent
 
 
 async def build_main_agent(
@@ -120,10 +129,17 @@ async def build_main_agent(
         )
     ]
 
-    subagents = _declarative_subagents()
-    file_subagent, desktop_subagent = await _local_subagents()
-    subagents.append(file_subagent)
-    subagents.append(desktop_subagent)
+    decl_subagents = _declarative_subagents()  # [Knowledge, Media, Map, Browser]
+    code_subagent, file_subagent, desktop_subagent = await _local_subagents()
+    subagents = [
+        decl_subagents[0],  # KnowledgeAgent
+        decl_subagents[1],  # MediaAgent
+        decl_subagents[2],  # MapAgent
+        code_subagent,      # CodeAgent
+        decl_subagents[3],  # BrowserAgent
+        file_subagent,      # FileAgent
+        desktop_subagent,   # DesktopAgent
+    ]
 
     # 断言除 FileAgent 外，任何声明式子 Agent 的工具列表都不得包含 convert_to_markdown
     for sa in subagents:
