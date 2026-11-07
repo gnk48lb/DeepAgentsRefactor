@@ -2,7 +2,7 @@
 tests/smoke_file_agent.py
 
 FileAgent 离线冒烟测试套件（无外部依赖、无需 API Key、无需 Docker/网络）。
-覆盖 Group A (A1-A4) 与 Group B (B1-B9)。
+覆盖 Group A (A1-A6) 与 Group B (B1-B14)。
 """
 import os
 import sys
@@ -108,7 +108,7 @@ def test_a1_tool_whitelist():
         runnable.invoke({"messages": [HumanMessage(content="hi")]})
         assert len(fam.seen_tools) > 0, "bind_tools 未被调用"
         actual = set(fam.seen_tools[0])
-        expected = {"ls", "read_file", "write_file", "edit_file", "glob", "grep", "move_file", "create_directory"}
+        expected = {"ls", "read_file", "write_file", "edit_file", "glob", "grep", "move_file", "create_directory", "run_host_command"}
         assert actual == expected, f"工具集不匹配: actual={actual}, expected={expected}"
         assert "delete" not in actual, "delete 不应存在"
         assert "execute" not in actual, "execute 不应存在"
@@ -197,6 +197,31 @@ def test_a4_large_tool_results_isolation():
         # 验证内存 state 中包含 large_tool_results
         files = out.get("files", {})
         assert any("large_tool_results" in str(k) for k in files.keys()), f"state['files'] 中缺少 large_tool_results: {files.keys()}"
+
+
+def test_a5_auto_approved_command_runs_directly():
+    """A5 免授权命令：不带 checkpointer 直接 invoke，不会中断，ToolMessage 含 exit_code=0。"""
+    with tempfile.TemporaryDirectory() as td:
+        script = [
+            AIMessage(content="", tool_calls=[{"name": "run_host_command", "args": {"command": "whoami"}, "id": "h1"}]),
+            AIMessage(content="done"),
+        ]
+        fam = ScriptedModel(script=script)
+        runnable = file_agent.build_file_agent_runnable(fam, "prompt", td)
+        res = runnable.invoke({"messages": [HumanMessage(content="who")]})
+        tm = {m.tool_call_id: m for m in res["messages"] if isinstance(m, ToolMessage)}["h1"]
+        assert tm.status != "error", f"whoami 调用出错: {tm.content}"
+        assert "[exit_code=0" in str(tm.content), f"缺少 exit_code=0: {tm.content}"
+
+
+def test_a6_timeout_validation():
+    """A6 timeout 越界（过大 / 负数）直接返回 Error: timeout 文本，不执行命令。"""
+    with tempfile.TemporaryDirectory() as td:
+        tool_ = {t.name: t for t in file_agent.make_workspace_tools(td)}["run_host_command"]
+        for bad in (9999, -1):
+            out = tool_.invoke({"command": "echo should_not_run", "timeout": bad})
+            assert str(out).startswith("Error: timeout"), f"timeout={bad} 应被拒绝: {out}"
+            assert "should_not_run" not in str(out)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -606,19 +631,117 @@ def test_b9_global_profile_isolation():
         assert len(main_m.seen_tools) > 0
         main_tools = set(main_m.seen_tools[0])
         assert not (main_tools & {"write_file", "edit_file", "delete", "execute", "ls", "glob", "grep"}), f"主 Agent 包含了被排除工具: {main_tools}"
+        assert "run_host_command" not in main_tools, f"主 Agent 不应有 run_host_command: {main_tools}"
         assert "read_file" in main_tools, f"主 Agent 缺失 read_file: {main_tools}"
 
         assert len(normal_m.seen_tools) > 0
         normal_tools = set(normal_m.seen_tools[0])
         assert not (normal_tools & {"write_file", "edit_file", "delete", "execute", "ls", "glob", "grep"}), f"声明式子 Agent 包含了被排除工具: {normal_tools}"
+        assert "run_host_command" not in normal_tools, f"声明式子 Agent 不应有 run_host_command: {normal_tools}"
         assert "read_file" in normal_tools, f"声明式子 Agent 缺失 read_file: {normal_tools}"
 
         # 断言 FileAgent 含有 write_file / edit_file
         assert len(fa_m.seen_tools) > 0
         fa_tools = set(fa_m.seen_tools[0])
         assert "write_file" in fa_tools and "edit_file" in fa_tools, f"FileAgent 缺失写工具: {fa_tools}"
-        for tool_name in ("ls", "glob", "grep", "read_file"):
+        for tool_name in ("ls", "glob", "grep", "read_file", "run_host_command"):
             assert tool_name in fa_tools, f"FileAgent 缺失工具 {tool_name}: {fa_tools}"
+        assert "execute" not in fa_tools, f"FileAgent 不应有 execute: {fa_tools}"
+
+
+def _host_flow(td, tool_name, args, thread_id):
+    """派 FileAgent 调一次指定工具；返回 (agent, cfg, fa_model, state)。"""
+    main_script = [
+        AIMessage(content="", tool_calls=[
+            {"name": "task", "args": {"subagent_type": "FileAgent", "description": "执行"}, "id": "t1"}
+        ]),
+        AIMessage(content="完成"),
+    ]
+    fa_script = [
+        AIMessage(content="", tool_calls=[{"name": tool_name, "args": args, "id": "h1"}]),
+        AIMessage(content="【内部专家汇报 - 来源：FileAgent】\n完成"),
+    ]
+    fa_m = ScriptedModel(script=fa_script)
+    agent = _build_main_deep_agent(ScriptedModel(script=main_script), fa_m, td)
+    cfg = {"configurable": {"thread_id": thread_id}}
+    agent.invoke({"messages": [HumanMessage(content="执行")]}, config=cfg)
+    return agent, cfg, fa_m, agent.get_state(cfg)
+
+
+def test_b10_host_command_approve():
+    """B10 run_host_command 批准：首次中断时尚未执行；Y 后 marker 出现在工作区根目录。"""
+    with tempfile.TemporaryDirectory() as td:
+        cmd = "echo approved_ok > host_marker.txt"
+        agent, cfg, fa_m, state = _host_flow(td, "run_host_command", {"command": cmd}, "b10")
+        assert len(hitl.pending_interrupts(state)) == 1, "应恰有 1 个中断"
+        marker = Path(td) / "host_marker.txt"
+        assert not marker.exists(), "授权前命令不应已执行"
+        warning = hitl.format_hitl_warning(state)
+        assert "run_host_command" in warning and cmd in warning and "回复 Y 允许" in warning, warning
+        agent.invoke(Command(resume=hitl.build_resume(state, "Y")), config=cfg)
+        assert marker.exists(), "批准后 marker 应出现在工作区根目录（cwd=工作区根）"
+        assert "approved_ok" in marker.read_text(encoding="utf-8", errors="replace")
+        assert fa_m.idx == 2, f"FileAgent 模型调用数应为 2，实际 {fa_m.idx}"
+
+
+def test_b11_host_command_reject():
+    """B11 run_host_command 拒绝：命令不执行，模型仍只被调用 2 次。"""
+    with tempfile.TemporaryDirectory() as td:
+        agent, cfg, fa_m, state = _host_flow(
+            td, "run_host_command", {"command": "echo approved_ok > host_marker.txt"}, "b11")
+        assert hitl.has_pending_interrupts(state)
+        agent.invoke(Command(resume=hitl.build_resume(state, "N")), config=cfg)
+        assert not (Path(td) / "host_marker.txt").exists(), "拒绝后命令不应执行"
+        assert fa_m.idx == 2, f"FileAgent 模型调用数应为 2，实际 {fa_m.idx}"
+
+
+def test_b12_bypass_variants_all_interrupt():
+    """B12 免授权名单的各种绕过变体都必须弹授权，拒绝后载荷不被执行。"""
+    variants = [
+        "whoami\necho x > m.txt",
+        "whoami && echo x > m.txt",
+        "whoami & echo x > m.txt",
+        "whoami | more",
+        "git status\r\necho x > m.txt",
+        "git branch -D smoke_branch",
+        "git diff --no-index a b",
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        for i, cmd in enumerate(variants):
+            agent, cfg, _fa_m, state = _host_flow(td, "run_host_command", {"command": cmd}, f"b12_{i}")
+            assert hitl.has_pending_interrupts(state), f"变体未弹授权: {cmd!r}"
+            agent.invoke(Command(resume=hitl.build_resume(state, "N")), config=cfg)
+            assert not (Path(td) / "m.txt").exists(), f"拒绝后载荷被执行: {cmd!r}"
+
+
+def test_b13_auto_approved_no_interrupt():
+    """B13 免批命令（whoami）不弹授权，直接执行完毕。"""
+    with tempfile.TemporaryDirectory() as td:
+        _agent, _cfg, fa_m, state = _host_flow(td, "run_host_command", {"command": "whoami"}, "b13")
+        assert not hitl.has_pending_interrupts(state), "免批命令不应产生中断"
+        assert fa_m.idx == 2, f"FileAgent 模型调用数应为 2，实际 {fa_m.idx}"
+
+
+def test_b14_prompt_content():
+    """B14 授权提示内容：timeout、write_file 内容预览、超长内容截断到 300 字符并显示总数。"""
+    with tempfile.TemporaryDirectory() as td:
+        _a, _c, _m, state = _host_flow(td, "run_host_command", {"command": "echo hi", "timeout": 30}, "b14_t")
+        warning = hitl.format_hitl_warning(state)
+        assert "timeout=30" in warning, warning
+
+        content = "echo PWNED_PREVIEW"
+        _a, _c, _m, state = _host_flow(
+            td, "write_file", {"file_path": "workspace/run.bat", "content": content}, "b14_w")
+        warning = hitl.format_hitl_warning(state)
+        assert content in warning and "内容预览" in warning, warning
+
+        long_content = "A" * 400
+        _a, _c, _m, state = _host_flow(
+            td, "write_file", {"file_path": "workspace/long.txt", "content": long_content}, "b14_l")
+        warning = hitl.format_hitl_warning(state)
+        assert "A" * 300 + "…" in warning, warning
+        assert "A" * 301 not in warning, "预览不应超过 300 个字符"
+        assert "共 400 字符" in warning, warning
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -802,6 +925,8 @@ SCENARIOS = [
     ("A2 读操作与分页", test_a2_read_operations),
     ("A3 越界路径拦截", test_a3_path_traversal),
     ("A4 大结果落盘隔离不污染真实工作区", test_a4_large_tool_results_isolation),
+    ("A5 免授权命令直接执行", test_a5_auto_approved_command_runs_directly),
+    ("A6 timeout 越界校验", test_a6_timeout_validation),
     ("B1 approve 流程与恢复值映射", test_b1_approve),
     ("B2 reject 流程与拒绝消息", test_b2_reject),
     ("B3 edit 流程与参数修改", test_b3_edit),
@@ -811,6 +936,11 @@ SCENARIOS = [
     ("B7 hitl.format_hitl_warning 文案格式", test_b7_hitl_warning_formatting),
     ("B8 并行中断与多 id 恢复", test_b8_parallel_interrupts),
     ("B9 全局 profile 隔离性验证", test_b9_global_profile_isolation),
+    ("B10 run_host_command 批准", test_b10_host_command_approve),
+    ("B11 run_host_command 拒绝", test_b11_host_command_reject),
+    ("B12 免授权绕过变体全部弹授权", test_b12_bypass_variants_all_interrupt),
+    ("B13 免批命令不弹授权", test_b13_auto_approved_no_interrupt),
+    ("B14 授权提示内容预览", test_b14_prompt_content),
     ("C1 markitdown 路径映射与安全越界拦截", test_c1_markitdown_normalize_uri),
     ("C2 markitdown build_tools 工具挂载与隔离", test_c2_markitdown_build_tools_and_mounting),
     ("C3 markitdown 边界输入与 SSRF 分支", test_c3_markitdown_edge_and_ssrf),

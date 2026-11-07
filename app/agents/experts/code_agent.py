@@ -29,6 +29,7 @@ DESCRIPTION = (
     "代码与终端专家：在隔离 Docker 沙箱里写代码、跑 Python 与 Linux 命令（rg/jq/unzip…）、"
     "读写沙箱内文件（/work），只读访问用户工作区（/workspace）；用于计算、数据分析与绘图、批量处理文件。"
     "不能联网，不能修改用户工作区（新建/修改 workspace 文件一律找 FileAgent）。需要绘图要明确要求。"
+    "需要联网、宿主机已安装的工具（git / pip / npm 等）、或要在用户电脑上真正执行的命令，一律找 FileAgent。"
 )
 
 PROMPT = (

@@ -9,7 +9,7 @@ tests/smoke_budget.py
   B 声明式子 Agent（KnowledgeAgent / MediaAgent / MapAgent / CodeAgent / BrowserAgent 的装配方式）
     B1 软停止  B2 硬停止  B3 计数器隔离  B4 生产递归上限下失控
   C FileAgent（create_agent 预编译 + HITL）
-    C1 软停止  C2 硬停止  C3 超预算写入不弹授权  C4 预算内写入仍要授权  C5 生产嵌套结构下失控
+    C1 软停止  C2 硬停止  C3 超预算写入不弹授权  C4 预算内写入仍要授权  C5 生产嵌套结构下失控  C6 超预算宿主机命令不弹授权
   D DesktopAgent（手写 StateGraph）
     D1 预算截断  D2 正常路径不变  D3 默认预算 + 生产递归上限
 
@@ -336,6 +336,24 @@ def test_c4_in_budget_write_still_requires_approval():
     assert fam.idx == 2, f"模型调用数应为 2，实际 {fam.idx}"
 
 
+def test_c6_over_budget_host_command_does_not_prompt():
+    """C6 N=2：第 3 次调用恰好是 run_host_command → 被预算拦下，不弹授权、不执行、同一个 tool_call_id 只有 1 条应答。"""
+    with tempfile.TemporaryDirectory() as td:
+        script = ls_calls(2) + [
+            call("run_host_command", {"command": "echo blocked > blocked.txt"}, "h1"),
+            AIMessage(content=f"{FA_REPORT}已汇总"),
+        ]
+        fam = ScriptedModel(script=script)
+        runnable = file_agent.build_file_agent_runnable(fam, "prompt", td, checkpointer=MemorySaver(), max_tool_calls=2)
+        cfg = {"configurable": {"thread_id": "c6"}, "recursion_limit": 100}
+        res = runnable.invoke({"messages": [HumanMessage(content="go")]}, config=cfg)
+        assert not hitl.has_pending_interrupts(runnable.get_state(cfg)), "超预算的宿主机命令不应再弹授权"
+        assert not (Path(td) / "blocked.txt").exists(), "超预算的宿主机命令不应被执行"
+    ms = tool_msgs(res, "h1")
+    assert len(ms) == 1 and LIMIT_ERR in str(ms[0].content), ms
+    assert fam.idx == 4, f"模型调用数应为 4，实际 {fam.idx}"
+
+
 def test_c5_file_agent_runaway_nested_under_production_recursion_limit():
     """C5 FileAgent 作为 CompiledSubAgent 嵌在主图里、recursion_limit=60：失控也只会被默认预算止住。"""
     limit = config.SUBAGENT_TOOL_LIMITS["FileAgent"]
@@ -488,6 +506,7 @@ def main():
         ("C3 FileAgent·超预算写入不弹授权", test_c3_over_budget_write_does_not_prompt),
         ("C4 FileAgent·预算内写入仍要授权", test_c4_in_budget_write_still_requires_approval),
         ("C5 FileAgent·生产嵌套结构下失控", test_c5_file_agent_runaway_nested_under_production_recursion_limit),
+        ("C6 FileAgent·超预算宿主机命令不弹授权", test_c6_over_budget_host_command_does_not_prompt),
         ("D1 DesktopAgent·预算截断", test_d1_desktop_budget_cut),
         ("D2 DesktopAgent·正常路径不变", test_d2_desktop_normal_path_unchanged),
         ("D3 DesktopAgent·默认预算+生产递归上限", test_d3_desktop_default_budget_under_production_recursion_limit),

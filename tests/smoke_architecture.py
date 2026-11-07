@@ -322,6 +322,7 @@ import app.agents.spec
 import app.agents.budget
 import app.agents.prompts
 import app.agents.skills
+import app.infra.host_shell
 import app.agents.experts.file_agent
 import app.tools.markitdown_tool
 import app.tools.amap

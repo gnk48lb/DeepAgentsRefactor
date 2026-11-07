@@ -25,9 +25,26 @@ def has_pending_interrupts(state) -> bool:
     return bool(pending_interrupts(state))
 
 
+_PREVIEW_CHARS = 300
+
+
+def _preview(text: str) -> str:
+    return text[:_PREVIEW_CHARS] + ("…" if len(text) > _PREVIEW_CHARS else "")
+
+
 def _target(name: str, args: dict) -> str:
     if name == "move_file":
         return f"{args.get('source')} -> {args.get('destination')}"
+    if name == "run_host_command":
+        cmd = str(args.get("command") or "")
+        t = args.get("timeout")
+        return f"{cmd}  （timeout={t}s）" if t else cmd
+    if name == "write_file":
+        content = str(args.get("content") or "")
+        return f"{args.get('file_path') or args.get('path')}\n内容预览（共 {len(content)} 字符）:\n{_preview(content)}"
+    if name == "edit_file":
+        new = str(args.get("new_string") or "")
+        return f"{args.get('file_path') or args.get('path')}\n新内容预览（共 {len(new)} 字符）:\n{_preview(new)}"
     return str(args.get("file_path") or args.get("path") or args.get("destination") or args)
 
 

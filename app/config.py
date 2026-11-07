@@ -175,6 +175,29 @@ SANDBOX_MAX_IMAGE_MB = int(os.getenv("SANDBOX_MAX_IMAGE_MB", "10"))
 SANDBOX_USER_IMAGE_MAX_SIDE = int(os.getenv("SANDBOX_USER_IMAGE_MAX_SIDE", "1600"))
 SANDBOX_MODEL_IMAGE_MAX_SIDE = int(os.getenv("SANDBOX_MODEL_IMAGE_MAX_SIDE", "768"))
 
+# 宿主机命令执行（FileAgent 的 run_host_command，见 app/infra/host_shell.py）。
+# 这是在用户真实机器上跑命令，没有任何沙箱：防线只有 人工授权 + 环境变量白名单 + 提示词约束。
+HOST_SHELL_TIMEOUT_SECONDS = int(os.getenv("HOST_SHELL_TIMEOUT_SECONDS", "60"))
+HOST_SHELL_MAX_TIMEOUT_SECONDS = int(os.getenv("HOST_SHELL_MAX_TIMEOUT_SECONDS", "180"))
+HOST_SHELL_MAX_OUTPUT_CHARS = int(os.getenv("HOST_SHELL_MAX_OUTPUT_CHARS", "30000"))  # 返回给模型的上限：头 60% + 尾 40%
+HOST_SHELL_HARD_CAP_BYTES = int(os.getenv("HOST_SHELL_HARD_CAP_BYTES", str(16 * 1024 * 1024)))  # 内存里最多缓存的原始输出，超过即终止进程
+HOST_SHELL_MAX_COMMAND_CHARS = int(os.getenv("HOST_SHELL_MAX_COMMAND_CHARS", "2000"))
+# 额外放行给命令子进程的环境变量名（逗号分隔，不区分大小写），如 "JAVA_HOME,GOPATH"
+HOST_SHELL_ENV_ALLOW = tuple(
+    n.strip().upper() for n in os.getenv("HOST_SHELL_ENV_ALLOW", "").split(",") if n.strip()
+)
+# 免授权命令：整条命令（空白折叠、忽略大小写）必须与某一项完全一致；只收无副作用的只读查询，
+# 要加新的就在这里按“整条命令”加。含 & | < > ^ % ! ; ` $ ( ) 引号 的条目会被运行时忽略。
+HOST_SHELL_AUTO_APPROVE_COMMANDS = (
+    "whoami", "hostname", "ver",
+    "git --version", "python --version", "pip --version", "uv --version", "node --version", "npm --version",
+    "git status", "git status -s", "git status --short", "git status -sb",
+    "git diff", "git diff --stat", "git diff --name-only", "git diff --cached", "git diff --cached --stat",
+    "git log --oneline", "git log --oneline -n 10", "git log --oneline -n 20", "git log -n 5",
+    "git branch", "git branch -a", "git branch -vv", "git branch --show-current",
+    "git remote -v",
+)
+
 REFRESH_COLLECTION = False
 CLEAR_MEMORY_ON_STARTUP = False
 REFRESH_BM25 = False

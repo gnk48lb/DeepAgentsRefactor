@@ -1,4 +1,15 @@
 """文本提取与处理工具 (L0)"""
+import re
+
+URL_REGEX = re.compile(r"(?:https?://|www\.)[^\s<>\"'）)】」》，。；、！？]+", re.IGNORECASE)
+
+
+def defang_urls(text: str) -> str:
+    """把 URL 改写成不会被识别为链接、但人眼仍能看清的形式（https[:]//a[.]com/x）。
+    用于授权提示：这类文本不能像普通回复那样把 URL 直接删掉，否则用户看不到自己在批准什么。"""
+    if not text:
+        return text
+    return URL_REGEX.sub(lambda m: m.group(0).replace("://", "[:]//").replace(".", "[.]"), text)
 
 
 def extract_text(content) -> str:

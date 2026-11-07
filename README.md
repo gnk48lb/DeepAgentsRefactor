@@ -46,7 +46,7 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 3. **MapAgent**: 地理与出行专家，挂载高德地图本地工具（共 12 个高德本地 Tool），支持天气查询、周边检索、路径规划与地理编码。约定：路线、周边搜索、测距的位置参数既可传文字地址也可传'经度,纬度'，工具内部自动解析（文字地址跨城有歧义时会报错要求补城市）；只有 maps_regeocode 必须传坐标。
 4. **CodeAgent**: 代码执行与数据分析沙箱工作台。基于 deepagents 的 `CompiledSubAgent` 模式，挂载 `FilesystemMiddleware`（提供 `ls`、`read_file`、`write_file`、`edit_file`、`glob`、`grep`、`execute` 7 个沙箱工具，故意不含 `delete` 工具）与快捷通道 `execute_python_code`。通过 `/workspace/...` 只读访问用户工作区，沙箱专属可读写会话工作目录为 `/work/...`（脚本、数据与多文件处理），专属交付箱为 `/work/outputs/...`（生成的图表由 `SandboxOutputsMiddleware` 统一按指纹提取并自动推送到模型与用户发件箱）。绘图规范由 Skill `matplotlib-chart` 提供，数据分析规范由 Skill `data-analysis` 提供。沙箱预置中文字体、热启动支持与流式输出截断。
 5. **BrowserAgent**: 浏览器自动化专家，基于 Playwright/browser-use 操控真实浏览器（可见模式），处理网页端交互。
-6. **FileAgent (HITL)**: 本地文件专家，内置 FilesystemMiddleware + FilesystemBackend + 原生 HITL。提供工具：`ls`/`glob`/`grep`/`read_file` 免授权，`convert_to_markdown`（由 markitdown-mcp 提供，支持富文档转 Markdown），`write_file`/`edit_file`/`create_directory`/`move_file` 需授权，删除 = 移动到 archive_trash 归档。只能在 workspace 工作区内操作。转换结果过大时会暂存到 `/_artifacts/large_tool_results/<id>`，FileAgent 用 `read_file` 分页读回。
+6. **FileAgent (HITL)**: 本地文件专家，内置 FilesystemMiddleware + FilesystemBackend + 原生 HITL。提供工具：`ls`/`glob`/`grep`/`read_file` 免授权，`convert_to_markdown`（由 markitdown-mcp 提供，支持富文档转 Markdown），`write_file`/`edit_file`/`create_directory`/`move_file` 需授权，删除 = 移动到 archive_trash 归档；另有自定义工具 `run_host_command`（在用户 Windows 宿主机上执行命令，仅少数只读状态查询如 `git status` 免授权，其余需授权，见 2.10）。文件工具只能在 workspace 工作区内操作；`run_host_command` 不受路径限制（仅以工作区根目录作为 cwd）。转换结果过大时会暂存到 `/_artifacts/large_tool_results/<id>`，FileAgent 用 `read_file` 分页读回。
 7. **DesktopAgent (HITL)**: 桌面操作专家，基于网格坐标截屏、模拟点击与键鼠交互。
 
 ### 2.4 单用户模式
@@ -56,7 +56,7 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 - 对话会话使用固定的 `thread_id`（`"main"`），私聊与群聊共享同一份对话上下文。
 - 发送 `/reset`（或 `/new`、`/新对话`）可清空固定会话，含挂起中的授权。
 
-> **警告**：机器人必须保持私有；若将来对外开放，需要重新引入用户隔离与权限层。
+> **警告**：机器人必须保持私有；若将来对外开放，需要重新引入用户隔离与权限层。尤其是 `FileAgent` 的 `run_host_command` 会以机器人进程所属用户的权限在宿主机上执行命令，任何能给机器人发消息并回复 `Y` 的人都等同于拥有这台机器的该用户权限。
 
 ### 2.5 MCP 常驻会话与容错机制
 系统通过 Model Context Protocol (MCP) 集成外部能力（如文档转换 `markitdown`、桌面控制 `desktop`）。
@@ -120,6 +120,21 @@ L0 Config & Utils    (app/config.py, app/utils/*)
   - 由 `SandboxOutputsMiddleware` 拦截 `execute` 调用，调用底层 `collect_new_outputs()` 按 `(路径: (大小, mtime))` 文件指纹扫描 `/work/outputs/`。
   - 生成的新图表通过 `publish_images()` 实现双份投递：一份推送到接入层图片发件箱（Outbox）直发给用户，一份压缩编码为低分辨率预览 block 反哺给模型进行图表自检；同一指纹在会话生命周期内不重复投递。
 
+### 2.10 宿主机命令与沙箱的分工
+`FileAgent` 通过自定义工具 `run_host_command` 在用户的 Windows 宿主机上执行命令（`cmd.exe /d /s /c`），`CodeAgent` 仍在 Docker 沙箱里执行。主管按“要不要联网 / 要不要碰用户这台电脑 / 要不要真正改 workspace”选择：
+
+| 场景 | 联网 | 碰宿主机 | 改 workspace | 派给 |
+| --- | --- | --- | --- | --- |
+| 计算、统计、绘图、数据分析、验证纯代码 | 否 | 否 | 否 | CodeAgent（无需授权） |
+| git、pip/npm 安装、下载、构建/测试脚本、运行 workspace 里的程序、查看本机进程/端口/环境 | 可能 | 是 | 可能 | FileAgent（绝大多数命令需授权） |
+| 改代码 → 运行 → 看报错 → 再改 | - | 是 | 是 | FileAgent（一次委派内闭环） |
+
+- **为什么不用 `LocalShellBackend`**：它用 `subprocess.run(shell=True, text=True)`，Windows 上超时只杀 `cmd.exe`、孙进程占着管道会让调用一直挂住；标准输入继承自机器人进程；按本地代码页解码；输出在内存里无上限。因此运行器自己写在 `app/infra/host_shell.py`：`stdin=DEVNULL`、stdout/stderr 合并、超时与输出洪泛时终止整个进程树（Windows 用 `taskkill /T`）、读线程 + 16MB 内存硬上限、先严格按 UTF-8 解码再回退 OEM 代码页、按“头 60% + 尾 40%”截断。工具不叫 `execute`，是为了与 CodeAgent 的 `execute` 区分。
+- **免授权 = 整条命令精确匹配**：整条命令（空白折叠、忽略大小写）必须与 `config.HOST_SHELL_AUTO_APPROVE_COMMANDS` 中某一项完全一致才免授权，不解析 cmd 语法、不做前缀匹配；其余一律人工授权。命令长度上限 `HOST_SHELL_MAX_COMMAND_CHARS`（默认 2000），低于 `QQ_MAX_REPLY_CHARS`，保证被批准的命令一定被完整展示过。
+- **环境变量白名单**：子进程只继承系统运行必需项、代理和常见工具链目录，绝不整体继承 `os.environ`（`.env` 中的 API Key、`QQ_BOTS` 等都不会传入）。需要额外放行时设置 `HOST_SHELL_ENV_ALLOW=JAVA_HOME,GOPATH`。
+- **审计日志**：每条实际执行的命令追加一行到 `storage/host_shell_audit.log`（时间、退出码、耗时、命令前 500 字符）。
+- **加免授权命令**：在 `app/config.py` 的 `HOST_SHELL_AUTO_APPROVE_COMMANDS` 里按“整条命令”添加；含 `& | < > ^ % ! ; ` $ ( )` 和引号的条目会被运行时忽略。只应加无副作用的只读查询。
+
 ---
 
 ## 3. 目录结构
@@ -143,6 +158,7 @@ DeepAgentsRefactor/
 │   │   ├── models.py         # LLM / VLM / 向量模型 / 重排器惰性单例
 │   │   ├── milvus_client.py  # Milvus 客户端单例工厂
 │   │   ├── sandbox.py        # Docker Python 沙箱代码执行环境
+│   │   ├── host_shell.py     # 宿主机命令运行器 / 环境变量白名单 / 免授权判定（FileAgent run_host_command）
 │   │   ├── browser_service.py# 浏览器自动化控制封装 (Playwright)
 │   │   └── mcp_service.py    # MCP 协议客户端管理
 │   ├── knowledge/            # L2: 知识库检索与构建
@@ -208,6 +224,7 @@ DeepAgentsRefactor/
 │   ├── smoke_budget.py       # 专家工具调用预算（独立停止条件）冒烟测试
 │   ├── smoke_chat_service.py # chat_service 服务层离线冒烟测试
 │   ├── smoke_file_agent.py   # FileAgent 离线冒烟测试
+│   ├── smoke_host_shell.py   # 宿主机命令运行器离线冒烟测试
 │   ├── smoke_knowledge.py    # 知识库离线冒烟测试
 │   ├── smoke_markitdown_e2e.py # MarkItDown 端到端离线冒烟测试
 │   ├── smoke_memory.py       # 长期记忆两阶段召回对账与版本化离线冒烟测试
@@ -240,6 +257,7 @@ uv sync
 - `TAVILY_API_KEY`：Tavily 搜索 API Key。
 - `SILICON_FLOW_API_KEY`：硅基流动 Embedding / Reranker API Key。
 - `HUGGINGFACEHUB_API_TOKEN`：Hugging Face 访问令牌。
+- `HOST_SHELL_*`（可选）：FileAgent 宿主机命令的超时、输出上限、命令长度上限与额外放行的环境变量名，见 2.10 与 `.env.example`。
 
 #### LLM 角色与 Magpie 网关
 
@@ -375,6 +393,17 @@ uv run python main.py --rebuild
 ──────────────────
 回复 Y 允许，回复 N 拒绝。
 ```
+`run_host_command` 的授权提示会完整显示命令（不截断）：
+```text
+⚠️ 敏感操作授权拦截
+──────────────────
+操作: [run_host_command]
+目标: git clone https://github.com/u/r.git  （timeout=120s）
+──────────────────
+回复 Y 允许，回复 N 拒绝。
+```
+- `write_file` / `edit_file` 的授权提示会显示内容预览（前 300 字符及总字符数），因为“先 `write_file` 写脚本、再 `run_host_command` 运行”是最直接的绕过路径。
+- 授权提示里的 URL 不会像普通回复那样被替换为“（链接已省略）”，而是转义成 `https[:]//github[.]com/...` 的形式，保证你能看清自己在批准什么。
 - **回复 `Y` / `y`**：系统恢复执行并完成敏感工具调用。
 - **回复 `N` / `n`**：阻断该操作，向专家注入明确拒绝信息并由其礼貌告知用户。
 - **发送 `/reset`**：可随时丢弃未决的授权与历史上下文，重新开始新对话。
@@ -389,9 +418,9 @@ uv run python main.py --rebuild
 uv run python tests/run_smoke.py
 ```
 
-测试包含以下 13 个离线测试套件：
+测试包含以下 14 个离线测试套件：
 1. `tests/smoke_architecture.py`：分层单向依赖、语法禁令、空 `__init__`、提示词单例、专家规格、轻量隔离导入、无 Key 安全导入与 MCP 路径校验（8 个场景）。
-2. `tests/smoke_file_agent.py`：FileAgent 离线冒烟测试（含 MarkItDown 路径安全拦截、越界隔离、HITL 恢复映射等 16 个场景）。
+2. `tests/smoke_file_agent.py`：FileAgent 离线冒烟测试（含 MarkItDown 路径安全拦截、越界隔离、HITL 恢复映射以及 `run_host_command` 的工具白名单、免授权、批准/拒绝、绕过变体与授权提示内容等 23 个场景）。
 3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试（2 个场景）。
 4. `tests/smoke_amap_contract.py`：高德地图 12 个本地工具契约与 Schema 快照测试（5 个场景）。
 5. `tests/smoke_amap_http.py`：高德工具 HTTP 异常与密钥脱敏测试（13 个场景）。
@@ -399,10 +428,11 @@ uv run python tests/run_smoke.py
 7. `tests/smoke_knowledge.py`：知识库建库、pending 增量入库、混合检索、长期记忆与 Reranker 阈值/降级离线冒烟测试（6 个场景）。
 8. `tests/smoke_memory.py`：长期记忆两阶段召回对账、版本化演进、代码护栏、输入隔离、fail-closed、多线程并发与平滑迁移离线冒烟测试（9 个场景）。
 9. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（4 个场景，含主管时间工具与专家预算装配）。
-10. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Neo4j图约束确保、图片编码与自检、Anthropic thinking 保留与浏览器 provider 选择等 17 个场景）。
-11. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、生产递归上限下失控保护等 18 个场景）。
+10. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Neo4j图约束确保、图片编码与自检、Anthropic thinking 保留、浏览器 provider 选择与授权提示 URL 转义等 18 个场景）。
+11. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、超预算宿主机命令不弹授权、生产递归上限下失控保护等 19 个场景）。
 12. `tests/smoke_sandbox.py`：Docker 沙箱架构契约与防护离线冒烟测试（含配置参数校验、单例跨调用复用与 TTL 超时重建、执行超时防护、输出洪泛头尾截断、多模态产物解析与安全防御、Docker 未启动友好引导、只读挂载降级与软链接防御、BaseSandbox 与 CompositeBackend 抽象基类契约、资源释放幂等性、并发串行化、code_tools 工具层与 Outbox 旁路集成、P0 命令包装与输出上限、O 超时细分保留状态、P 客户端缓存与 clamp、Q 指纹去重、R 沙箱工作台装配与 S 多模态中间件等 19 个场景）。
 13. `tests/smoke_models.py`：模型角色默认 provider、Gemini 回退、未知 provider、缺 key 作用域、惰性单例与 thinking 文本隔离测试（5 个场景，构造过程不访问网络）。
+14. `tests/smoke_host_shell.py`：宿主机命令运行器测试（环境变量白名单、编码回退、免授权精确匹配、基础运行、子进程环境与 stdin、超时杀进程树、脱离孙进程不挂住、截断与洪泛硬上限、审计日志，以及仅 Windows 的专项用例，共 10 个场景）。
 
 此外还提供 `tests/live_sandbox.py` 真机验收测试套件（包含 18 项端到端用例，需在已启动 Docker 守护进程的环境下执行 `uv run python tests/live_sandbox.py --live` 运行；慢测试需追加 `--slow` 参数）。
 
@@ -423,3 +453,7 @@ uv run python tests/run_smoke.py
 9. **沙箱产物导出目前仅支持图片**: 目前沙箱多模态解析仅自动识别并导出 `/work/outputs/` 下的有效图片（PNG/JPEG/WebP/GIF），非图片产物（CSV/JSON/HTML 等中间结果）v1 暂不导出。
 10. **沙箱会话级单例模式**: 沙箱在单机器人进程中采用单例设计与固定容器标签（`gnk48.sandbox=1`）。若在同一宿主机上并发启动多个机器人实例，可能发生容器抢占或清理冲突（建议单实例运行）。
 11. **沙箱镜像更新需手动重新构建**: 修改 `deploy/sandbox/` 下的 Dockerfile 或配置文件后需手动执行 `docker build` 重新构建；运行中的常驻沙箱容器不会自动感知镜像变更，需重启机器人或待空闲 TTL 触发重建。
+12. **宿主机命令没有沙箱**: `run_host_command` 以机器人进程所属用户的权限运行，唯一防线是人工授权（注意避免“反射性回 Y”）、环境变量白名单和提示词约束。
+13. **免批 git 命令在不可信仓库里可能执行代码**: `git status` / `git diff` 等免授权命令可能经仓库配置（如 `core.fsmonitor`、外部 diff 驱动）执行代码；不要让 workspace 指向不可信仓库，或把相关条目从 `HOST_SHELL_AUTO_APPROVE_COMMANDS` 中移除。
+14. **进程树清理有边界**: `taskkill /T` 杀不到父进程已退出的孙进程；超时后遗留的后台进程不会被清理。
+15. **授权提示可能发不出去**: QQ 若拒收含“像域名”的文本（如命令里的 `a.b`），授权提示可能发不出，此时用 `/reset` 兜底。

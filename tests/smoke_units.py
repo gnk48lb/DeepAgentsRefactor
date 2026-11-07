@@ -19,6 +19,7 @@ tests/smoke_units.py
   L5 web_search 异常字符串识别与加固
   M DesktopAgent thinking/redacted_thinking 签名块保留
   N browser_use provider 客户端选择（不启动浏览器）
+  O defang_urls:授权提示里的 URL 转义
 """
 import base64
 import os
@@ -650,6 +651,19 @@ def test_n_browser_client_selection():
             setattr(config, name, value)
 
 
+def test_o_defang_urls():
+    from app.utils.text import URL_REGEX, defang_urls
+
+    src = "git clone https://github.com/u/r.git && curl www.example.com/a.sh"
+    out = defang_urls(src)
+    assert URL_REGEX.search(out) is None, f"转义后仍匹配 URL: {out!r}"
+    assert "https[:]//github[.]com/u/r[.]git" in out, out
+    assert "git clone" in out and "curl" in out
+    plain = "git status && echo hello"
+    assert defang_urls(plain) == plain
+    assert defang_urls("") == ""
+
+
 SCENARIOS = [
     ("A config._resolve_path", test_a_resolve_path),
     ("B bootstrap os.rename 兜底补丁", test_b_bootstrap_rename_fallback),
@@ -668,6 +682,7 @@ SCENARIOS = [
     ("L5 web_search 异常字符串识别与加固", test_l5_web_search_hardening),
     ("M DesktopAgent thinking 签名块保留", test_m_desktop_thinking_preservation),
     ("N browser_use provider 客户端选择", test_n_browser_client_selection),
+    ("O defang_urls 授权提示 URL 转义", test_o_defang_urls),
 ]
 
 
