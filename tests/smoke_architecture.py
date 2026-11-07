@@ -326,6 +326,10 @@ import app.infra.host_shell
 import app.agents.experts.file_agent
 import app.tools.markitdown_tool
 import app.tools.amap
+import app.infra.session_store
+import app.infra.checkpointer
+import app.tools.session_tools
+import app.services.session_log
 
 forbidden = ["app.infra.models", "app.infra.milvus_client", "app.knowledge", "app.memory"]
 loaded = [m for m in forbidden if any(name == m or name.startswith(m + ".") for name in sys.modules)]

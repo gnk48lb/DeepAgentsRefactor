@@ -93,8 +93,12 @@ def test_d_time_tool_and_budgets():
     from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
     from app import config
 
-    # 主管直接挂载 get_current_time
-    assert [t.name for t in _captured["tools"]] == ["get_current_time"], _captured.get("tools")
+    # 主管直接挂载 get_current_time + 两个只读会话回溯工具（顺序固定）
+    from app.tools import session_tools
+    assert [t.name for t in session_tools.TOOLS] == ["get_session_events", "search_session_history"]
+    assert [t.name for t in _captured["tools"]] == [
+        "get_current_time", "get_session_events", "search_session_history"
+    ], _captured.get("tools")
 
     # 配置表覆盖全部专家；声明式专家各挂 [软停止, 硬停止]
     by_name = {_name(s): s for s in _captured["subagents"]}

@@ -208,6 +208,18 @@ QQ_MAX_REPLY_CHARS = 10000
 # Agent 执行 recursion_limit
 AGENT_RECURSION_LIMIT = 60
 
+# 会话层持久化（见 README「会话与事件日志」）：两个独立的 SQLite 文件，均位于被 git 忽略的 storage/
+# sessions.db 存会话 / 事件日志 / 挂起态；checkpoints.db 存 LangGraph checkpoint（模型上下文续跑用）
+SESSIONS_DB_PATH = _resolve_path(os.getenv("SESSIONS_DB_PATH") or "storage/sessions.db")
+CHECKPOINT_DB_PATH = _resolve_path(os.getenv("CHECKPOINT_DB_PATH") or "storage/checkpoints.db")
+SESSION_LIST_LIMIT = 10                     # /sessions 默认列出的会话数
+SESSION_TITLE_MAX_CHARS = 28                # 自动标题长度
+SESSION_EVENT_TEXT_MAX_CHARS = 20000        # 写入事件日志的单段文本上限
+SESSION_TOOL_OUTPUT_MAX_CHARS = 6000        # 回溯工具返回给模型的总字符上限
+SESSION_TOOL_EVENT_MAX_CHARS = 1500         # 回溯工具里单条事件的字符上限
+# 每轮正常结束后清理子专家嵌套命名空间的 checkpoint（截图 base64 会让它们迅速膨胀；根命名空间永不清理）
+CHECKPOINT_PRUNE_NESTED = os.getenv("CHECKPOINT_PRUNE_NESTED", "true").lower() in ("1", "true", "yes")
+
 # 专家独立停止条件：每个专家在“一次 task 委派”内最多可调用的工具次数（实现见 app/agents/budget.py）。
 # 第 N+1 次起的工具调用不再执行（软停止，提示模型立即收尾汇报）；模型仍不收手则在第 N+2 次模型调用后强制结束（硬停止）。
 # 这些是“止损阈值”而不是常规用量：按各专家真实流程留足余量，调参只改这里。

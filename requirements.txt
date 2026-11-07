@@ -11,6 +11,10 @@ aiohttp==3.13.3
     #   langchain-community
 aiosignal==1.4.0
     # via aiohttp
+aiosqlite==0.22.1
+    # via
+    #   gnk48-agent
+    #   langgraph-checkpoint-sqlite
 annotated-doc==0.0.4
     # via
     #   fastapi
@@ -280,10 +284,13 @@ langgraph==1.2.11
     # via
     #   gnk48-agent
     #   langchain
-langgraph-checkpoint==4.1.0
+langgraph-checkpoint==4.3.1
     # via
     #   langgraph
+    #   langgraph-checkpoint-sqlite
     #   langgraph-prebuilt
+langgraph-checkpoint-sqlite==3.1.3
+    # via gnk48-agent
 langgraph-prebuilt==1.1.0
     # via
     #   gnk48-agent
@@ -1313,6 +1320,8 @@ sqlalchemy==2.0.49
     # via
     #   langchain-classic
     #   langchain-community
+sqlite-vec==0.1.9
+    # via langgraph-checkpoint-sqlite
 sse-starlette==3.4.4
     # via mcp
 starlette==1.0.0

@@ -15,7 +15,7 @@ GNK48-Agent 采用声明式主智能体配合垂直领域子专家架构。主 A
 ### 2.1 分层架构与依赖约束（单向，只能向下 import）
 系统严格遵循 6 层单向依赖架构：
 ```text
-L5 Services  (app/services/startup.py, app/services/chat_service.py)
+L5 Services  (app/services/startup.py, chat_service.py, session_log.py)
    ↓
 L4 Agents    (app/agents/spec.py, prompts.py, orchestrator.py, experts/*)
    ↓
@@ -53,8 +53,12 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 系统为单用户专属模式，仅供本人使用：
 - 所有专家（含具有本地文件读写权限的 `FileAgent`、物理桌面控制的 `DesktopAgent` 以及自动化操作网页的 `BrowserAgent` 等全量 7 个专家）始终挂载。
 - 系统内部没有任何用户身份或权限校验逻辑。
-- 对话会话使用固定的 `thread_id`（`"main"`），私聊与群聊共享同一份对话上下文。
-- 发送 `/reset`（或 `/new`、`/新对话`）可清空固定会话，含挂起中的授权。
+- 对话按会话（session）组织：`thread_id` 等于会话 id，会话游标、事件日志与挂起的授权都持久化在 `storage/` 下（详见 2.11），进程重启后可恢复；同一个聊天窗口里可以开多个会话并切换。
+- 斜杠命令（在授权判断之前拦截，按首个空白分隔的词精确匹配；其余以 `/` 开头的文本，如路径，按普通消息处理）：
+  - `/new [标题]`：新建并切换到新会话，旧会话原样保留（含挂起的授权）。
+  - `/sessions [N]`：列出最近 N 个会话（默认 10，最多 30），标出 `[当前]` 与 `[待授权]`。
+  - `/switch <序号|id前缀>`：序号按 `/sessions` 的顺序；切到有待授权操作的会话时会附上授权内容。
+  - `/reset`：只清空当前会话的对话上下文（含挂起的授权）并重置代码沙箱，**事件日志保留**。沙箱仍是进程级全局，`/new`、`/switch` 不会动它。
 
 > **警告**：机器人必须保持私有；若将来对外开放，需要重新引入用户隔离与权限层。尤其是 `FileAgent` 的 `run_host_command` 会以机器人进程所属用户的权限在宿主机上执行命令，任何能给机器人发消息并回复 `Y` 的人都等同于拥有这台机器的该用户权限。
 
@@ -135,6 +139,43 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 - **审计日志**：每条实际执行的命令追加一行到 `storage/host_shell_audit.log`（时间、退出码、耗时、命令前 500 字符）。
 - **加免授权命令**：在 `app/config.py` 的 `HOST_SHELL_AUTO_APPROVE_COMMANDS` 里按“整条命令”添加；含 `& | < > ^ % ! ; ` $ ( )` 和引号的条目会被运行时忽略。只应加无副作用的只读查询。
 
+### 2.11 会话与事件日志
+设计依据是 Anthropic《Scaling Managed Agents》：**会话（session）不是上下文窗口**。会话是持久化的事件日志，模型上下文只是其中一部分的一次读取；Harness（本进程）无状态，跨轮、跨授权的状态只放在存储里。
+
+**文章接口 ↔ 本项目**
+
+| 文章 | 本项目 |
+| --- | --- |
+| `getSession` | `SessionStore.get_session` |
+| `getEvents` | `get_events` / `get_last_events` / `get_pending_events` |
+| `emitEvent` | `SessionStore.emit_event`（带 `key` 时幂等） |
+| `wake(session_id)`（无载荷） | `chat_service.wake`：载荷全部从事件日志里读 |
+| Sandbox / Tools | 已满足，未改动；沙箱仍是进程级全局，不按会话隔离 |
+
+**两个库文件（都在被 git 忽略的 `storage/`，路径可由 `SESSIONS_DB_PATH` / `CHECKPOINT_DB_PATH` 覆盖）**
+- `sessions.db`（标准库 `sqlite3`，WAL）：`sessions`（含处理游标 `processed_seq`）、`events`（只追加的事件日志）、`turn_state`（授权挂起期间暂存的用户原话与已生成的图片）、`meta`（活动会话指针）。
+- `checkpoints.db`（官方 `AsyncSqliteSaver`）：LangGraph checkpoint，负责“续跑”（模型上下文与 HITL 中断）。`thread_id == session_id`。
+- 两者分工：checkpoint 负责续跑，事件日志负责记录与回溯；不要试图从事件日志重建模型上下文。
+
+**事件类型**：`session_created`、`user_message`（原话 / 翻译后文本 / 是否带图）、`approval`、`approval_request`、`assistant_message`（文本 + 图片张数）、`expert_report`（task 返回的专家完整战报）、`tool_call`、`tool_result`、`turn_failed`、`turn_abandoned`、`session_reset`。事件只追加、不改写；“待处理”由会话游标 `processed_seq` 表达（入站事件 `user_message` / `approval` 的 seq 大于游标即待处理）。图片字节永远不进事件日志，只记张数。
+
+**wake 与重启恢复语义**
+- wake 只做按需触发（用户消息 / Y-N 审批），不做定时、cron、后台主动唤醒，也不做崩溃自动重试。
+- 收到消息：写入 `user_message` 事件 → `wake(会话)` → 读取未处理的入站事件逐条处理 → 推进游标（成功失败都推进）。
+- 挂起授权：状态在 checkpoint 里，原话与已生成的图片落在 `turn_state`。进程重启后回复 Y/N 照常恢复，已完成的专家不会重跑，挂起前生成的图片仍随最终回复发出。
+- 崩溃遗留：启动时对每个有未处理入站事件的会话先镜像已落盘的消息，再追加 `turn_abandoned{process_restart}` 并推进游标，**不自动重跑**（回复通道已断，且重放可能让已批准的宿主机命令再执行一次）。
+- 主 Agent 的回溯：`search_session_history` / `get_session_events` 两个只读工具直接挂在主 Agent 上，查的是事件日志（用户原话 + 专家完整汇报），不受上下文压缩影响。
+
+**`/reset` 与脚本删除的区别**
+- `/reset`：只清上下文（删 checkpoint 线程 + 挂起态 + 重置沙箱），事件日志保留并追加 `session_reset`。
+- `uv run python scripts/manage_sessions.py delete <id前缀> [--yes]`：彻底删除（事件日志 + 挂起态 + checkpoint 线程），不可恢复。另有 `list`、`show <id前缀> [--from N --limit N --types a,b]`。
+
+**嵌套 checkpoint 清理**：DesktopAgent 截图的 base64 会让子专家的嵌套 checkpoint 迅速膨胀，而一轮正常结束后它们不会再被读取。每轮**正常结束**时清理 `checkpoint_ns != ''` 的行（`CHECKPOINT_PRUNE_NESTED`，默认开启）；失败 / 超时 / 挂起时不清理，根命名空间永不清理，也不调用 `aprune()`。
+
+**隐私提示**：`sessions.db` 含完整对话文本（用户原话与专家汇报），`checkpoints.db` 含完整模型上下文，都位于被 git 忽略的 `storage/`；备份、分享前请留意。
+
+**严格 msgpack**：checkpointer 创建时显式传入 `allowed_msgpack_modules=None`（等价于 `LANGGRAPH_STRICT_MSGPACK=true`），checkpoint 反序列化只允许 LangGraph 内置的安全类型；重启恢复测试覆盖了本项目用到的状态类型。
+
 ---
 
 ## 3. 目录结构
@@ -159,6 +200,8 @@ DeepAgentsRefactor/
 │   │   ├── milvus_client.py  # Milvus 客户端单例工厂
 │   │   ├── sandbox.py        # Docker Python 沙箱代码执行环境
 │   │   ├── host_shell.py     # 宿主机命令运行器 / 环境变量白名单 / 免授权判定（FileAgent run_host_command）
+│   │   ├── session_store.py  # 会话 / 事件日志 / 挂起态 / 活动会话指针（标准库 sqlite3，sessions.db）
+│   │   ├── checkpointer.py   # LangGraph checkpoint 的 AsyncSqliteSaver 打开 / 关闭 / 嵌套命名空间清理（checkpoints.db）
 │   │   ├── browser_service.py# 浏览器自动化控制封装 (Playwright)
 │   │   └── mcp_service.py    # MCP 协议客户端管理
 │   ├── knowledge/            # L2: 知识库检索与构建
@@ -177,6 +220,7 @@ DeepAgentsRefactor/
 │   │   └── guards.py         # 记忆纯函数代码护栏（证据校验/文本合规/对账规则）
 │   ├── tools/                # L3: 工具集合与适配器
 │   │   ├── knowledge_tools.py# RAG / Tavily / 时间查询工具
+│   │   ├── session_tools.py  # 主 Agent 的会话记录回溯工具（get_session_events / search_session_history，只读）
 │   │   ├── media_tools.py    # 媒体图谱检索工具
 │   │   ├── sql_tools.py      # MySQL 查询工具
 │   │   ├── code_tools.py     # Python 代码执行沙箱工具
@@ -199,7 +243,8 @@ DeepAgentsRefactor/
 │   │       └── desktop_agent.py
 │   └── services/             # L5: 应用服务与业务流程调度
 │       ├── startup.py        # 全局数据库与服务初始化入口
-│       └── chat_service.py   # 单用户多模态会话状态机与消息调度服务
+│       ├── chat_service.py   # 单用户多模态会话状态机、斜杠命令与 wake 调度服务
+│       └── session_log.py    # 事件日志镜像（mirror_messages）与命令输出格式化
 ├── deploy/                   # 部署配置
 │   ├── docker-compose.yml    # Neo4j 等后台服务容器编排
 │   └── sandbox/              # Docker 沙箱镜像定义
@@ -211,6 +256,7 @@ DeepAgentsRefactor/
 ├── scripts/                  # 运维与工具脚本
 │   ├── login_setup.py        # 浏览器自动化持久化登录引导脚本
 │   ├── manage_memory.py      # Milvus 长期记忆管理工具 (list/delete/restore)
+│   ├── manage_sessions.py    # 会话管理工具 (list/show/delete，彻底删除会话与其 checkpoint)
 │   └── migrate_to_mysql.py   # 数据迁移至 MySQL
 ├── skills/                   # deepagents 官方 Skills 目录
 │   └── matplotlib-chart/     # Matplotlib 绘图规范技能
@@ -229,9 +275,10 @@ DeepAgentsRefactor/
 │   ├── smoke_markitdown_e2e.py # MarkItDown 端到端离线冒烟测试
 │   ├── smoke_memory.py       # 长期记忆两阶段召回对账与版本化离线冒烟测试
 │   ├── smoke_orchestrator.py # 主管编排与专家装配冒烟测试
+│   ├── smoke_session.py      # 会话存储 / 事件日志镜像 / 回溯工具离线冒烟测试
 │   ├── smoke_skills.py       # Skills 规范与 Backend 路由冒烟测试
 │   └── smoke_units.py        # 纯函数单元冒烟测试
-├── storage/                  # 运行时持久化目录（Milvus DB、浏览器配置等，已忽略）
+├── storage/                  # 运行时持久化目录（Milvus DB、sessions.db、checkpoints.db、浏览器配置等，已忽略）
 ├── workspace/                # FileAgent 操作工作区（已忽略）
 ├── bot.py                    # NoneBot2 QQ 机器人启动入口
 ├── main.py                   # 本地控制台多轮对话入口 (合并了原 CLI 功能)
@@ -258,6 +305,7 @@ uv sync
 - `SILICON_FLOW_API_KEY`：硅基流动 Embedding / Reranker API Key。
 - `HUGGINGFACEHUB_API_TOKEN`：Hugging Face 访问令牌。
 - `HOST_SHELL_*`（可选）：FileAgent 宿主机命令的超时、输出上限、命令长度上限与额外放行的环境变量名，见 2.10 与 `.env.example`。
+- `SESSIONS_DB_PATH` / `CHECKPOINT_DB_PATH` / `CHECKPOINT_PRUNE_NESTED`（可选）：会话库、checkpoint 库路径与嵌套 checkpoint 清理开关，默认 `storage/sessions.db`、`storage/checkpoints.db`、开启，见 2.11。
 
 #### LLM 角色与 Magpie 网关
 
@@ -406,7 +454,9 @@ uv run python main.py --rebuild
 - 授权提示里的 URL 不会像普通回复那样被替换为“（链接已省略）”，而是转义成 `https[:]//github[.]com/...` 的形式，保证你能看清自己在批准什么。
 - **回复 `Y` / `y`**：系统恢复执行并完成敏感工具调用。
 - **回复 `N` / `n`**：阻断该操作，向专家注入明确拒绝信息并由其礼貌告知用户。
-- **发送 `/reset`**：可随时丢弃未决的授权与历史上下文，重新开始新对话。
+- **重启后仍可恢复**：挂起的授权状态在 checkpoint 里，授权前已生成的图片和用户原话在 `turn_state` 里。授权提示出现后即使重启进程，回复 `Y` / `N` 仍照常放行，已完成的专家不会重跑（见 2.11）。
+- **授权挂起时切换会话**：`/new`、`/switch` 不会丢弃挂起的授权；用 `/sessions` 可看到 `[待授权]` 标记，`/switch` 切回该会话后回复 `Y` / `N`。
+- **发送 `/reset`**：可随时丢弃当前会话未决的授权与历史上下文（事件日志保留），重新开始新对话。
 
 ---
 
@@ -418,21 +468,22 @@ uv run python main.py --rebuild
 uv run python tests/run_smoke.py
 ```
 
-测试包含以下 14 个离线测试套件：
+测试包含以下 15 个离线测试套件：
 1. `tests/smoke_architecture.py`：分层单向依赖、语法禁令、空 `__init__`、提示词单例、专家规格、轻量隔离导入、无 Key 安全导入与 MCP 路径校验（8 个场景）。
 2. `tests/smoke_file_agent.py`：FileAgent 离线冒烟测试（含 MarkItDown 路径安全拦截、越界隔离、HITL 恢复映射以及 `run_host_command` 的工具白名单、免授权、批准/拒绝、绕过变体与授权提示内容等 23 个场景）。
 3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试（2 个场景）。
 4. `tests/smoke_amap_contract.py`：高德地图 12 个本地工具契约与 Schema 快照测试（5 个场景）。
 5. `tests/smoke_amap_http.py`：高德工具 HTTP 异常与密钥脱敏测试（13 个场景）。
-6. `tests/smoke_chat_service.py`：多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复、`/reset` 与图片轮不提取测试（7 个场景）。
-7. `tests/smoke_knowledge.py`：知识库建库、pending 增量入库、混合检索、长期记忆与 Reranker 阈值/降级离线冒烟测试（6 个场景）。
-8. `tests/smoke_memory.py`：长期记忆两阶段召回对账、版本化演进、代码护栏、输入隔离、fail-closed、多线程并发与平滑迁移离线冒烟测试（9 个场景）。
-9. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（4 个场景，含主管时间工具与专家预算装配）。
-10. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Neo4j图约束确保、图片编码与自检、Anthropic thinking 保留、浏览器 provider 选择与授权提示 URL 转义等 18 个场景）。
-11. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、超预算宿主机命令不弹授权、生产递归上限下失控保护等 19 个场景）。
-12. `tests/smoke_sandbox.py`：Docker 沙箱架构契约与防护离线冒烟测试（含配置参数校验、单例跨调用复用与 TTL 超时重建、执行超时防护、输出洪泛头尾截断、多模态产物解析与安全防御、Docker 未启动友好引导、只读挂载降级与软链接防御、BaseSandbox 与 CompositeBackend 抽象基类契约、资源释放幂等性、并发串行化、code_tools 工具层与 Outbox 旁路集成、P0 命令包装与输出上限、O 超时细分保留状态、P 客户端缓存与 clamp、Q 指纹去重、R 沙箱工作台装配与 S 多模态中间件等 19 个场景）。
-13. `tests/smoke_models.py`：模型角色默认 provider、Gemini 回退、未知 provider、缺 key 作用域、惰性单例与 thinking 文本隔离测试（5 个场景，构造过程不访问网络）。
-14. `tests/smoke_host_shell.py`：宿主机命令运行器测试（环境变量白名单、编码回退、免授权精确匹配、基础运行、子进程环境与 stdin、超时杀进程树、脱离孙进程不挂住、截断与洪泛硬上限、审计日志，以及仅 Windows 的专项用例，共 10 个场景）。
+6. `tests/smoke_chat_service.py`：以生产同款 `AsyncSqliteSaver` + `SessionStore` 驱动的服务层测试，覆盖多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复、`/reset`、图片轮不提取记忆，以及重启恢复、多会话 `/new` `/sessions` `/switch`、崩溃遗留、事件日志镜像、嵌套 checkpoint 清理、`/reset` 保留日志与 `wake` 幂等消费（14 个场景）。
+7. `tests/smoke_session.py`：`SessionStore` 建表 / 活动指针 / 标题 / 前缀解析、事件追加与幂等 key、处理游标、`turn_state`（含 ≥1MB 发件箱）、搜索、关闭重开、并发 emit、`delete_session`，以及 `session_log.mirror_messages` 与两个回溯工具（12 个场景）。
+8. `tests/smoke_knowledge.py`：知识库建库、pending 增量入库、混合检索、长期记忆与 Reranker 阈值/降级离线冒烟测试（6 个场景）。
+9. `tests/smoke_memory.py`：长期记忆两阶段召回对账、版本化演进、代码护栏、输入隔离、fail-closed、多线程并发与平滑迁移离线冒烟测试（9 个场景）。
+10. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（4 个场景，含主管时间 / 会话回溯工具与专家预算装配）。
+11. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Neo4j图约束确保、图片编码与自检、Anthropic thinking 保留、浏览器 provider 选择与授权提示 URL 转义等 18 个场景）。
+12. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、超预算宿主机命令不弹授权、生产递归上限下失控保护等 19 个场景）。
+13. `tests/smoke_sandbox.py`：Docker 沙箱架构契约与防护离线冒烟测试（含配置参数校验、单例跨调用复用与 TTL 超时重建、执行超时防护、输出洪泛头尾截断、多模态产物解析与安全防御、Docker 未启动友好引导、只读挂载降级与软链接防御、BaseSandbox 与 CompositeBackend 抽象基类契约、资源释放幂等性、并发串行化、code_tools 工具层与 Outbox 旁路集成、P0 命令包装与输出上限、O 超时细分保留状态、P 客户端缓存与 clamp、Q 指纹去重、R 沙箱工作台装配与 S 多模态中间件等 19 个场景）。
+14. `tests/smoke_models.py`：模型角色默认 provider、Gemini 回退、未知 provider、缺 key 作用域、惰性单例与 thinking 文本隔离测试（5 个场景，构造过程不访问网络）。
+15. `tests/smoke_host_shell.py`：宿主机命令运行器测试（环境变量白名单、编码回退、免授权精确匹配、基础运行、子进程环境与 stdin、超时杀进程树、脱离孙进程不挂住、截断与洪泛硬上限、审计日志，以及仅 Windows 的专项用例，共 10 个场景）。
 
 此外还提供 `tests/live_sandbox.py` 真机验收测试套件（包含 18 项端到端用例，需在已启动 Docker 守护进程的环境下执行 `uv run python tests/live_sandbox.py --live` 运行；慢测试需追加 `--slow` 参数）。
 
@@ -443,7 +494,7 @@ uv run python tests/run_smoke.py
 ## 9. 已知限制
 
 1. **DesktopAgent 不稳定**: 桌面操作依赖网格视觉识别，受分辨率和缩放比例影响较大，可能存在点击漂移。
-2. **MemorySaver 会话重启丢失**: 当前状态保存器为内存级 `MemorySaver`，机器人进程重启后进行中的上下文与未决 HITL 中断会丢失。长期事实依赖 Milvus 后台抽取持久化。
+2. **会话重启后的边界**: 会话、事件日志、挂起的授权与模型上下文已持久化（见 2.11），重启后上下文与未决 HITL 都能恢复。但**非 HITL 的中途崩溃轮不会自动续跑**：启动时只把崩溃前未处理的消息标记为放弃（`turn_abandoned`），需要用户重新发送。长期事实仍依赖 Milvus 后台抽取持久化。
 3. **专家单次委派有工具调用预算**: 每个专家单次委派内的工具调用次数受 `config.SUBAGENT_TOOL_LIMITS` 限制（见 2.8；FileAgent 默认 20 次，授权恢复后重新计数），触顶后调用被拦截、专家以已有结果收尾，复杂任务可能因此汇报不完整；`write_file` 对已存在文件会整体覆盖。
 4. **增量入库不是事务**: 图片/PDF 的 VLM 摘要生成、写入 Milvus、把文件从 `data/pending/` 移到 `data/source/` 是三个独立步骤，失败不会回滚。若 VLM 调用失败（或摘要已生成但入库前进程中断），而同一批还有其它成功入库的文档，该文件仍会被移动到 `data/source/`，其摘要块之后不会被自动补入，表现为“文件已归档，但检索不到”。恢复方式：修复后执行 `uv run python main.py --rebuild`；若文件仍卡在 `data/pending/`，先删除对应的 `data/pipeline/summaries/<hash>.md`，并确保 `REFRESH_BM25=False` 后重新启动。
 5. **记忆提取仅信任用户原话**: 只记录用户原话，用户用“对/是的”确认 AI 转述不会被记住。
@@ -457,3 +508,7 @@ uv run python tests/run_smoke.py
 13. **免批 git 命令在不可信仓库里可能执行代码**: `git status` / `git diff` 等免授权命令可能经仓库配置（如 `core.fsmonitor`、外部 diff 驱动）执行代码；不要让 workspace 指向不可信仓库，或把相关条目从 `HOST_SHELL_AUTO_APPROVE_COMMANDS` 中移除。
 14. **进程树清理有边界**: `taskkill /T` 杀不到父进程已退出的孙进程；超时后遗留的后台进程不会被清理。
 15. **授权提示可能发不出去**: QQ 若拒收含“像域名”的文本（如命令里的 `a.b`），授权提示可能发不出，此时用 `/reset` 兜底。
+16. **沙箱是进程级全局，不按会话隔离**: `/new`、`/switch` 不动 Docker 沙箱，所以不同会话共用同一个 `/work`；只有 `/reset` 会重置沙箱。
+17. **根命名空间 checkpoint 不清理**: 只清理子专家的嵌套命名空间（见 2.11）；`checkpoints.db` 会随对话轮数持续增长，需要时用 `scripts/manage_sessions.py delete` 删除整个会话。
+18. **刚挂起即崩溃会丢授权前已生成的图片**: 挂起态（用户原话与已生成图片）在授权提示发出的同一轮收尾时才落库；若进程恰好在 checkpoint 落盘之后、挂起态写入之前崩溃，授权仍可恢复，但授权前已生成的图片会丢失。
+19. **事件时间戳是写入时间**: 事件日志里的 `ts` 是事件写入日志的时间，不是原始发生时间（镜像发生在每轮收尾，启动恢复时补镜像）。

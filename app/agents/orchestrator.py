@@ -13,7 +13,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from app import config
 from app.infra import models, mcp_service
-from app.tools import amap, knowledge_tools, markitdown_tool
+from app.tools import amap, knowledge_tools, markitdown_tool, session_tools
 from app.agents.prompts import MAIN_AGENT_PROMPT
 from app.agents.skills import build_skills_backend
 from app.agents.experts import (
@@ -109,9 +109,10 @@ async def build_main_agent(
     构建基于 deepagents 的主 Agent 实例（单用户：本地操作类专家始终挂载）。
     - 主模型: models.orchestrator_llm
     - 子专家: 声明式接入 (task 委派)，包含 FileAgent / DesktopAgent / BrowserAgent 等全部 7 个专家
-    - 主管工具: get_current_time（时间类问题由主管就地回答，不再委派）
+    - 主管工具: get_current_time（时间类问题由主管就地回答，不再委派）、
+      get_session_events / search_session_history（只读回溯会话记录，直接挂在主管上，不经 task 委派）
     - 中间件: ToolCallLimitMiddleware 防御 task 工具死循环
-    - 持久化: 默认使用 MemorySaver
+    - 持久化: 由调用方传入 checkpointer（生产为 AsyncSqliteSaver）；不传时回退 MemorySaver
     """
     # 校验高德配置并获取本地工具
     amap.validate_config()
@@ -157,7 +158,7 @@ async def build_main_agent(
 
     agent = create_deep_agent(
         model=models.orchestrator_llm,
-        tools=[knowledge_tools.get_current_time],
+        tools=[knowledge_tools.get_current_time, *session_tools.TOOLS],
         system_prompt=MAIN_AGENT_PROMPT,
         subagents=subagents,
         middleware=middleware,

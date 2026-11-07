@@ -12,6 +12,7 @@ SMOKES = [
     "tests/smoke_amap_contract.py",
     "tests/smoke_amap_http.py",
     "tests/smoke_chat_service.py",
+    "tests/smoke_session.py",
     "tests/smoke_knowledge.py",
     "tests/smoke_memory.py",
     "tests/smoke_orchestrator.py",
