@@ -99,13 +99,13 @@ def test_c_hybrid_search():
 def test_d_memory():
     store.init_memory_collection()
     coll = store.collection_name()
-    store.add_memory("用户家住在济南市文化东路42号", evidence="济南市文化东路42号")
-    store.add_memory("用户家住在济南市文化东路42号", evidence="济南市文化东路42号")          # 相同文本:幂等检查跳过,不重复写入
+    store.add_memory("用户家住在台北市信义区市府路1号", evidence="台北市信义区市府路1号")
+    store.add_memory("用户家住在台北市信义区市府路1号", evidence="台北市信义区市府路1号")          # 相同文本:幂等检查跳过,不重复写入
     assert _count(coll) == 1, "相同文本不重复写入失败"
     store.add_memory("用户对海鲜严重过敏", evidence="海鲜严重过敏")
     assert _count(coll) == 2
-    got = store.search_memory("用户家住在济南市文化东路42号", top_k=3)
-    assert got == ["用户家住在济南市文化东路42号"], f"阈值过滤后应只命中相同文本,实际: {got}"
+    got = store.search_memory("用户家住在台北市信义区市府路1号", top_k=3)
+    assert got == ["用户家住在台北市信义区市府路1号"], f"阈值过滤后应只命中相同文本,实际: {got}"
 
 
 def test_e_idempotent(n_now):

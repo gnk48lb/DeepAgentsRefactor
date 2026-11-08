@@ -525,7 +525,7 @@ async def test_k_event_log():
     )
     orig = cs.injector.build_initial_messages
     cs.injector.build_initial_messages = lambda q, history_messages=None: [
-        HumanMessage(content=f"<long_term_memory>\n我住济南\n</long_term_memory>\n{q}", name="user")
+        HumanMessage(content=f"<long_term_memory>\n我住台北\n</long_term_memory>\n{q}", name="user")
     ]
     try:
         r1 = await cs.process_message("你好")

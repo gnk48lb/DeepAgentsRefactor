@@ -53,10 +53,10 @@ async def test_success_case():
                 "status": "1",
                 "info": "OK",
                 "infocode": "10000",
-                "province": "山东省",
-                "city": "济南市",
-                "adcode": "370100",
-                "rectangle": "116.9,36.5;117.1,36.7",
+                "province": "北京市",
+                "city": "北京市",
+                "adcode": "110100",
+                "rectangle": "116.1,39.5;117.5,40.0",
             },
         )
 
@@ -64,8 +64,8 @@ async def test_success_case():
     tools = {t.name: t for t in amap.get_tools()}
     res_str = await tools["maps_ip_location"].ainvoke({"ip": "1.1.1.1"})
     data = json.loads(res_str)
-    assert data.get("province") == "山东省"
-    assert data.get("city") == "济南市"
+    assert data.get("province") == "北京市"
+    assert data.get("city") == "北京市"
     assert "error" not in data
 
 
@@ -116,7 +116,7 @@ async def test_timeout_error():
 
     setup_mock_client(handler)
     tools = {t.name: t for t in amap.get_tools()}
-    res_str = await tools["maps_weather"].ainvoke({"city": "370100"})
+    res_str = await tools["maps_weather"].ainvoke({"city": "110100"})
     data = json.loads(res_str)
     assert "error" in data
     assert data["error"] == "Request failed: The read operation timed out"
@@ -226,14 +226,14 @@ async def test_ambiguity_guard():
                     "status": "1",
                     "geocodes": [
                         {"province": "北京市", "city": "北京市", "location": "116.1,39.1", "level": "门址"},
-                        {"province": "山东省", "city": "济南市", "location": "117.1,36.1", "level": "门址"},
+                        {"province": "台湾省", "city": "台北市", "location": "121.5,25.0", "level": "门址"},
                     ],
                 })
-            if addr == "歧义地址" and city == "济南市":
+            if addr == "歧义地址" and city == "台北市":
                 return httpx.Response(200, json={
                     "status": "1",
                     "geocodes": [
-                        {"province": "山东省", "city": "济南市", "location": "117.1,36.1", "level": "门址"},
+                        {"province": "台湾省", "city": "台北市", "location": "121.5,25.0", "level": "门址"},
                     ],
                 })
             if addr == "同城多候选":
@@ -255,15 +255,15 @@ async def test_ambiguity_guard():
     res1 = json.loads(await tools["maps_route_walking"].ainvoke({"origin": "歧义地址", "destination": "116.49,39.99"}))
     assert "error" in res1
     assert "有歧义" in res1["error"]
-    assert "北京" in res1["error"] and "济南" in res1["error"]
+    assert "北京" in res1["error"] and "台北" in res1["error"]
     assert not any(r.url.path == "/v3/direction/walking" for r in calls)
 
-    # 2. 传 origin_city="济南市" 放行
+    # 2. 传 origin_city="台北市" 放行
     calls.clear()
-    res2 = json.loads(await tools["maps_route_walking"].ainvoke({"origin": "歧义地址", "destination": "116.49,39.99", "origin_city": "济南市"}))
+    res2 = json.loads(await tools["maps_route_walking"].ainvoke({"origin": "歧义地址", "destination": "116.49,39.99", "origin_city": "台北市"}))
     assert "error" not in res2
     assert any(r.url.path == "/v3/direction/walking" for r in calls)
-    assert calls[0].url.params["city"] == "济南市"
+    assert calls[0].url.params["city"] == "台北市"
 
     # 3. 两个候选同在一个城市放行
     calls.clear()
@@ -405,29 +405,29 @@ async def test_weather_name_resolution():
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
         if request.url.path == "/v3/geocode/geo":
-            return httpx.Response(200, json={"status": "1", "geocodes": [{"province": "山东省", "city": "济南市", "adcode": "370100", "location": "117.0,36.6", "level": "市"}]})
+            return httpx.Response(200, json={"status": "1", "geocodes": [{"province": "北京市", "city": "北京市", "adcode": "110100", "location": "116.4,39.9", "level": "市"}]})
         if request.url.path == "/v3/weather/weatherInfo":
-            return httpx.Response(200, json={"status": "1", "forecasts": [{"city": "济南市", "adcode": "370100", "casts": []}]})
+            return httpx.Response(200, json={"status": "1", "forecasts": [{"city": "北京市", "adcode": "110100", "casts": []}]})
         return httpx.Response(404)
 
     setup_mock_client(handler)
     tools = {t.name: t for t in amap.get_tools()}
 
     # 中文地名 -> 先 geo 获取 adcode，再请求 weatherInfo
-    res1 = json.loads(await tools["maps_weather"].ainvoke({"city": "济南市"}))
+    res1 = json.loads(await tools["maps_weather"].ainvoke({"city": "北京市"}))
     assert len(calls) == 2
     assert calls[0].url.path == "/v3/geocode/geo"
     assert calls[1].url.path == "/v3/weather/weatherInfo"
-    assert calls[1].url.params["city"] == "370100"
-    assert res1.get("city") == "济南市"
+    assert calls[1].url.params["city"] == "110100"
+    assert res1.get("city") == "北京市"
 
     # 6 位 adcode -> 不发 geo，直传 weatherInfo
     calls.clear()
-    res2 = json.loads(await tools["maps_weather"].ainvoke({"city": "370100"}))
+    res2 = json.loads(await tools["maps_weather"].ainvoke({"city": "110100"}))
     assert len(calls) == 1
     assert calls[0].url.path == "/v3/weather/weatherInfo"
-    assert calls[0].url.params["city"] == "370100"
-    assert res2.get("city") == "济南市"
+    assert calls[0].url.params["city"] == "110100"
+    assert res2.get("city") == "北京市"
 
 
 SCENARIOS = [

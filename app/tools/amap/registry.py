@@ -20,7 +20,7 @@ def _check_coords(name: str, kwargs: dict) -> str | None:
         if isinstance(val, str) and not impl.is_coordinates(val):
             return (
                 f"工具 '{name}' 调用失败：参数 '{field}' 格式错误。"
-                f"该字段必须是 '经度,纬度' 格式的数字字符串（如 '117.05,36.65'）。"
+                f"该字段必须是 '经度,纬度' 格式的数字字符串（如 '116.40,39.90'）。"
                 f"你直接传入了地址文本 '{val}'。"
                 f"请先调用 'maps_geo' 解析该地址获取坐标后再试。"
             )

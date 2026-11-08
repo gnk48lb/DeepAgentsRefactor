@@ -61,8 +61,8 @@ def test_a_sessions_basics():
         assert [e.type for e in first] == ["session_created"], first
         assert s.get_active_session_id() == sid               # 幂等
 
-        s.emit_event(sid, "user_message", {"text": "帮我查一下济南\n今天的天气", "processed_text": "x", "has_image": False})
-        assert s.get_session(sid).title == "帮我查一下济南 今天的天气"[: config.SESSION_TITLE_MAX_CHARS]
+        s.emit_event(sid, "user_message", {"text": "帮我查一下北京\n今天的天气", "processed_text": "x", "has_image": False})
+        assert s.get_session(sid).title == "帮我查一下北京 今天的天气"[: config.SESSION_TITLE_MAX_CHARS]
         s.emit_event(sid, "user_message", {"text": "第二句不应改标题"})
         assert "第二句" not in s.get_session(sid).title
 
@@ -251,19 +251,19 @@ def test_i_delete_session():
 
 
 def _mk_msgs(big=False):
-    task_call = {"name": "task", "args": {"subagent_type": "MapAgent", "description": "查济南天气"}, "id": "c_task"}
+    task_call = {"name": "task", "args": {"subagent_type": "MapAgent", "description": "查北京天气"}, "id": "c_task"}
     tool_call = {"name": "get_current_time", "args": {}, "id": "c_time"}
     todo_call = {"name": "write_todos", "args": {"todos": []}, "id": "c_todo"}
     sess_call = {"name": "search_session_history", "args": {"query": "x"}, "id": "c_sess"}
     long_text = "很长" * 15000 if big else "晴 25度"
     return [
-        HumanMessage(content="<long_term_memory>\n我住济南\n</long_term_memory>\n查天气", id="h1"),
+        HumanMessage(content="<long_term_memory>\n我住台北\n</long_term_memory>\n查天气", id="h1"),
         AIMessage(content="", tool_calls=[task_call, tool_call, todo_call, sess_call], id="ai1"),
         ToolMessage(content=long_text + " data:image/png;base64,AAAA", tool_call_id="c_task", name="task", id="t1"),
         ToolMessage(content="2026-11-07", tool_call_id="c_time", name="get_current_time", id="t2"),
         ToolMessage(content="ok", tool_call_id="c_todo", name="write_todos", id="t3"),
         ToolMessage(content="回溯结果", tool_call_id="c_sess", name="search_session_history", id="t4"),
-        AIMessage(content="济南今天晴", id="ai2"),
+        AIMessage(content="北京今天晴", id="ai2"),
     ]
 
 
@@ -280,11 +280,11 @@ def test_j_mirror_messages():
         tc = evs[0].payload["calls"]
         assert [c["name"] for c in tc] == ["get_current_time"], tc                       # task/write_todos/会话工具被跳过
         er = evs[1].payload
-        assert er["expert"] == "MapAgent" and er["task"] == "查济南天气" and "晴 25度" in er["text"], er
+        assert er["expert"] == "MapAgent" and er["task"] == "查北京天气" and "晴 25度" in er["text"], er
         assert "[图片已省略]" in er["text"] and "base64" not in er["text"]                # data URI 被清洗
         assert evs[2].payload["name"] == "get_current_time" and evs[2].payload["text"] == "2026-11-07"
         blob = json.dumps([e.payload for e in evs], ensure_ascii=False)
-        assert "long_term_memory" not in blob and "济南今天晴" not in blob and "回溯结果" not in blob
+        assert "long_term_memory" not in blob and "北京今天晴" not in blob and "回溯结果" not in blob
         # 整体重放幂等（含摘要压缩后只剩尾部消息的情况）
         assert session_log.mirror_messages(s, sid, msgs) == 0
         assert session_log.mirror_messages(s, sid, msgs[2:]) == 0
@@ -310,7 +310,7 @@ def test_k_session_tools():
         a = s.create_session("天气会话").id
         b = s.create_session("菜谱会话").id                                             # 活动会话 = b
         for i in range(25):
-            s.emit_event(a, "user_message", {"text": f"A消息{i} 济南天气"})
+            s.emit_event(a, "user_message", {"text": f"A消息{i} 北京天气"})
         s.emit_event(b, "user_message", {"text": "B消息 红烧肉怎么做"})
         s.emit_event(b, "expert_report", {"expert": "KnowledgeAgent", "task": "红烧肉", "text": "步骤" * 2000})
 
@@ -361,7 +361,7 @@ def test_k2_search_tool():
         s = env.store
         a = s.create_session("天气会话").id
         b = s.create_session("菜谱会话").id
-        s.emit_event(a, "expert_report", {"expert": "MapAgent", "task": "天气", "text": "济南今天晴，气温 25 度，适合出门"})
+        s.emit_event(a, "expert_report", {"expert": "MapAgent", "task": "天气", "text": "北京今天晴，气温 25 度，适合出门"})
         s.emit_event(b, "user_message", {"text": "红烧肉怎么做"})
         f = session_tools.search_session_history
         out = f.invoke({"query": "气温"})
@@ -373,7 +373,7 @@ def test_k2_search_tool():
         assert "没有找到" in f.invoke({"query": "火星基地"}) and "换个关键词" in f.invoke({"query": "火星基地"})
         ov = f.invoke({"query": ""})                                                     # 空 query → 概览
         assert "天气会话" in ov and "菜谱会话" in ov and "轮" in ov, ov
-        out = f.invoke({"query": "济南 晴", "limit": 99})
+        out = f.invoke({"query": "北京 晴", "limit": 99})
         assert a[:8] in out
         assert "找不到会话" in f.invoke({"query": "x", "session_id": "nope"})
 

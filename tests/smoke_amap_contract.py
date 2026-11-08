@@ -84,12 +84,12 @@ async def test_coord_validation():
     tools_map = {t.name: t for t in amap.get_tools()}
     expected_msg = (
         "工具 'maps_regeocode' 调用失败：参数 'location' 格式错误。"
-        "该字段必须是 '经度,纬度' 格式的数字字符串（如 '117.05,36.65'）。"
-        "你直接传入了地址文本 '文化东路42号'。"
+        "该字段必须是 '经度,纬度' 格式的数字字符串（如 '116.40,39.90'）。"
+        "你直接传入了地址文本 '市府路1号'。"
         "请先调用 'maps_geo' 解析该地址获取坐标后再试。"
     )
-    assert await tools_map["maps_regeocode"].ainvoke({"location": "文化东路42号"}) == expected_msg
-    probe = {"location": "文化东路42号", "origin": "文化东路42号", "destination": "望京SOHO", "origins": "文化东路42号"}
+    assert await tools_map["maps_regeocode"].ainvoke({"location": "市府路1号"}) == expected_msg
+    probe = {"location": "市府路1号", "origin": "市府路1号", "destination": "望京SOHO", "origins": "市府路1号"}
     for name in tools_map:   # 直接测纯函数，不走 ainvoke，避免本机有 key 时打真实请求
         assert (registry._check_coords(name, probe) is not None) == (name == "maps_regeocode"), name
     assert registry._check_coords("maps_regeocode", {"location": " 116.48, 39.99 "}) is None
@@ -102,7 +102,7 @@ async def test_coordinate_normalization():
     assert impl.normalize_coordinates("116.48，39.99") == "116.48,39.99"
     assert impl.normalize_coordinates("-0.5,39.99") == "-0.5,39.99"
     assert impl.normalize_coordinates("116.48148812,39.99046499") == "116.481488,39.990465"
-    for invalid in ["文化东路42号", "", "116.48", "116.48,39.99,10", "望京SOHO", None, 5]:
+    for invalid in ["市府路1号", "", "116.48", "116.48,39.99,10", "望京SOHO", None, 5]:
         assert impl.normalize_coordinates(invalid) is None, f"{invalid} 应返回 None"
 
 

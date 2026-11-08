@@ -59,7 +59,7 @@
       "properties": {
         "city": {
           "type": "string",
-          "description": "城市名称（如 '济南市'）或 6 位 adcode（如 '370100'）；要查区县请写全（如 '北京市朝阳区'）或直接用 adcode"
+          "description": "城市名称（如 '北京市'）或 6 位 adcode（如 '110100'）；要查区县请写全（如 '北京市朝阳区'）或直接用 adcode"
         }
       },
       "required": [
@@ -83,7 +83,7 @@
         },
         "origin_city": {
           "type": "string",
-          "description": "起点是文字地址、又可能重名时，填写起点所在城市（如 '济南市'）"
+          "description": "起点是文字地址、又可能重名时，填写起点所在城市（如 '北京市'）"
         },
         "destination_city": {
           "type": "string",
@@ -112,7 +112,7 @@
         },
         "origin_city": {
           "type": "string",
-          "description": "起点是文字地址、又可能重名时，填写起点所在城市（如 '济南市'）"
+          "description": "起点是文字地址、又可能重名时，填写起点所在城市（如 '北京市'）"
         },
         "destination_city": {
           "type": "string",
@@ -141,7 +141,7 @@
         },
         "origin_city": {
           "type": "string",
-          "description": "起点是文字地址、又可能重名时，填写起点所在城市（如 '济南市'）"
+          "description": "起点是文字地址、又可能重名时，填写起点所在城市（如 '北京市'）"
         },
         "destination_city": {
           "type": "string",
@@ -220,7 +220,7 @@
   },
   {
     "name": "maps_text_search",
-    "description": "关键词 POI 搜索：按名称或类别找地点（如 '济南西站'、'西单 肯德基'），最多返回 20 条，每条含 id、name、address、location（'经度,纬度'）、type（可读的分类）。结果不含距离：要找'某处附近有哪些/最近的'请用 maps_around_search；需要距离可把 location 交给 maps_distance 或路线工具。",
+    "description": "关键词 POI 搜索：按名称或类别找地点（如 '北京西站'、'西单 肯德基'），最多返回 20 条，每条含 id、name、address、location（'经度,纬度'）、type（可读的分类）。结果不含距离：要找'某处附近有哪些/最近的'请用 maps_around_search；需要距离可把 location 交给 maps_distance 或路线工具。",
     "inputSchema": {
       "type": "object",
       "properties": {
