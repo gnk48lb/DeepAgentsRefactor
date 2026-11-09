@@ -37,7 +37,7 @@ def _make_coroutine(tool_name: str, fn: Callable):
             return coord_err
         try:
             res = await fn(**tool_input)
-            return json.dumps(res, ensure_ascii=False, indent=2)
+            return json.dumps(res, ensure_ascii=False, separators=(",", ":"))
         except asyncio.CancelledError:
             raise
         except Exception as e:

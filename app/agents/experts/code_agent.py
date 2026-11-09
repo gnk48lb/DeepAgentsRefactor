@@ -14,6 +14,7 @@ from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.skills import SkillsMiddleware
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
+from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from langchain_core.messages import ToolMessage
 
 from app import config
@@ -140,6 +141,9 @@ def build_code_agent_runnable(
                 max_execute_timeout=config.SANDBOX_MAX_TIMEOUT_SECONDS,
             ),
             *build_budget_middleware(max_tool_calls),
+            # 与 deepagents 的尾部约定一致：缓存断点中间件放最内层，看到的是其他中间件处理完的最终请求；
+            # 非 Anthropic 模型（如回退 Gemini）时静默 no-op。
+            AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
         ],
         checkpointer=checkpointer,
     )

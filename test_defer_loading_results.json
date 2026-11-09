@@ -1,0 +1,587 @@
+{
+  "target": {
+    "base_url": "http://127.0.0.1:3425",
+    "model": "minimax-code-global/MiniMax-M3.1-Flash"
+  },
+  "records": [
+    {
+      "case": "baseline",
+      "request": {
+        "url": "http://127.0.0.1:3425/v1/messages",
+        "headers": {
+          "x-api-key": "***",
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json"
+        },
+        "body": {
+          "model": "minimax-code-global/MiniMax-M3.1-Flash",
+          "max_tokens": 4096,
+          "messages": [
+            {
+              "role": "user",
+              "content": "请查询当前时间。必须使用工具回答，不要凭记忆回答。"
+            }
+          ],
+          "tools": [
+            {
+              "name": "get_current_time",
+              "description": "获取当前的日期和时间。询问当前时间时使用。",
+              "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+              }
+            }
+          ]
+        }
+      },
+      "response": {
+        "http_status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "content": [
+            {
+              "text": "I'll check the current time for you.",
+              "type": "text"
+            },
+            {
+              "id": "call_01a1bde5a45e72d4aec3560d",
+              "input": {},
+              "name": "get_current_time",
+              "type": "tool_use"
+            }
+          ],
+          "id": "msg_074053291d96c916f7a494e356b3b48c",
+          "model": "MiniMax-M3.1-Flash",
+          "role": "assistant",
+          "stop_reason": "tool_use",
+          "stop_sequence": null,
+          "type": "message",
+          "usage": {
+            "input_tokens": 309,
+            "output_tokens": 28,
+            "cache_read_input_tokens": 128,
+            "cache_creation_input_tokens": 0
+          }
+        },
+        "elapsed_seconds": 0.81
+      },
+      "signals": {
+        "http_status": 200,
+        "error_message": null,
+        "stop_reason": "tool_use",
+        "content_block_types": [
+          "text",
+          "tool_use"
+        ],
+        "tool_use_names": [
+          "get_current_time"
+        ],
+        "deferred_tool_called": false,
+        "has_tool_search_result": false,
+        "has_tool_reference": false,
+        "usage": {
+          "input_tokens": 309,
+          "output_tokens": 28,
+          "cache_read_input_tokens": 128,
+          "cache_creation_input_tokens": 0
+        },
+        "text_preview": "I'll check the current time for you."
+      }
+    },
+    {
+      "case": "defer_field",
+      "request": {
+        "url": "http://127.0.0.1:3425/v1/messages",
+        "headers": {
+          "x-api-key": "***",
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json"
+        },
+        "body": {
+          "model": "minimax-code-global/MiniMax-M3.1-Flash",
+          "max_tokens": 4096,
+          "messages": [
+            {
+              "role": "user",
+              "content": "请查询当前时间。必须使用工具回答，不要凭记忆回答。"
+            }
+          ],
+          "tools": [
+            {
+              "name": "get_current_time",
+              "description": "获取当前的日期和时间。询问当前时间时使用。",
+              "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+              }
+            },
+            {
+              "name": "get_weather",
+              "description": "查询指定城市的实时天气。询问天气时使用。",
+              "input_schema": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": "城市名，如 北京"
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              },
+              "defer_loading": true
+            },
+            {
+              "name": "search_files",
+              "description": "在工作区文件中搜索内容。查找文件时使用。",
+              "input_schema": {
+                "type": "object",
+                "properties": {
+                  "query": {
+                    "type": "string",
+                    "description": "搜索关键词"
+                  }
+                },
+                "required": [
+                  "query"
+                ]
+              },
+              "defer_loading": true
+            }
+          ]
+        }
+      },
+      "response": {
+        "http_status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "content": [
+            {
+              "id": "call_01a1bde5a9ce77b5842ea7f1",
+              "input": {},
+              "name": "get_current_time",
+              "type": "tool_use"
+            }
+          ],
+          "id": "msg_0740532aa48e88b74ea8def56246e129",
+          "model": "MiniMax-M3.1-Flash",
+          "role": "assistant",
+          "stop_reason": "tool_use",
+          "stop_sequence": null,
+          "type": "message",
+          "usage": {
+            "input_tokens": 299,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 269,
+            "cache_creation_input_tokens": 0
+          }
+        },
+        "elapsed_seconds": 1.37
+      },
+      "signals": {
+        "http_status": 200,
+        "error_message": null,
+        "stop_reason": "tool_use",
+        "content_block_types": [
+          "tool_use"
+        ],
+        "tool_use_names": [
+          "get_current_time"
+        ],
+        "deferred_tool_called": false,
+        "has_tool_search_result": false,
+        "has_tool_reference": false,
+        "usage": {
+          "input_tokens": 299,
+          "output_tokens": 20,
+          "cache_read_input_tokens": 269,
+          "cache_creation_input_tokens": 0
+        },
+        "text_preview": null
+      }
+    },
+    {
+      "case": "defer_field_with_beta",
+      "request": {
+        "url": "http://127.0.0.1:3425/v1/messages",
+        "headers": {
+          "x-api-key": "***",
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+          "anthropic-beta": "advanced-tool-use-2025-11-20"
+        },
+        "body": {
+          "model": "minimax-code-global/MiniMax-M3.1-Flash",
+          "max_tokens": 4096,
+          "messages": [
+            {
+              "role": "user",
+              "content": "请查询当前时间。必须使用工具回答，不要凭记忆回答。"
+            }
+          ],
+          "tools": [
+            {
+              "name": "get_current_time",
+              "description": "获取当前的日期和时间。询问当前时间时使用。",
+              "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+              }
+            },
+            {
+              "name": "get_weather",
+              "description": "查询指定城市的实时天气。询问天气时使用。",
+              "input_schema": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": "城市名，如 北京"
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              },
+              "defer_loading": true
+            },
+            {
+              "name": "search_files",
+              "description": "在工作区文件中搜索内容。查找文件时使用。",
+              "input_schema": {
+                "type": "object",
+                "properties": {
+                  "query": {
+                    "type": "string",
+                    "description": "搜索关键词"
+                  }
+                },
+                "required": [
+                  "query"
+                ]
+              },
+              "defer_loading": true
+            }
+          ]
+        }
+      },
+      "response": {
+        "http_status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "content": [
+            {
+              "id": "call_01a1bde5acc570528698e116",
+              "input": {},
+              "name": "get_current_time",
+              "type": "tool_use"
+            }
+          ],
+          "id": "msg_0740532b35c65168bbc42f5104fbbfe7",
+          "model": "MiniMax-M3.1-Flash",
+          "role": "assistant",
+          "stop_reason": "tool_use",
+          "stop_sequence": null,
+          "type": "message",
+          "usage": {
+            "input_tokens": 1,
+            "output_tokens": 19,
+            "cache_read_input_tokens": 567,
+            "cache_creation_input_tokens": 0
+          }
+        },
+        "elapsed_seconds": 0.85
+      },
+      "signals": {
+        "http_status": 200,
+        "error_message": null,
+        "stop_reason": "tool_use",
+        "content_block_types": [
+          "tool_use"
+        ],
+        "tool_use_names": [
+          "get_current_time"
+        ],
+        "deferred_tool_called": false,
+        "has_tool_search_result": false,
+        "has_tool_reference": false,
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 19,
+          "cache_read_input_tokens": 567,
+          "cache_creation_input_tokens": 0
+        },
+        "text_preview": null
+      }
+    },
+    {
+      "case": "defer_visibility",
+      "request": {
+        "url": "http://127.0.0.1:3425/v1/messages",
+        "headers": {
+          "x-api-key": "***",
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json"
+        },
+        "body": {
+          "model": "minimax-code-global/MiniMax-M3.1-Flash",
+          "max_tokens": 4096,
+          "messages": [
+            {
+              "role": "user",
+              "content": "北京今天的天气怎么样？必须使用工具查询，不要凭记忆回答。"
+            }
+          ],
+          "tools": [
+            {
+              "name": "get_current_time",
+              "description": "获取当前的日期和时间。询问当前时间时使用。",
+              "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+              }
+            },
+            {
+              "name": "get_weather",
+              "description": "查询指定城市的实时天气。询问天气时使用。",
+              "input_schema": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": "城市名，如 北京"
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              },
+              "defer_loading": true
+            },
+            {
+              "name": "search_files",
+              "description": "在工作区文件中搜索内容。查找文件时使用。",
+              "input_schema": {
+                "type": "object",
+                "properties": {
+                  "query": {
+                    "type": "string",
+                    "description": "搜索关键词"
+                  }
+                },
+                "required": [
+                  "query"
+                ]
+              },
+              "defer_loading": true
+            }
+          ]
+        }
+      },
+      "response": {
+        "http_status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "content": [
+            {
+              "text": "I'll check the weather in Beijing for you.",
+              "type": "text"
+            },
+            {
+              "id": "call_01a1bde5b295740cb698388c",
+              "input": {
+                "location": "北京"
+              },
+              "name": "get_weather",
+              "type": "tool_use"
+            }
+          ],
+          "id": "msg_0740532c3901519027fc4ebd8838c28c",
+          "model": "MiniMax-M3.1-Flash",
+          "role": "assistant",
+          "stop_reason": "tool_use",
+          "stop_sequence": null,
+          "type": "message",
+          "usage": {
+            "input_tokens": 380,
+            "output_tokens": 38,
+            "cache_read_input_tokens": 188,
+            "cache_creation_input_tokens": 0
+          }
+        },
+        "elapsed_seconds": 1.48
+      },
+      "signals": {
+        "http_status": 200,
+        "error_message": null,
+        "stop_reason": "tool_use",
+        "content_block_types": [
+          "text",
+          "tool_use"
+        ],
+        "tool_use_names": [
+          "get_weather"
+        ],
+        "deferred_tool_called": true,
+        "has_tool_search_result": false,
+        "has_tool_reference": false,
+        "usage": {
+          "input_tokens": 380,
+          "output_tokens": 38,
+          "cache_read_input_tokens": 188,
+          "cache_creation_input_tokens": 0
+        },
+        "text_preview": "I'll check the weather in Beijing for you."
+      }
+    },
+    {
+      "case": "tool_search_full",
+      "request": {
+        "url": "http://127.0.0.1:3425/v1/messages",
+        "headers": {
+          "x-api-key": "***",
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json"
+        },
+        "body": {
+          "model": "minimax-code-global/MiniMax-M3.1-Flash",
+          "max_tokens": 4096,
+          "messages": [
+            {
+              "role": "user",
+              "content": "北京今天的天气怎么样？必须使用工具查询，不要凭记忆回答。"
+            }
+          ],
+          "tools": [
+            {
+              "type": "tool_search_tool_regex_20251119",
+              "name": "tool_search_tool_regex"
+            },
+            {
+              "name": "get_current_time",
+              "description": "获取当前的日期和时间。询问当前时间时使用。",
+              "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+              }
+            },
+            {
+              "name": "get_weather",
+              "description": "查询指定城市的实时天气。询问天气时使用。",
+              "input_schema": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": "城市名，如 北京"
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              },
+              "defer_loading": true
+            },
+            {
+              "name": "search_files",
+              "description": "在工作区文件中搜索内容。查找文件时使用。",
+              "input_schema": {
+                "type": "object",
+                "properties": {
+                  "query": {
+                    "type": "string",
+                    "description": "搜索关键词"
+                  }
+                },
+                "required": [
+                  "query"
+                ]
+              },
+              "defer_loading": true
+            }
+          ]
+        }
+      },
+      "response": {
+        "http_status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "content": [
+            {
+              "text": "I'll check the weather in Beijing for you.",
+              "type": "text"
+            },
+            {
+              "id": "call_01a1bde5b7b4753197040ee7",
+              "input": {
+                "location": "北京"
+              },
+              "name": "get_weather",
+              "type": "tool_use"
+            },
+            {
+              "id": "call_01a1bde5b7d376e091f9d703",
+              "input": {},
+              "name": "get_current_time",
+              "type": "tool_use"
+            }
+          ],
+          "id": "msg_0740532e682e27c0b5aa1e425860ad89",
+          "model": "MiniMax-M3.1-Flash",
+          "role": "assistant",
+          "stop_reason": "tool_use",
+          "stop_sequence": null,
+          "type": "message",
+          "usage": {
+            "input_tokens": 1,
+            "output_tokens": 51,
+            "cache_read_input_tokens": 567,
+            "cache_creation_input_tokens": 0
+          }
+        },
+        "elapsed_seconds": 1.52
+      },
+      "signals": {
+        "http_status": 200,
+        "error_message": null,
+        "stop_reason": "tool_use",
+        "content_block_types": [
+          "text",
+          "tool_use",
+          "tool_use"
+        ],
+        "tool_use_names": [
+          "get_weather",
+          "get_current_time"
+        ],
+        "deferred_tool_called": true,
+        "has_tool_search_result": false,
+        "has_tool_reference": false,
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 51,
+          "cache_read_input_tokens": 567,
+          "cache_creation_input_tokens": 0
+        },
+        "text_preview": "I'll check the weather in Beijing for you."
+      }
+    }
+  ],
+  "summary": "\n========== 结论 ==========\n(b) 字段被静默剥离/忽略：deferred 工具对模型直接可见并被调用（无搜索过程）。"
+}

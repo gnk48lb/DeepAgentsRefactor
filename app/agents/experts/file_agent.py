@@ -18,6 +18,7 @@ from deepagents import FilesystemMiddleware
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
 from app import config
@@ -222,6 +223,9 @@ def build_file_agent_runnable(llm, system_prompt: str, workspace_dir: str, check
             # 所以限步中间件放在 HITL 之后 → 先拦截超预算调用，再轮到 HITL（并通过 when 跳过已被拦截的调用）。
             HumanInTheLoopMiddleware(interrupt_on=FILE_AGENT_INTERRUPT_ON),
             *build_budget_middleware(max_tool_calls),
+            # 追加在最末（最内层，与 deepagents 尾部约定一致），不影响上方 HITL/限步的相对顺序；
+            # 非 Anthropic 模型（如回退 Gemini）时静默 no-op。
+            AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
         ],
         checkpointer=checkpointer,
     )
