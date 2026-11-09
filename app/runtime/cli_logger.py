@@ -7,6 +7,7 @@ tool executions, subagent delegations, thinking processes, and HITL interrupts.
 """
 
 import sys
+import threading
 import time
 import json
 import re
@@ -73,6 +74,86 @@ def get_max_chars() -> int:
         return int(getattr(config, "CLI_DEBUG_MAX_CHARS", "600"))
     except Exception:
         return 600
+
+
+def is_metrics_enabled() -> bool:
+    """检查是否把 LLM / 回合指标落盘到 storage/llm_metrics.jsonl（环境变量 CLI_METRICS，默认开启）
+
+    故意与 CLI_DEBUG 分开：终端彩色输出关掉后，真实数据仍要继续积累。
+    """
+    val = str(getattr(config, "CLI_METRICS", "1")).strip().lower()
+    return val not in ("0", "false", "no", "off")
+
+
+# 并行的 task 委派会在不同线程里同时回调，追加写需要一把锁
+# （Windows 上多个句柄并发 open-append 可能直接抛错，丢一行也比串成坏 JSON 好）
+_metrics_lock = threading.Lock()
+
+
+def _append_metric(record: Dict[str, Any]) -> None:
+    """追加一行 JSON 指标到 config.LLM_METRICS_PATH；任何异常静默吞掉，绝不影响主流程"""
+    if not is_metrics_enabled():
+        return
+    try:
+        path = str(getattr(config, "LLM_METRICS_PATH", "") or "")
+        if not path:
+            return
+        line = json.dumps(record, ensure_ascii=False, default=str)
+        with _metrics_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _ns_and_thread(metadata: Optional[Dict[str, Any]]) -> tuple:
+    """从回调 metadata 取 langgraph 命名空间与线程 id
+
+    on_llm_end 的 kwargs 里没有 metadata（只有 run_id / parent_run_id / tags），
+    所以这两个值必须在 *_start 阶段就存进 self._llm_runs。
+    命名空间用来区分主管与子专家（实测）：主管是单层 'model:<task_id>'，
+    子专家是父命名空间用 '|' 拼接的 'tools:<task_id>|model:<task_id>'，即含 '|' 即嵌套。
+    """
+    md = metadata if isinstance(metadata, dict) else {}
+    return str(md.get("langgraph_checkpoint_ns", "") or ""), str(md.get("thread_id", "") or "")
+
+
+def _usage_numbers(usage: Any) -> Dict[str, int]:
+    """从 usage_metadata 取四个数值（含缓存读写），拿不到一律记 0"""
+
+    def _pick(obj: Any, key: str) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    out = {"input_tokens": 0, "output_tokens": 0, "cache_read": 0, "cache_creation": 0}
+    try:
+        if not usage:
+            return out
+        details = _pick(usage, "input_token_details") or {}
+        out["input_tokens"] = int(_pick(usage, "input_tokens") or 0)
+        out["output_tokens"] = int(_pick(usage, "output_tokens") or 0)
+        out["cache_read"] = int(_pick(details, "cache_read") or 0)
+        out["cache_creation"] = int(_pick(details, "cache_creation") or 0)
+    except Exception:
+        pass
+    return out
+
+
+def _model_name_of(serialized: Any, kwargs: Optional[Dict[str, Any]] = None) -> str:
+    """从 serialized / invocation_params 里取模型名（取不到返回 unknown-model）"""
+    model_name = "unknown-model"
+    if isinstance(serialized, dict):
+        model_name = (
+            serialized.get("kwargs", {}).get("model")
+            or serialized.get("name")
+            or (serialized.get("id", [])[-1] if serialized.get("id") else None)
+        )
+    if (not model_name or model_name == "unknown-model") and isinstance(kwargs, dict):
+        inv = kwargs.get("invocation_params", {})
+        if isinstance(inv, dict) and inv.get("model"):
+            model_name = inv.get("model")
+    return model_name or "unknown-model"
 
 
 def _desensitize_str(s: str) -> str:
@@ -300,29 +381,21 @@ class CLIDebugCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> Any:
         try:
-            if not is_debug_enabled():
-                return
             agent_name = _identify_agent(messages, metadata, serialized)
+            model_name = _model_name_of(serialized, kwargs)
+            ns, thread = _ns_and_thread(metadata)
 
-            # 获取模型名称
-            model_name = "unknown-model"
-            if isinstance(serialized, dict):
-                model_name = (
-                    serialized.get("kwargs", {}).get("model")
-                    or serialized.get("name")
-                    or (serialized.get("id", [])[-1] if serialized.get("id") else None)
-                )
-            if not model_name or model_name == "unknown-model":
-                inv_params = kwargs.get("invocation_params", {})
-                if isinstance(inv_params, dict) and inv_params.get("model"):
-                    model_name = inv_params.get("model")
-
+            # 与 CLI_DEBUG 解耦：即使不打彩色日志，也要记下 begin 信息供 on_llm_end 计算耗时与落盘
             self._llm_runs[run_id] = {
                 "agent": agent_name,
                 "model": model_name,
+                "ns": ns,
+                "thread": thread,
                 "start": time.perf_counter(),
             }
 
+            if not is_debug_enabled():
+                return
             msg_count = sum(len(sub) if isinstance(sub, list) else 1 for sub in messages) if messages else 0
             print(
                 f"{FG_MAGENTA}🤖 [LLM 调用开始] {BOLD}{agent_name}{RESET}"
@@ -344,8 +417,6 @@ class CLIDebugCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> Any:
         try:
-            if not is_debug_enabled():
-                return
             prompt_corpus = "\n".join(prompts) if prompts else ""
             if "个人隐私与偏好提取官" in prompt_corpus:
                 agent_name = "MemoryExtractor"
@@ -354,20 +425,19 @@ class CLIDebugCallbackHandler(BaseCallbackHandler):
             else:
                 agent_name = _identify_agent(None, metadata, serialized)
 
-            model_name = "unknown-model"
-            if isinstance(serialized, dict):
-                model_name = (
-                    serialized.get("kwargs", {}).get("model")
-                    or serialized.get("name")
-                    or (serialized.get("id", [])[-1] if serialized.get("id") else None)
-                )
+            model_name = _model_name_of(serialized, kwargs)
+            ns, thread = _ns_and_thread(metadata)
 
             self._llm_runs[run_id] = {
                 "agent": agent_name,
                 "model": model_name,
+                "ns": ns,
+                "thread": thread,
                 "start": time.perf_counter(),
             }
 
+            if not is_debug_enabled():
+                return
             print(
                 f"{FG_MAGENTA}🤖 [LLM 调用开始] {BOLD}{agent_name}{RESET}"
                 f"{FG_MAGENTA} (model={model_name}, Prompt 数={len(prompts)}){RESET}",
@@ -386,27 +456,52 @@ class CLIDebugCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> Any:
         try:
-            if not is_debug_enabled():
-                return
             info = self._llm_runs.pop(run_id, {})
             agent_name = info.get("agent", "Agent")
             start = info.get("start", time.perf_counter())
             elapsed = time.perf_counter() - start
 
             # 获取 Generation 与 AIMessage
+            # generations 有两种形状：LLMResult 是 List[List[Generation]]（嵌套），
+            # ChatResult 是 List[Generation]（扁平）。两种都要能取到 message。
             gen = None
             message = None
             if response and hasattr(response, "generations") and response.generations:
                 for sublist in response.generations:
-                    if sublist:
+                    if isinstance(sublist, (list, tuple)):
+                        if not sublist:
+                            continue
                         gen = sublist[0]
-                        message = getattr(gen, "message", None)
-                        break
+                    else:
+                        gen = sublist
+                    message = getattr(gen, "message", None)
+                    break
 
             # 1. 提取 Token 统计与缓存命中
             usage = getattr(message, "usage_metadata", None)
             if not usage and hasattr(response, "llm_output") and isinstance(response.llm_output, dict):
                 usage = response.llm_output.get("token_usage") or response.llm_output.get("usage_metadata")
+
+            # 1b. 落盘结构化指标（独立于 CLI_DEBUG，异常在 _append_metric 内吞掉）
+            numbers = _usage_numbers(usage)
+            tool_calls = getattr(message, "tool_calls", None) or []
+            _append_metric({
+                "type": "llm",
+                "ts": time.time(),
+                "dur": round(elapsed, 3),
+                "agent": agent_name,
+                "model": info.get("model", "unknown-model"),
+                "ns": info.get("ns", ""),
+                "thread": info.get("thread", ""),
+                "run_id": str(run_id),
+                "parent_run_id": str(parent_run_id) if parent_run_id else "",
+                "has_tool_calls": bool(tool_calls),
+                "tool_names": [str(tc.get("name", "")) for tc in tool_calls if isinstance(tc, dict)],
+                **numbers,
+            })
+
+            if not is_debug_enabled():
+                return
 
             tok_str = ""
             if usage and isinstance(usage, dict):
@@ -511,9 +606,10 @@ class CLIDebugCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> Any:
         try:
+            # 先无条件 pop，避免 CLI_DEBUG=0 时 _llm_runs 残留 run_id
+            info = self._llm_runs.pop(run_id, {})
             if not is_debug_enabled():
                 return
-            info = self._llm_runs.pop(run_id, {})
             agent_name = info.get("agent", "Agent")
             start = info.get("start", time.perf_counter())
             elapsed = time.perf_counter() - start
@@ -695,6 +791,14 @@ def log_hitl_status(event_type: str, detail: str = "") -> None:
 def log_turn_end(reply_text: str, image_count: int, awaiting_approval: bool, elapsed: float) -> None:
     """打印本轮处理完毕的总耗时、发件箱图片数与最终回复预览横幅"""
     try:
+        _append_metric({
+            "type": "turn",
+            "ts": time.time(),
+            "dur": round(float(elapsed), 3),
+            "image_count": int(image_count or 0),
+            "awaiting_approval": bool(awaiting_approval),
+            "reply_chars": len(reply_text or ""),
+        })
         if not is_debug_enabled():
             return
         status_str = "等待人工授权" if awaiting_approval else "正常结束"

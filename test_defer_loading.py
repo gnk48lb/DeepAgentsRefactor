@@ -2,7 +2,7 @@
 
 探测链路（默认值与 app/config.py 一致，但本脚本独立运行，不 import / 不修改 app 任何代码）：
     httpx -> Magpie 网关 (http://127.0.0.1:3425/v1/messages)
-          -> minimax-code-global/MiniMax-M3.1-Flash（native_endpoints=["/v1/messages"]）
+          -> minimax-code/MiniMax-M3.1-Flash（native_endpoints=["/v1/messages"]）
 
 探测字段依据 Anthropic 官方 Tool Search Tool 文档（2026-11 核对，已 GA，无需 beta header）：
     - 普通工具定义上挂 "defer_loading": true
@@ -29,7 +29,7 @@ import httpx
 # ---- 配置：与 app/config.py 相同的默认值，可被环境变量 / 命令行覆盖 ----
 DEFAULT_BASE_URL = os.getenv("MAGPIE_BASE_URL", "http://127.0.0.1:3425")
 DEFAULT_API_KEY = os.getenv("MAGPIE_API_KEY", "local")
-DEFAULT_MODEL = os.getenv("MAGPIE_MODEL", "minimax-code-global/MiniMax-M3.1-Flash")
+DEFAULT_MODEL = os.getenv("MAGPIE_MODEL", "minimax-code/MiniMax-M3.1-Flash")
 
 LEGACY_BETA = "advanced-tool-use-2025-11-20"  # 发布时的 beta header，仅作对照
 

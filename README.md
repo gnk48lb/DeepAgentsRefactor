@@ -323,7 +323,7 @@ uv sync
 | `VLM` | 固定 Gemini | 聊天图片到文本的低延迟意图翻译 |
 | `EXTRACTOR_LLM` | 固定 Gemini | 后台记忆结构化提取 |
 
-公共网关配置：`MAGPIE_BASE_URL`、`MAGPIE_API_KEY`、`MAGPIE_MODEL`、`MAGPIE_MAX_TOKENS`、`MAGPIE_TIMEOUT_SECONDS`、`MAGPIE_MAX_RETRIES`。默认模型为 `minimax-code-global/MiniMax-M3.1-Flash`，每个迁移角色可用 `<ROLE>_MODEL` 单独覆盖，模型 ID 直接取 Magpie `/v1/models` 返回的值，不加 `anthropic:` 前缀。
+公共网关配置：`MAGPIE_BASE_URL`、`MAGPIE_API_KEY`、`MAGPIE_MODEL`、`MAGPIE_MAX_TOKENS`、`MAGPIE_TIMEOUT_SECONDS`、`MAGPIE_MAX_RETRIES`。默认模型为 `minimax-code/MiniMax-M3.1-Flash`，每个迁移角色可用 `<ROLE>_MODEL` 单独覆盖，模型 ID 直接取 Magpie `/v1/models` 返回的值，不加 `anthropic:` 前缀。
 
 每个迁移角色都可独立回退。例如将 `WORKER_LLM_PROVIDER=gemini` 写入 `.env` 并重启进程即可；若设置过 `WORKER_LLM_MODEL`，同时删除它或改为原 Gemini 型号。未显式覆盖模型时，provider 会自动选择对应的默认型号。回退后请开启新会话，不混用不同 provider 的历史推理块。
 

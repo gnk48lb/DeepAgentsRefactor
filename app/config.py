@@ -32,6 +32,10 @@ JINA_API_KEY = os.getenv("JINA_API_KEY")  # 已废弃，网页提取已全面迁
 # CLI Logger / Debug Configuration
 CLI_DEBUG = os.getenv("CLI_DEBUG", "1")
 CLI_DEBUG_MAX_CHARS = os.getenv("CLI_DEBUG_MAX_CHARS", "600")
+# LLM 指标埋点：独立于 CLI_DEBUG，关掉彩色终端输出时也能继续攒真实数据
+# （每行一条 JSON，见 app/runtime/cli_logger.py；storage/ 已被 git 忽略）
+CLI_METRICS = os.getenv("CLI_METRICS", "1")
+LLM_METRICS_PATH = _resolve_path(os.getenv("LLM_METRICS_PATH") or "storage/llm_metrics.jsonl")
 
 # Workspace / Filesystem MCP 配置
 WORKSPACE_DIR = _resolve_path(
@@ -99,7 +103,7 @@ RAG_MIN_RERANK_SCORE = float(os.getenv("RAG_MIN_RERANK_SCORE", "0.1"))
 # Magpie 本地网关（Anthropic Messages 协议；SDK 自动拼接 /v1/messages）
 MAGPIE_BASE_URL = os.getenv("MAGPIE_BASE_URL") or "http://127.0.0.1:3425"
 MAGPIE_API_KEY = os.getenv("MAGPIE_API_KEY") or "local"
-MAGPIE_MODEL = os.getenv("MAGPIE_MODEL") or "minimax-code-global/MiniMax-M3.1-Flash"
+MAGPIE_MODEL = os.getenv("MAGPIE_MODEL") or "minimax-code/MiniMax-M3.1-Flash"
 MAGPIE_MAX_TOKENS = int(os.getenv("MAGPIE_MAX_TOKENS", "16384"))
 MAGPIE_TIMEOUT_SECONDS = float(os.getenv("MAGPIE_TIMEOUT_SECONDS", "600"))
 MAGPIE_MAX_RETRIES = int(os.getenv("MAGPIE_MAX_RETRIES", "2"))
