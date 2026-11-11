@@ -58,7 +58,8 @@ L0 Config & Utils    (app/config.py, app/utils/*)
   - `/new [标题]`：新建并切换到新会话，旧会话原样保留（含挂起的授权）。
   - `/sessions [N]`：列出最近 N 个会话（默认 10，最多 30），标出 `[当前]` 与 `[待授权]`。
   - `/switch <序号|id前缀>`：序号按 `/sessions` 的顺序；切到有待授权操作的会话时会附上授权内容。
-  - `/reset`：只清空当前会话的对话上下文（含挂起的授权）并重置代码沙箱，**事件日志保留**。沙箱仍是进程级全局，`/new`、`/switch` 不会动它。
+  - `/reset`：只清空当前会话的对话上下文（含挂起的授权）并重置代码沙箱，**事件日志保留**。沙箱仍是进程级全局，`/new`、`/switch` 不会动它。任务正在运行时，`/reset` 会先中止当前任务（回复以“已先中止正在运行的任务。”开头），再执行清空。
+  - `/stop`：中止正在运行的任务（语义见 2.11「中止（/stop）语义」）。它不等 `_chat_lock`，任务运行期间也能立即生效；CLI 里任务运行期间同样可以输入 `/stop`。没有任务在跑时只回复“当前没有正在运行的任务。”。`/new`、`/switch`、`/sessions` 在任务运行期间仍返回“还在处理中”的忙提示（提示里附带已运行秒数与 `/stop` 用法）。
 
 > **警告**：机器人必须保持私有；若将来对外开放，需要重新引入用户隔离与权限层。尤其是 `FileAgent` 的 `run_host_command` 会以机器人进程所属用户的权限在宿主机上执行命令，任何能给机器人发消息并回复 `Y` 的人都等同于拥有这台机器的该用户权限。
 
@@ -157,7 +158,7 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 - `checkpoints.db`（官方 `AsyncSqliteSaver`）：LangGraph checkpoint，负责“续跑”（模型上下文与 HITL 中断）。`thread_id == session_id`。
 - 两者分工：checkpoint 负责续跑，事件日志负责记录与回溯；不要试图从事件日志重建模型上下文。
 
-**事件类型**：`session_created`、`user_message`（原话 / 翻译后文本 / 是否带图）、`approval`、`approval_request`、`assistant_message`（文本 + 图片张数）、`expert_report`（task 返回的专家完整战报）、`tool_call`、`tool_result`、`turn_failed`、`turn_abandoned`、`session_reset`。事件只追加、不改写；“待处理”由会话游标 `processed_seq` 表达（入站事件 `user_message` / `approval` 的 seq 大于游标即待处理）。图片字节永远不进事件日志，只记张数。
+**事件类型**：`session_created`、`user_message`（原话 / 翻译后文本 / 是否带图）、`approval`、`approval_request`、`assistant_message`（文本 + 图片张数）、`expert_report`（task 返回的专家完整战报）、`tool_call`、`tool_result`、`turn_failed`（`reason`：`recursion_limit` / `timeout` / `error` / `no_pending_approval` / `user_stop` / `cancelled`）、`turn_abandoned`、`session_reset`。事件只追加、不改写；“待处理”由会话游标 `processed_seq` 表达（入站事件 `user_message` / `approval` 的 seq 大于游标即待处理）。图片字节永远不进事件日志，只记张数。
 
 **wake 与重启恢复语义**
 - wake 只做按需触发（用户消息 / Y-N 审批），不做定时、cron、后台主动唤醒，也不做崩溃自动重试。
@@ -165,6 +166,16 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 - 挂起授权：状态在 checkpoint 里，原话与已生成的图片落在 `turn_state`。进程重启后回复 Y/N 照常恢复，已完成的专家不会重跑，挂起前生成的图片仍随最终回复发出。
 - 崩溃遗留：启动时对每个有未处理入站事件的会话先镜像已落盘的消息，再追加 `turn_abandoned{process_restart}` 并推进游标，**不自动重跑**（回复通道已断，且重放可能让已批准的宿主机命令再执行一次）。
 - 主 Agent 的回溯：`search_session_history` / `get_session_events` 两个只读工具直接挂在主 Agent 上，查的是事件日志（用户原话 + 专家完整汇报），不受上下文压缩影响。
+
+**中止（/stop）语义**
+- 取消范围：一轮普通对话（含 Y/N 授权恢复）跑在 `chat_service` 自己创建的独立 task 里，`/stop` 只取消这个 task，**不会取消调用方**（NoneBot handler / CLI 主 task）；斜杠命令在 `_chat_lock` 内同步执行，不可被 `/stop` 取消。顺序是先 cancel 再终止进程（反过来的话，被杀进程的“失败结果”会让图再往前走一步）。
+- 同时终止的副作用：`host_shell.kill_all_running()` 杀掉所有在跑的宿主机命令的整个进程树，`sandbox.interrupt_sandbox()` 杀掉 Docker 沙箱里沙箱用户的全部进程（不销毁容器、不清 `/work`）。asyncio 的 cancel 只放弃 await、杀不死线程，所以这两步是必须的；线程里的其它同步工具（rag、SQL、图谱检索等）会自然跑完，结果被丢弃。
+- 不回滚：已经点过的击、已写入的文件、已跑完的命令都不回滚，`/stop` 的回复里会明说。
+- 被中止的那条请求返回 `None`：`plugins/chat.py` 对 `None` 直接 return，所以原消息不会再多发一条回复，`/stop` 自己的回复才是确认；CLI 也不会打印“(空)”。
+- 日志与游标：事件日志追加 `turn_failed{reason:"user_stop"}`，其余未处理事件写 `turn_abandoned`，处理游标照常推进，锁释放，下一条消息正常处理。悬空的 `task` 调用由 deepagents 默认的 `PatchToolCallsMiddleware` 在下一轮开头补一条 “…was cancelled…” 的 ToolMessage（由 O2 钉死）。
+- 不清理：`/stop` 不清 checkpoint（嵌套 checkpoint 留给下一次正常结束时的清理，与超时路径一致），不写 `assistant_message`，不触发记忆提取，不调用 `adelete_thread`。
+- 等待时限：`AGENT_STOP_WAIT_SECONDS`（默认 15 秒）内被取消的那一轮没有收尾，回复“任务还在收尾”，可再发一次 `/stop`。
+- 关闭服务（`shutdown_service`）开头也会先做一次尽力的中止，避免关闭 MCP / 浏览器时还有一轮在操作桌面或跑宿主机命令。
 
 **`/reset` 与脚本删除的区别**
 - `/reset`：只清上下文（删 checkpoint 线程 + 挂起态 + 重置沙箱），事件日志保留并追加 `session_reset`。
@@ -457,6 +468,7 @@ uv run python main.py --rebuild
 - **重启后仍可恢复**：挂起的授权状态在 checkpoint 里，授权前已生成的图片和用户原话在 `turn_state` 里。授权提示出现后即使重启进程，回复 `Y` / `N` 仍照常放行，已完成的专家不会重跑（见 2.11）。
 - **授权挂起时切换会话**：`/new`、`/switch` 不会丢弃挂起的授权；用 `/sessions` 可看到 `[待授权]` 标记，`/switch` 切回该会话后回复 `Y` / `N`。
 - **发送 `/reset`**：可随时丢弃当前会话未决的授权与历史上下文（事件日志保留），重新开始新对话。
+- **回复 `Y` 之后发送 `/stop`**：授权恢复阶段被中止后，图里的授权中断仍然保留（实测 `has_pending_interrupts` 为 `True`），`/stop` 的回复会再次附上授权内容和“回复 Y 重试 / N 放弃 / 或 /reset 清空”；已经执行完的那部分操作不会回滚，回 `Y` 重试可能让同一操作再执行一次，请先确认。
 
 ---
 
@@ -474,16 +486,16 @@ uv run python tests/run_smoke.py
 3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试（2 个场景）。
 4. `tests/smoke_amap_contract.py`：高德地图 12 个本地工具契约与 Schema 快照测试（5 个场景）。
 5. `tests/smoke_amap_http.py`：高德工具 HTTP 异常与密钥脱敏测试（13 个场景）。
-6. `tests/smoke_chat_service.py`：以生产同款 `AsyncSqliteSaver` + `SessionStore` 驱动的服务层测试，覆盖多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复、`/reset`、图片轮不提取记忆，以及重启恢复、多会话 `/new` `/sessions` `/switch`、崩溃遗留、事件日志镜像、嵌套 checkpoint 清理、`/reset` 保留日志与 `wake` 幂等消费（14 个场景）。
+6. `tests/smoke_chat_service.py`：以生产同款 `AsyncSqliteSaver` + `SessionStore` 驱动的服务层测试，覆盖多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复、`/reset`、图片轮不提取记忆，以及重启恢复、多会话 `/new` `/sessions` `/switch`、崩溃遗留、事件日志镜像、嵌套 checkpoint 清理、`/reset` 保留日志与 `wake` 幂等消费，以及 `/stop`（O1 慢模型中止、O2 子专家工具中止与悬空 tool_calls 补 cancelled、O3 空闲 `/stop`、O4 忙提示与忙时 `/reset`、O5 授权恢复阶段被中止、O6 终止原语在 cancel 之后被触发）（20 个场景）。
 7. `tests/smoke_session.py`：`SessionStore` 建表 / 活动指针 / 标题 / 前缀解析、事件追加与幂等 key、处理游标、`turn_state`（含 ≥1MB 发件箱）、搜索、关闭重开、并发 emit、`delete_session`，以及 `session_log.mirror_messages` 与两个回溯工具（12 个场景）。
 8. `tests/smoke_knowledge.py`：知识库建库、pending 增量入库、混合检索、长期记忆与 Reranker 阈值/降级离线冒烟测试（6 个场景）。
 9. `tests/smoke_memory.py`：长期记忆两阶段召回对账、版本化演进、代码护栏、输入隔离、fail-closed、多线程并发与平滑迁移离线冒烟测试（9 个场景）。
 10. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（4 个场景，含主管时间 / 会话回溯工具与专家预算装配）。
 11. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Neo4j图约束确保、图片编码与自检、Anthropic thinking 保留、浏览器 provider 选择与授权提示 URL 转义等 18 个场景）。
 12. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、超预算宿主机命令不弹授权、生产递归上限下失控保护等 19 个场景）。
-13. `tests/smoke_sandbox.py`：Docker 沙箱架构契约与防护离线冒烟测试（含配置参数校验、单例跨调用复用与 TTL 超时重建、执行超时防护、输出洪泛头尾截断、多模态产物解析与安全防御、Docker 未启动友好引导、只读挂载降级与软链接防御、BaseSandbox 与 CompositeBackend 抽象基类契约、资源释放幂等性、并发串行化、code_tools 工具层与 Outbox 旁路集成、P0 命令包装与输出上限、O 超时细分保留状态、P 客户端缓存与 clamp、Q 指纹去重、R 沙箱工作台装配与 S 多模态中间件等 19 个场景）。
+13. `tests/smoke_sandbox.py`：Docker 沙箱架构契约与防护离线冒烟测试（含配置参数校验、单例跨调用复用与 TTL 超时重建、执行超时防护、输出洪泛头尾截断、多模态产物解析与安全防御、Docker 未启动友好引导、只读挂载降级与软链接防御、BaseSandbox 与 CompositeBackend 抽象基类契约、资源释放幂等性、并发串行化、code_tools 工具层与 Outbox 旁路集成、P0 命令包装与输出上限、O 超时细分保留状态、P 客户端缓存与 clamp、Q 指纹去重、R 沙箱工作台装配、S 多模态中间件与 T `interrupt` 不抢沙箱锁（`/stop`）等 20 个场景）。
 14. `tests/smoke_models.py`：模型角色默认 provider、Gemini 回退、未知 provider、缺 key 作用域、惰性单例与 thinking 文本隔离测试（5 个场景，构造过程不访问网络）。
-15. `tests/smoke_host_shell.py`：宿主机命令运行器测试（环境变量白名单、编码回退、免授权精确匹配、基础运行、子进程环境与 stdin、超时杀进程树、脱离孙进程不挂住、截断与洪泛硬上限、审计日志，以及仅 Windows 的专项用例，共 10 个场景）。
+15. `tests/smoke_host_shell.py`：宿主机命令运行器测试（环境变量白名单、编码回退、免授权精确匹配、基础运行、子进程环境与 stdin、超时杀进程树、脱离孙进程不挂住、截断与洪泛硬上限、审计日志，仅 Windows 的专项用例，以及 H11 `kill_all_running`（`/stop` 终止在跑命令、之后新命令不受影响），共 11 个场景）。
 
 此外还提供 `tests/live_sandbox.py` 真机验收测试套件（包含 18 项端到端用例，需在已启动 Docker 守护进程的环境下执行 `uv run python tests/live_sandbox.py --live` 运行；慢测试需追加 `--slow` 参数）。
 
@@ -512,3 +524,6 @@ uv run python tests/run_smoke.py
 17. **根命名空间 checkpoint 不清理**: 只清理子专家的嵌套命名空间（见 2.11）；`checkpoints.db` 会随对话轮数持续增长，需要时用 `scripts/manage_sessions.py delete` 删除整个会话。
 18. **刚挂起即崩溃会丢授权前已生成的图片**: 挂起态（用户原话与已生成图片）在授权提示发出的同一轮收尾时才落库；若进程恰好在 checkpoint 落盘之后、挂起态写入之前崩溃，授权仍可恢复，但授权前已生成的图片会丢失。
 19. **事件时间戳是写入时间**: 事件日志里的 `ts` 是事件写入日志的时间，不是原始发生时间（镜像发生在每轮收尾，启动恢复时补镜像）。
+20. **`/stop` 不能杀线程**: `/stop` 只放弃异步等待，并终止宿主机命令的进程树与 Docker 沙箱里的进程；跑在 executor 线程里的 rag、SQL、图谱检索等同步工具会自然跑完，结果被丢弃。
+21. **桌面操作无法在 `/stop` 瞬间刹住**: 已发往桌面 MCP 服务的那一步（最多一步）仍可能执行；已执行的点击、按键等副作用不回滚。物理急停仍是 pyautogui 的 FAILSAFE（鼠标移到屏幕左上角）。
+22. **授权恢复阶段被 `/stop` 后仍可能处于待授权**: 回 `Y` 之后、专家还在跑时发 `/stop`，图里的授权中断仍然保留（实测 `has_pending_interrupts` 为 `True`），`/stop` 的回复会再附上授权内容与“回复 Y 重试 / N 放弃 / 或 /reset 清空”。授权前已经执行完的那部分操作不回滚，回 `Y` 重试可能让同一操作再执行一次，请先确认现状。
