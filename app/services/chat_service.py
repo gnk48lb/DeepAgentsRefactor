@@ -43,8 +43,22 @@ _checkpointer = None
 _chat_lock = asyncio.Lock()
 _background_tasks: Set[asyncio.Task] = set()
 
-_SLASH_COMMANDS = {"/new", "/sessions", "/switch", "/reset"}
+_SLASH_COMMANDS = {"/new", "/sessions", "/switch", "/reset", "/stop"}
 _SESSIONS_CMD_MAX = 30
+
+
+@dataclass
+class _TurnHandle:
+    """正在运行的那一轮对话的句柄：/stop 靠它 cancel 内层 task（不能 cancel 调用方自己的 task）。"""
+    task: asyncio.Task
+    session_id: str
+    started_at: float            # time.monotonic()
+    stop_requested: bool = False
+    cancel_sent_at: float = 0.0
+
+
+# 当前正在运行的一轮（仅普通消息 / Y-N 审批；斜杠命令在锁内同步执行，不可被 /stop 取消）
+_current_turn: Optional[_TurnHandle] = None
 
 
 async def _load_image_as_data_uri(image_url: str) -> Optional[str]:
@@ -136,6 +150,11 @@ async def shutdown_service() -> None:
     """关闭系统服务并释放 MCP 资源"""
     global _initialized, _agent, _checkpointer
     print("🛑 [chat_service] 正在关闭服务...")
+    # 先中止还在跑的一轮，避免关闭 MCP / 浏览器时它仍在操作桌面或宿主机命令（尽力而为）
+    try:
+        await _stop_current_turn()
+    except Exception as e:
+        print(f"⚠️ 警告：关闭前中止当前任务失败 (非致命): {e}")
     from app.infra import mcp_service, browser_service, milvus_client
     from app.tools import amap
     await mcp_service.shutdown_mcp()
@@ -182,7 +201,7 @@ async def _handle_command(cmd: str, arg: str, turn_start: float) -> ChatReply:
         return await _cmd_sessions(arg, turn_start)
     if cmd == "/switch":
         return await _cmd_switch(arg, turn_start)
-    return await _cmd_reset(turn_start)
+    return await _cmd_reset(turn_start)     # /stop 不会走到这里：它在 process_message 里锁外直接处理
 
 
 async def _cmd_new(title: str, turn_start: float) -> ChatReply:
@@ -318,50 +337,193 @@ async def _prepare_user_input(
     return processed_text, None
 
 
+async def _run_turn(sid: str, text: str, image_url: Optional[str], turn_start: float) -> Optional[ChatReply]:
+    """一轮普通对话（HITL 检查 -> Y/N 恢复 / 图片转文字 -> 写入入站事件 -> wake）。
+
+    跑在 _run_cancellable 创建的独立 task 里，/stop 只取消这个 task，不会波及调用方。
+    """
+    store = session_store.get_store()
+
+    # 检查当前会话是否在等授权
+    current_state = await _agent.aget_state(_state_config(sid))
+    if hitl.has_pending_interrupts(current_state):
+        user_reply = text.strip().upper()
+        if user_reply in ("Y", "N"):
+            store.emit_event(sid, "approval", {"answer": user_reply})
+            return await wake(sid, turn_start=turn_start)
+        cli_logger.log_hitl_status("REMIND", user_reply)
+        warn = hitl.format_hitl_warning(current_state)
+        msg = f"⚠️ 当前正在等待授权确认，请回复 Y 允许或 N 拒绝。\n\n{warn}"
+        cli_logger.log_turn_end(msg, 0, True, time.perf_counter() - turn_start)
+        return ChatReply(msg, [], awaiting_approval=True)
+
+    # 新消息流程：图片转文字（可选）-> 写入 user_message 事件 -> wake
+    processed_text, early_reply = await _prepare_user_input(text, image_url, turn_start)
+    if early_reply is not None or processed_text is None:
+        return early_reply
+    store.emit_event(
+        sid,
+        "user_message",
+        {"text": text, "processed_text": processed_text, "has_image": bool(image_url)},
+    )
+    return await wake(sid, turn_start=turn_start)
+
+
+async def _run_cancellable(coro, session_id: str, turn_start: float) -> Optional[ChatReply]:
+    """把一轮对话放进独立 task 并登记句柄，使 /stop 能在 _chat_lock 之外取消它。
+
+    被 /stop 取消的那一轮返回 None（plugins/chat.py 对 None 直接 return，不会多发一条回复）。
+    禁止用 asyncio.current_task().cancel() 实现 /stop：当前 task 是 NoneBot handler / CLI 主 task，会误杀调用方。
+    """
+    global _current_turn
+    task = asyncio.create_task(coro, name="chat-turn")
+    handle = _TurnHandle(task=task, session_id=session_id, started_at=time.monotonic())
+    _current_turn = handle                      # 与 create_task 之间不能有 await
+    try:
+        return await task
+    except asyncio.CancelledError:
+        me = asyncio.current_task()
+        if handle.stop_requested and me is not None and me.cancelling() == 0:
+            # 是内层 task 被 /stop 取消，而不是调用方自己被取消
+            cli_logger.log_turn_end("（已被用户中止）", 0, False, time.perf_counter() - turn_start)
+            return None
+        raise
+    finally:
+        _current_turn = None
+
+
+def _kill_side_effects() -> int:
+    """终止这一轮已在宿主机 / 沙箱里起的进程（阻塞调用，放线程里跑）。返回被终止的宿主机命令数。"""
+    from app.infra import host_shell, sandbox
+    killed = 0
+    try:
+        killed = int(host_shell.kill_all_running())
+    except Exception as e:
+        print(f"⚠️ [/stop] 终止宿主机命令失败 (非致命): {e}")
+    try:
+        sandbox.interrupt_sandbox()
+    except Exception as e:
+        print(f"⚠️ [/stop] 中断沙箱失败 (非致命): {e}")
+    return killed
+
+
+async def _stop_current_turn() -> tuple[str, int]:
+    """中止当前正在运行的一轮（/stop、/reset、关闭服务共用）。返回 (状态, 被终止的宿主机命令数)。
+
+    状态：idle（没有在跑的轮）/ stopped（已收尾）/ timeout（已发出中止，但 AGENT_STOP_WAIT_SECONDS 内没收尾）。
+    顺序是先 cancel 再杀进程：反过来的话，被杀进程的“失败结果”会让图再往前走一步。
+    """
+    handle = _current_turn
+    if handle is None or handle.task.done():
+        return "idle", 0
+    now = time.monotonic()
+    # 同一轮重复调用不再 cancel（会打断收尾代码），除非距上次已超过等待时限
+    if not handle.stop_requested or now - handle.cancel_sent_at > config.AGENT_STOP_WAIT_SECONDS:
+        handle.stop_requested = True
+        handle.cancel_sent_at = now
+        handle.task.cancel()
+    killed = await asyncio.to_thread(_kill_side_effects)
+    # 不用 wait_for：它超时会再取消一次
+    await asyncio.wait({handle.task}, timeout=config.AGENT_STOP_WAIT_SECONDS)
+    return ("stopped" if handle.task.done() else "timeout"), killed
+
+
+async def _cmd_stop(turn_start: float) -> ChatReply:
+    """/stop：在 _chat_lock 之外运行；不写 assistant_message、不提取记忆、不清 checkpoint。"""
+    handle = _current_turn
+    status, killed = await _stop_current_turn()
+    store = session_store.get_store()
+    sid = handle.session_id if handle is not None else store.get_active_session_id()
+
+    async def _pending_state():
+        if _agent is None:
+            return None
+        try:
+            state = await _agent.aget_state(_state_config(sid))
+        except Exception as e:
+            print(f"⚠️ [/stop] 读取会话状态失败 (非致命): {e}")
+            return None
+        return state if hitl.has_pending_interrupts(state) else None
+
+    if status == "idle":
+        msg = "当前没有正在运行的任务。"
+        pending = await _pending_state()
+        if pending is not None:
+            return _command_reply(msg + "有待授权的操作，回复 Y 允许 / N 拒绝，或 /reset 清空会话。", turn_start, awaiting=True)
+        return _command_reply(msg, turn_start)
+
+    if status == "timeout":
+        return _command_reply(
+            "已发送中止指令，但任务还在收尾，请稍后再发消息；仍无响应可再发一次 /stop。", turn_start
+        )
+
+    # 让日志留下中止前已落盘的进度（非致命）
+    try:
+        state = await _agent.aget_state(_state_config(sid))
+        await asyncio.to_thread(session_log.mirror_messages, store, sid, state.values.get("messages", []))
+    except Exception as e:
+        print(f"⚠️ [会话日志镜像失败]: {e}")
+
+    msg = "已中止当前任务。"
+    if killed:
+        msg += f"已终止 {killed} 个正在运行的宿主机命令。"
+    msg += "已经执行完的操作（点击、已写入的文件、已运行完的命令）不会回滚。"
+    pending = await _pending_state()
+    if pending is not None:
+        # 授权恢复阶段被中止后图里仍有待处理的中断：回复必须与实际状态一致
+        msg += "\n仍有待授权的操作：\n\n" + hitl.format_hitl_warning(pending) + "\n回复 Y 重试 / N 放弃 / 或 /reset 清空会话。"
+        return _command_reply(msg, turn_start, awaiting=True)
+    return _command_reply(msg, turn_start)
+
+
 async def process_message(text: str, image_url: Optional[str] = None) -> Optional[ChatReply]:
-    """处理单条用户消息（单用户模式：不区分用户、无权限校验）。不依赖 NoneBot，纯业务逻辑层。"""
+    """处理单条用户消息（单用户模式：不区分用户、无权限校验）。不依赖 NoneBot，纯业务逻辑层。
+
+    返回 None 表示这一轮被 /stop 中止（调用方不应再回复）。
+    """
     if not _initialized:
         return ChatReply("Agent 系统尚未初始化完成，请稍后再试。", [])
 
+    parsed = _parse_command(text)
+
+    # /stop 必须在 _chat_lock 之外：锁被正在运行的那一轮占着，等锁就永远停不下来
+    if parsed is not None and parsed[0] == "/stop":
+        stop_start = time.perf_counter()
+        cli_logger.log_turn_start(text, None)     # 附带的图片忽略
+        return await _cmd_stop(stop_start)
+
+    # /reset 忙时不干等：先中止当前轮，再走原有 /reset 流程
+    reset_prefix = ""
+    if parsed is not None and parsed[0] == "/reset" and _current_turn is not None:
+        await _stop_current_turn()
+        for _ in range(20):                       # 被取消的那一轮释放锁可能晚一拍，最多再等 1 秒
+            if not _chat_lock.locked():
+                break
+            await asyncio.sleep(0.05)
+        reset_prefix = "已先中止正在运行的任务。"
+
     # 全局一把锁：上一条还在处理时直接返回占用提示，不排队
     if _chat_lock.locked():
-        return ChatReply("上一条消息还在处理中，请稍候再发。", [])
+        busy = "上一条消息还在处理中，请稍候再发。"
+        turn = _current_turn
+        if turn is not None:
+            busy += f"（已运行 {int(time.monotonic() - turn.started_at)} 秒）"
+        return ChatReply(busy + "如需中止请发送 /stop", [])
 
     async with _chat_lock:
         turn_start = time.perf_counter()
         cli_logger.log_turn_start(text, image_url)
         try:
             # 斜杠命令：放在 HITL 判断之前，这样 /reset 能一并丢弃挂起中的授权，/switch 也能在授权挂起时使用
-            parsed = _parse_command(text)
+            # 命令在锁内同步执行，不可被 /stop 取消
             if parsed is not None:
-                return await _handle_command(parsed[0], parsed[1], turn_start)
+                reply = await _handle_command(parsed[0], parsed[1], turn_start)
+                if reset_prefix:
+                    reply = ChatReply(reset_prefix + reply.text, reply.images, reply.awaiting_approval)
+                return reply
 
-            store = session_store.get_store()
-            sid = store.get_active_session_id()
-
-            # 检查当前会话是否在等授权
-            current_state = await _agent.aget_state(_state_config(sid))
-            if hitl.has_pending_interrupts(current_state):
-                user_reply = text.strip().upper()
-                if user_reply in ("Y", "N"):
-                    store.emit_event(sid, "approval", {"answer": user_reply})
-                    return await wake(sid, turn_start=turn_start)
-                cli_logger.log_hitl_status("REMIND", user_reply)
-                warn = hitl.format_hitl_warning(current_state)
-                msg = f"⚠️ 当前正在等待授权确认，请回复 Y 允许或 N 拒绝。\n\n{warn}"
-                cli_logger.log_turn_end(msg, 0, True, time.perf_counter() - turn_start)
-                return ChatReply(msg, [], awaiting_approval=True)
-
-            # 新消息流程：图片转文字（可选）-> 写入 user_message 事件 -> wake
-            processed_text, early_reply = await _prepare_user_input(text, image_url, turn_start)
-            if early_reply is not None or processed_text is None:
-                return early_reply
-            store.emit_event(
-                sid,
-                "user_message",
-                {"text": text, "processed_text": processed_text, "has_image": bool(image_url)},
-            )
-            return await wake(sid, turn_start=turn_start)
+            sid = session_store.get_store().get_active_session_id()
+            return await _run_cancellable(_run_turn(sid, text, image_url, turn_start), sid, turn_start)
 
         except GraphRecursionError as e:
             print(f"[WARN] 任务步骤超限 (GraphRecursionError): {e}")
@@ -393,6 +555,11 @@ async def process_message(text: str, image_url: Optional[str] = None) -> Optiona
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _failure_reason(exc: BaseException) -> tuple[str, str]:
+    if isinstance(exc, asyncio.CancelledError):
+        turn = _current_turn
+        if turn is not None and turn.stop_requested:
+            return "user_stop", "用户发送 /stop 中止"
+        return "cancelled", "任务被取消"
     if isinstance(exc, GraphRecursionError):
         return "recursion_limit", str(exc)[:200]
     if isinstance(exc, asyncio.TimeoutError):
@@ -424,7 +591,7 @@ async def wake(session_id: str, *, turn_start: Optional[float] = None) -> Option
                     reply = await _run_user_message(session_id, ev, agent, cfg, started)
                 elif ev.type == "approval":
                     reply = await _run_approval(session_id, ev, agent, cfg, started)
-            except Exception as e:
+            except (Exception, asyncio.CancelledError) as e:
                 reason, detail = _failure_reason(e)
                 try:
                     store.emit_event(session_id, "turn_failed", {"reason": reason, "detail": detail})

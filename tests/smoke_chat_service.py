@@ -12,6 +12,8 @@ chat_service 服务层离线冒烟测试：用脚本化假模型驱动真实的 
   L    嵌套 checkpoint 清理：只清嵌套命名空间，根命名空间保留，开关可关
   M    /reset 清上下文但保留事件日志
   N    wake 幂等消费
+  O    /stop（锁外中止当前轮）：O1 慢模型 O2 子专家工具（含悬空 tool_calls 探针）O3 空闲 O4 忙提示与忙时 /reset
+       O5 授权恢复阶段被中止（P2 探针 + awaiting_approval 不变量）O6 终止原语被触发且在 cancel 之后
 不需要任何 API Key / Docker / MCP / 网络：orchestrator / injector / extractor / startup 在 import 前被桩掉。
 """
 import asyncio
@@ -220,6 +222,7 @@ async def _teardown():
     """先关连接（含 -wal / -shm），再删目录（Windows 要求）。"""
     global _env
     cs._agent, cs._initialized, cs._checkpointer = None, False, None
+    cs._current_turn = None
     if _env is not None:
         await checkpointer.close_checkpointer(_env.saver)
         session_store.close_store()
@@ -634,6 +637,237 @@ async def test_n_wake_idempotent():
     assert await cs.wake(sid) is None and mm.idx == calls + 1
 
 
+async def _state(sid=None):
+    return await cs._agent.aget_state({"configurable": {"thread_id": sid or cs.get_active_session_id()}})
+
+
+async def _stop_after(delay: float):
+    await asyncio.sleep(delay)
+    t0 = time.monotonic()
+    reply = await cs.process_message("/stop")
+    return reply, time.monotonic() - t0
+
+
+async def test_o1_stop_slow_model():
+    """O1 慢模型调用中 /stop：/stop 立即返回，原消息得到 None，锁释放，turn_failed(user_stop)，之后会话可继续。"""
+    root, fam, mm = await _install([AIMessage(content="慢回复"), AIMessage(content="之后的回复")], [FA_DONE], delay=1.5)
+    sid = cs.get_active_session_id()
+    t0 = time.monotonic()
+    turn = asyncio.create_task(cs.process_message("很慢的问题"))
+    (stop_reply, stop_cost) = await _stop_after(0.3)
+    original = await turn
+    total = time.monotonic() - t0
+
+    assert "已中止" in stop_reply.text and not stop_reply.awaiting_approval, stop_reply
+    assert stop_cost < 1.0 and total < 1.2, f"/stop 不应等模型：stop={stop_cost:.2f}s total={total:.2f}s"
+    assert original is None, original
+    assert not cs._chat_lock.locked() and cs._current_turn is None
+    failed = _env.store.get_events(sid, types=["turn_failed"])
+    assert [e.payload["reason"] for e in failed] == ["user_stop"], failed
+    assert _env.store.get_pending_events(sid) == [], "被中止的轮也必须推进游标"
+    assert _env.store.load_turn_state(sid) is None
+    assert not [e for e in _env.store.get_events(sid, limit=200) if e.type == "assistant_message"]
+
+    mm.delay = 0.0
+    await asyncio.sleep(1.6)                # 让被放弃的线程自然结束（参考 test_e）
+    r = await cs.process_message("中止之后的新问题")
+    assert r is not None and r.text == "之后的回复" and not cs._chat_lock.locked(), r
+
+
+async def test_o2_stop_in_subagent_tool():
+    """O2 子专家工具执行中 /stop（P1 探针）：async 工具收到 CancelledError，同步线程不被等待，下一轮补 cancelled 的 ToolMessage。"""
+    flags: dict = {}
+
+    @tool
+    async def hang() -> str:
+        """hang"""
+        flags["hang_started"] = True
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            flags["hang_cancelled"] = True
+            raise
+        return "不应到这里"
+
+    @tool
+    def slow_sync() -> str:
+        """slow"""
+        flags["sync_started"] = True
+        time.sleep(2)
+        flags["sync_done"] = True
+        return "done"
+
+    async def _wait_flag(name):
+        deadline = time.monotonic() + 5
+        while name not in flags and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert name in flags, f"{name} 未出现"
+
+    for variant, tool_fn, started in (("async", hang, "hang_started"), ("sync", slow_sync, "sync_started")):
+        flags.clear()
+        cam = ScriptedModel(script=[AIMessage(content="", tool_calls=[_tc(tool_fn.name, {}, "x1")]),
+                                    AIMessage(content="不应到这里")])
+        spec = {"name": "CodeAgent", "description": "c", "system_prompt": "x", "model": cam, "tools": [tool_fn]}
+        root, fam, mm = await _install(
+            [AIMessage(content="", tool_calls=[_task("CodeAgent", "t1")]), AIMessage(content="继续好了")],
+            [FA_DONE], extra=[spec],
+        )
+        sid = cs.get_active_session_id()
+        turn = asyncio.create_task(cs.process_message("让专家干活"))
+        await _wait_flag(started)
+        stop_reply, stop_cost = await _stop_after(0.1)
+        original = await turn
+        assert "已中止" in stop_reply.text and stop_cost < 1.5, (variant, stop_reply.text, stop_cost)
+        assert original is None and not cs._chat_lock.locked() and cs._current_turn is None, variant
+        if variant == "async":
+            assert flags.get("hang_cancelled"), "async 工具应收到 CancelledError"
+        else:
+            assert "sync_done" not in flags, "/stop 不应等同步线程跑完"
+        failed = _env.store.get_events(sid, types=["turn_failed"])
+        assert [e.payload["reason"] for e in failed] == ["user_stop"], (variant, failed)
+
+        # P1：悬空的 task 调用在下一轮开头被补成 "...was cancelled..." 的 ToolMessage，会话能继续
+        r = await cs.process_message("中止之后继续")
+        assert r is not None and r.text == "继续好了", (variant, r)
+        assert "cancelled" in mm.seen[-1], f"P1 不成立：下一轮主模型输入里没有 cancelled\n{mm.seen[-1][-400:]}"
+        if variant == "sync":
+            await asyncio.sleep(2.2)        # 让被放弃的线程结束再清理
+        await _teardown()
+
+
+async def test_o3_idle_stop():
+    """O3 空闲 /stop：不取锁、不写事件；有待授权时回复里带 Y/N 提示。"""
+    root, fam, mm = await _install(
+        [AIMessage(content="普通回复"), AIMessage(content="", tool_calls=[_task("FileAgent", "t1")]), AIMessage(content="写好了")],
+        [AIMessage(content="", tool_calls=[_write("workspace/a.txt", "c1")]), FA_DONE],
+    )
+    sid = cs.get_active_session_id()
+    before = _env.store.count_events(sid)
+    r = await cs.process_message("/stop")
+    assert "没有正在运行" in r.text and not r.awaiting_approval, r
+    assert _env.store.count_events(sid) == before, "空闲 /stop 不应新增事件"
+
+    # 不取锁：锁被占着（比如正在执行命令）时 /stop 也立即返回
+    async with cs._chat_lock:
+        r = await asyncio.wait_for(cs.process_message("/stop"), timeout=2)
+        assert "没有正在运行" in r.text
+    # 并发再发一条普通消息能正常处理
+    stop_r, normal_r = await asyncio.gather(cs.process_message("/stop"), cs.process_message("你好"))
+    assert "没有正在运行" in stop_r.text and normal_r.text == "普通回复", (stop_r, normal_r)
+
+    r = await cs.process_message("写个文件")
+    assert r.awaiting_approval
+    before = _env.store.count_events(sid)
+    r = await cs.process_message("/stop")
+    assert "没有正在运行" in r.text and "Y" in r.text and "N" in r.text and r.awaiting_approval, r
+    assert _env.store.count_events(sid) == before
+    r = await cs.process_message("Y")
+    assert r.text == "写好了" and _files(root) == ["a.txt"], (r.text, _files(root))
+
+
+async def test_o4_busy_hint_and_reset_while_busy():
+    """O4 忙提示带 /stop 提示；忙时 /reset 先中止当前轮再清空。"""
+    root, fam, mm = await _install([AIMessage(content="慢回复"), AIMessage(content="全新对话")], [FA_DONE], delay=1.5)
+    sid = cs.get_active_session_id()
+    turn = asyncio.create_task(cs.process_message("很慢的问题"))
+    await asyncio.sleep(0.3)
+    busy = await cs.process_message("插队")
+    assert "还在处理中" in busy.text and "/stop" in busy.text and "已运行" in busy.text, busy.text
+    for cmd in ("/new x", "/switch 1", "/sessions"):
+        r = await cs.process_message(cmd)
+        assert "还在处理中" in r.text, (cmd, r.text)
+
+    reset_reply = await cs.process_message("/reset")
+    original = await turn
+    assert original is None, original
+    assert "已先中止" in reset_reply.text and "已清空" in reset_reply.text, reset_reply.text
+    assert not cs._chat_lock.locked() and cs._current_turn is None
+    st = await _state(sid)
+    assert not st.values.get("messages") and not hitl.has_pending_interrupts(st), st
+    types_ = [e.type for e in _env.store.get_events(sid, limit=200)]
+    reasons = [e.payload["reason"] for e in _env.store.get_events(sid, types=["turn_failed"])]
+    assert reasons == ["user_stop"] and "session_reset" in types_, (reasons, types_)
+
+    mm.delay = 0.0
+    await asyncio.sleep(1.6)
+    r = await cs.process_message("你好")
+    assert r.text == "全新对话", r
+    assert "很慢的问题" not in mm.seen[-1], "/reset 之后应是全新对话"
+
+
+async def test_o5_stop_during_approval_resume():
+    """O5 授权恢复阶段被中止（P2 探针 + 不变量）：副作用不回滚；回复与实际授权状态一致；之后会话可继续。"""
+    root, fam, mm = await _install(
+        [AIMessage(content="", tool_calls=[_task("FileAgent", "t1")]), AIMessage(content="写好了"),
+         AIMessage(content="继续好了")],
+        [AIMessage(content="", tool_calls=[_write("workspace/a.txt", "c1")]), FA_DONE, FA_DONE],
+    )
+    sid = cs.get_active_session_id()
+    fam.delay = 0.0
+    r = await cs.process_message("写个文件")
+    assert r.awaiting_approval and _files(root) == [], r
+
+    fam.delay = 1.5                          # 批准后 write_file 立即落盘，随后 FileAgent 的下一次模型调用很慢
+    turn = asyncio.create_task(cs.process_message("Y"))
+    stop_reply, stop_cost = await _stop_after(0.4)
+    original = await turn
+    assert original is None and "已中止" in stop_reply.text, (original, stop_reply)
+    assert _files(root) == ["a.txt"], "已落盘的文件不回滚"
+    assert "不会回滚" in stop_reply.text
+
+    st = await _state(sid)
+    pending = hitl.has_pending_interrupts(st)
+    print(f"    [P2 实测] 授权恢复阶段被中止后 has_pending_interrupts = {pending}")
+    assert stop_reply.awaiting_approval == pending, (stop_reply.awaiting_approval, pending)
+    if pending:
+        assert "回复 Y 重试" in stop_reply.text and "write_file" in stop_reply.text, stop_reply.text
+    assert not cs._chat_lock.locked() and cs._current_turn is None
+    reasons = [e.payload["reason"] for e in _env.store.get_events(sid, types=["turn_failed"])]
+    assert reasons == ["user_stop"], reasons
+
+    fam.delay = 0.0
+    await asyncio.sleep(1.6)
+    if pending:
+        r = await cs.process_message("N")
+    else:
+        r = await cs.process_message("再说点什么")
+    assert r is not None and r.text in ("写好了", "继续好了"), r.text
+    r2 = await cs.process_message("最后一条")
+    assert r2 is not None and not cs._chat_lock.locked(), r2
+
+
+async def test_o6_kill_primitives_triggered():
+    """O6 终止原语被正确触发，且在 cancel 之后调用。"""
+    from app.infra import host_shell
+    root, fam, mm = await _install([AIMessage(content="慢回复"), AIMessage(content="后续")], [FA_DONE], delay=1.2)
+    calls = {"host": [], "sandbox": []}
+
+    def fake_kill():
+        t = cs._current_turn
+        calls["host"].append(bool(t is not None and t.stop_requested and t.task.cancelling() > 0))
+        return 2
+
+    def fake_interrupt():
+        t = cs._current_turn
+        calls["sandbox"].append(bool(t is not None and t.stop_requested))
+        return False
+
+    orig_kill, orig_int = host_shell.kill_all_running, sandbox.interrupt_sandbox
+    host_shell.kill_all_running, sandbox.interrupt_sandbox = fake_kill, fake_interrupt
+    try:
+        turn = asyncio.create_task(cs.process_message("慢"))
+        stop_reply, _ = await _stop_after(0.3)
+        await turn
+        # 空闲时的 /stop 不应触发任何终止原语
+        await cs.process_message("/stop")
+    finally:
+        host_shell.kill_all_running, sandbox.interrupt_sandbox = orig_kill, orig_int
+    assert calls == {"host": [True], "sandbox": [True]}, calls
+    assert "已终止 2 个" in stop_reply.text, stop_reply.text
+    mm.delay = 0.0
+    await asyncio.sleep(1.3)
+
+
 SCENARIOS = [
     ("A 多轮 HITL（批准/无关消息/拒绝）", test_a_multi_turn_hitl),
     ("B HITL 前的图片随最终回复发出", test_b_outbox_continuity),
@@ -649,6 +883,12 @@ SCENARIOS = [
     ("L 嵌套 checkpoint 清理", test_l_nested_prune),
     ("M /reset 保留事件日志", test_m_reset_keeps_log),
     ("N wake 幂等消费", test_n_wake_idempotent),
+    ("O1 慢模型调用中 /stop", test_o1_stop_slow_model),
+    ("O2 子专家工具中 /stop（悬空 tool_calls）", test_o2_stop_in_subagent_tool),
+    ("O3 空闲 /stop", test_o3_idle_stop),
+    ("O4 忙提示与忙时 /reset", test_o4_busy_hint_and_reset_while_busy),
+    ("O5 授权恢复阶段被中止", test_o5_stop_during_approval_resume),
+    ("O6 终止原语被正确触发", test_o6_kill_primitives_triggered),
 ]
 
 
