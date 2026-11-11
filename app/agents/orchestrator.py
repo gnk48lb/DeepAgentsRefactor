@@ -7,6 +7,7 @@ from deepagents import (
     register_harness_profile,
     HarnessProfile,
     GeneralPurposeSubagentProfile,
+    FilesystemPermission,
 )
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
@@ -25,6 +26,14 @@ from app.agents.experts import (
     file_agent,
     desktop_agent,
 )
+
+# 与 provider 无关的第二道保险:主管永远不写文件。
+# HarnessProfile.excluded_tools 按 provider 名字注册(google_genai/openai/anthropic),
+# 换成没注册的 provider 时写工具会静默回来;permissions 是工具层的硬拒绝,与 provider 无关。
+# 语义差异:excluded_tools 让工具"不可见",permissions 让工具"可见但调用报错"——两者并存。
+_SUPERVISOR_PERMISSIONS = [
+    FilesystemPermission(operations=["write"], paths=["/**"], mode="deny"),
+]
 
 
 def _register_harness_profiles():
@@ -163,6 +172,7 @@ async def build_main_agent(
         subagents=subagents,
         middleware=middleware,
         backend=build_skills_backend(),
+        permissions=_SUPERVISOR_PERMISSIONS,
         checkpointer=checkpointer,
     )
 
