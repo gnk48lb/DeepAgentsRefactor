@@ -5,11 +5,13 @@ tests/smoke_host_shell.py
   H1 build_safe_env 白名单   H2 decode_output   H3 is_auto_approved_command   H4 基础运行
   H5 子进程环境与编码        H6 超时杀进程树    H7 脱离的孙进程不挂住
   H8 截断与洪泛              H9 审计日志        H10 Windows 专项（其他平台跳过）
+  H11 kill_all_running（/stop 终止在跑命令：进程登记、中止标记、之后新命令不受影响）
 """
 import os
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -222,6 +224,40 @@ def test_h10_windows_only():
         assert r.output.strip(), r
 
 
+def test_h11_kill_all_running():
+    assert host_shell.kill_all_running() == 0, "没有命令在跑时应返回 0"
+    assert host_shell.running_count() == 0
+    with tempfile.TemporaryDirectory() as td:
+        box = {}
+
+        def _worker():
+            box["res"] = host_shell.run_command(f'{PY} -c "import time; time.sleep(60)"', cwd=td, timeout=120)
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t0 = time.monotonic()
+        t.start()
+        deadline = time.monotonic() + 15
+        while host_shell.running_count() != 1 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert host_shell.running_count() == 1, "长命令应已登记"
+        time.sleep(0.5)                       # 给子进程一点启动时间，让进程树真正成形
+
+        assert host_shell.kill_all_running() == 1
+        t.join(timeout=15)
+        assert not t.is_alive(), "run_command 应在 15s 内返回"
+        elapsed = time.monotonic() - t0
+        r = box["res"]
+        assert not r.timed_out and r.exit_code != 0 and r.exit_code == 130, r
+        assert any("中止" in n for n in r.notes), r.notes
+        assert elapsed < 30, f"中止耗时 {elapsed:.1f}s"
+        assert host_shell.running_count() == 0
+
+        # /stop 之后新命令照常运行（没有全局持久的“已取消”标志）
+        r2 = host_shell.run_command("echo after_kill", cwd=td)
+        assert r2.exit_code == 0 and "after_kill" in r2.output and not r2.notes, r2
+        assert host_shell.kill_all_running() == 0
+
+
 SCENARIOS = [
     ("H1 build_safe_env 白名单", test_h1_safe_env),
     ("H2 decode_output", test_h2_decode_output),
@@ -233,6 +269,7 @@ SCENARIOS = [
     ("H8 截断与洪泛硬上限", test_h8_truncate_and_flood),
     ("H9 审计日志", test_h9_audit_log),
     ("H10 Windows 专项", test_h10_windows_only),
+    ("H11 kill_all_running 终止在跑命令（/stop）", test_h11_kill_all_running),
 ]
 
 

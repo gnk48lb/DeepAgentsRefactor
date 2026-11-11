@@ -419,6 +419,21 @@ class DockerSandbox(BaseSandbox):
         except Exception:
             pass
 
+    def interrupt(self) -> bool:
+        """中止沙箱里正在运行的代码：杀掉沙箱用户的全部进程（保留 PID 1 与 sleep infinity）。
+
+        不得获取 self._lock：run_python / execute 持锁直到跑完，抢锁等于没中断。
+        不销毁容器、不清 /work、不清 _seen_outputs。有容器返回 True；永不抛异常。
+        """
+        try:
+            container = self._container     # 无锁读：引用赋值是原子的
+            if container is None:
+                return False
+            self._cleanup_stray_processes(container)
+            return True
+        except Exception:
+            return False
+
     def collect_new_outputs(self) -> OutputsResult:
         """扫描 /work/outputs，按指纹 (路径: (大小, mtime)) 提取新增或修改的产物。"""
         with self._lock:
@@ -988,6 +1003,18 @@ def reset_sandbox() -> None:
                 _GLOBAL_SANDBOX.reset()
             except Exception:
                 pass
+
+
+def interrupt_sandbox() -> bool:
+    """/stop 用：杀掉沙箱里正在跑的用户进程，保留容器与 /work（无沙箱返回 False，绝不去连 Docker，永不抛异常）。
+
+    刻意不取 _GLOBAL_LOCK：reset_sandbox 会持着它等沙箱锁，而沙箱锁在代码跑完之前一直被占用。
+    """
+    try:
+        sb = _GLOBAL_SANDBOX
+        return sb.interrupt() if sb is not None else False
+    except Exception:
+        return False
 
 
 def shutdown_sandbox() -> None:

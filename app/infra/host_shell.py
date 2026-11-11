@@ -173,6 +173,46 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         pass
 
 
+# ── 进程登记：/stop 用它找到并终止正在运行的命令 ────────────────────────────────
+# 不用全局“已取消”标志（否则 /stop 之后所有新命令都会被误杀）：只用代际计数 + 逐进程标记。
+# run_command 入口快照 _cancel_gen；kill_all_running 把它 +1。登记进程时若发现代际变了，
+# 说明 /stop 恰好落在“进入 run_command”与“登记进程”之间，立刻补杀。
+_active_lock = threading.Lock()
+_active: dict[int, subprocess.Popen] = {}      # id(proc) -> proc
+_killed_by_user: set[int] = set()              # 被 kill_all_running 终止的 id(proc)
+_cancel_gen: int = 0
+
+
+def running_count() -> int:
+    """当前登记在册（尚未结束）的宿主机命令数。"""
+    with _active_lock:
+        return len(_active)
+
+
+def kill_all_running() -> int:
+    """终止全部正在运行的宿主机命令（整个进程树），返回被终止的命令数。线程安全，永不抛异常。
+
+    只在锁内改计数并拷贝进程列表；taskkill 最多阻塞 10 秒，必须在锁外执行。
+    """
+    global _cancel_gen
+    try:
+        with _active_lock:
+            _cancel_gen += 1
+            victims = [(k, p) for k, p in _active.items() if p.poll() is None]    # 已自然结束的不算
+            for key, _ in victims:
+                _killed_by_user.add(key)
+    except Exception:
+        return 0
+    killed = 0
+    for _, proc in victims:
+        try:
+            _kill_tree(proc)
+            killed += 1
+        except Exception:
+            pass
+    return killed
+
+
 def _spawn(command: str, cwd: str, env: dict[str, str]) -> subprocess.Popen:
     kwargs: dict[str, Any] = dict(
         stdin=subprocess.DEVNULL,       # 不继承机器人的标准输入（CLI 模式下会抢走控制台输入）
@@ -236,12 +276,40 @@ def run_command(
     max_chars = config.HOST_SHELL_MAX_OUTPUT_CHARS if max_output_chars is None else max_output_chars
     cap = config.HOST_SHELL_HARD_CAP_BYTES if hard_cap_bytes is None else hard_cap_bytes
 
+    with _active_lock:
+        gen0 = _cancel_gen
     start = time.monotonic()
     try:
         proc = _spawn(command, str(cwd), dict(env) if env is not None else build_safe_env())
     except Exception as e:
         return HostCommandResult(f"Error: 启动命令失败 ({type(e).__name__}): {e}", 1)
 
+    key = id(proc)
+    with _active_lock:
+        _active[key] = proc
+        raced = _cancel_gen != gen0
+        if raced:
+            _killed_by_user.add(key)
+    if raced:
+        _kill_tree(proc)
+    try:
+        return _collect(command, proc, key, start, eff_timeout, max_chars, cap)
+    finally:
+        with _active_lock:
+            _active.pop(key, None)
+            _killed_by_user.discard(key)
+
+
+def _collect(
+    command: str,
+    proc: subprocess.Popen,
+    key: int,
+    start: float,
+    eff_timeout: int,
+    max_chars: int,
+    cap: int,
+) -> HostCommandResult:
+    """等待进程结束并收集输出（进程已登记；登记的清理由 run_command 的 finally 负责）。"""
     buf = bytearray()
     overflow = threading.Event()
 
@@ -286,14 +354,20 @@ def run_command(
 
     duration = time.monotonic() - start
     text, truncated = _head_tail(decode_output(bytes(buf)).replace("\r\n", "\n"), max_chars)
-    exit_code = 124 if timed_out else proc.returncode
+    with _active_lock:
+        user_stopped = key in _killed_by_user
+    if user_stopped:
+        timed_out = False       # 被 /stop 终止的不算超时，即便 wait() 恰好同时到期
+    exit_code = 130 if user_stopped else (124 if timed_out else proc.returncode)
 
     notes: list[str] = []
+    if user_stopped:
+        notes.append("命令被用户中止（/stop），已终止整个进程树")
     if timed_out:
         notes.append(f"命令超过 {eff_timeout} 秒未结束，已终止整个进程树")
     if overflow.is_set():
         notes.append(f"输出超过 {cap} 字节的内存上限，进程已被终止")
-    if pipe_held and not timed_out and not overflow.is_set():
+    if pipe_held and not timed_out and not overflow.is_set() and not user_stopped:
         notes.append("有后台子进程仍占用输出管道，已不再等待其后续输出")
 
     _audit(command, exit_code, duration)

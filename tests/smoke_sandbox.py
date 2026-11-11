@@ -4,6 +4,7 @@ tests/smoke_sandbox.py
 代码沙箱离线冒烟测试：
 使用手写 FakeDocker 测试 DockerSandbox 的生命周期、安全配置、流式截断、
 产物过滤、BaseSandbox 契约与 code_tools 集成。
+场景 T：interrupt / interrupt_sandbox 不取沙箱锁，用于 /stop 中止正在跑的沙箱代码。
 不依赖真实的 Docker 守护进程、不需要网络、不需要任何 API Key。
 """
 
@@ -446,6 +447,57 @@ def test_j_concurrency_serialization():
         set_docker_client(None)
 
 
+def test_t_interrupt_does_not_take_lock():
+    """T interrupt 不抢沙箱锁：run_python 持锁期间也能杀掉沙箱里的进程；无沙箱时不连 Docker。"""
+    import threading
+    from app.infra import sandbox as sandbox_mod
+
+    # 没有沙箱：返回 False，且不创建沙箱 / 不碰 Docker
+    shutdown_sandbox()
+    set_docker_client(None)
+    assert sandbox_mod.interrupt_sandbox() is False
+    assert sandbox_mod._GLOBAL_SANDBOX is None
+
+    fake = FakeDockerClient()
+    set_docker_client(fake)
+    try:
+        sb = get_sandbox()
+        assert sb.interrupt() is False, "容器还没建时返回 False"
+        sb.run_python("print(1)")
+        container = fake.containers.created_containers[0]
+        container.exec_commands.clear()
+
+        held, release = threading.Event(), threading.Event()
+
+        def _hold_lock():
+            with sb._lock:
+                held.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=_hold_lock, daemon=True)
+        holder.start()
+        assert held.wait(5)
+        try:
+            t0 = time.monotonic()
+            ok = sandbox_mod.interrupt_sandbox()
+            elapsed = time.monotonic() - t0
+            assert ok is True and elapsed < 2, (ok, elapsed)
+            assert any("pgrep" in c for c in container.exec_commands), container.exec_commands
+        finally:
+            release.set()
+            holder.join(timeout=5)
+        assert container.removed is False and sb._container is container, "interrupt 不销毁容器"
+    finally:
+        shutdown_sandbox()
+        set_docker_client(None)
+
+    # 关闭之后：False，且不会重新连接 Docker
+    fake2 = FakeDockerClient()
+    set_docker_client(fake2)
+    assert sandbox_mod.interrupt_sandbox() is False and fake2.containers.created_containers == []
+    set_docker_client(None)
+
+
 def test_k_code_tools_integration_and_outbox():
     """K code_tools 封装、outbox 图片流转与异常转文本。"""
     fake = FakeDockerClient()
@@ -784,6 +836,7 @@ SCENARIOS = [
     ("Q A3 产物指纹去重与状态保留", test_q_collect_new_outputs_fingerprint),
     ("R A1-A2 CodeAgent 沙箱工作台装配", test_r_code_agent_assembly_and_routing),
     ("S A3-L4 SandboxOutputsMiddleware 多模态投递", test_s_sandbox_outputs_middleware),
+    ("T interrupt 不抢沙箱锁（/stop）", test_t_interrupt_does_not_take_lock),
 ]
 
 

@@ -243,6 +243,9 @@ SUBAGENT_TOOL_LIMITS = {
 # 单轮 Agent 运行总时限（秒）
 AGENT_TURN_TIMEOUT_SECONDS = 600
 
+# /stop 等待被取消的那一轮真正收尾的时限（秒）；超时后回复“任务还在收尾”，不会再次取消那一轮
+AGENT_STOP_WAIT_SECONDS = 15
+
 # MCP 单次工具调用超时（秒）
 MCP_CALL_TIMEOUT_SECONDS = 60
 
