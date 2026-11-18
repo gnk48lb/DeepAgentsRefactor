@@ -49,6 +49,7 @@ from app.agents import budget  # noqa: E402
 from app.agents.experts import desktop_agent, file_agent  # noqa: E402
 from app.agents.spec import ExpertSpec  # noqa: E402
 from app.runtime import hitl  # noqa: E402
+from _support import owner_context  # noqa: E402
 
 # 与 smoke_file_agent.py 同款：给 ScriptedModel 注册生产同款 harness profile
 register_harness_profile(
@@ -517,7 +518,10 @@ def main():
     passed = 0
     for name, fn in scenarios:
         try:
-            fn()
+            # FileAgent 的 run_host_command 与 DesktopAgent 的 da_tools_node 现在有 require_owner() 门控：
+            # 这些场景都以 owner 身份运行（asyncio.run 会继承当前上下文）；断言不变
+            with owner_context():
+                fn()
             print(f"  [PASS] {name}")
             passed += 1
         except Exception:

@@ -1,5 +1,11 @@
-"""长期记忆集合初始化、版本化维护与语义检索 (所在层: L2)"""
+"""长期记忆集合初始化、版本化维护与语义检索 (所在层: L2)
 
+多用户：每个用户一个独立的 Milvus collection，所有公开函数都带必填的关键字参数 user_id，只在该用户自己的集合里读写。
+owner 沿用现有集合 user_memory_v2（零迁移，含旧集合平滑迁移逻辑）；其他用户的集合是 `<owner集合名>_u_<sha256(user_id)前16位>`，
+首次写入时惰性创建，读取一个不存在的 member 集合返回空且不创建。别人的记忆 id 在你的集合里查不到，一律当作不存在。
+"""
+
+import hashlib
 import os
 import time
 import threading
@@ -9,6 +15,7 @@ from app import config
 from app.infra import models
 from app.infra.milvus_client import get_client
 from app.memory.guards import normalize_text, check_memory_text
+from app.utils.identity import OWNER_USER_ID, validate_user_id
 
 _write_lock = threading.RLock()
 _last_id: int = 0
@@ -23,21 +30,67 @@ def _generate_id() -> int:
     return next_id
 
 
-def collection_name() -> str:
-    """返回当前版本的长期记忆集合名称。"""
-    return f"{config.MEMORY_COLLECTION_NAME}_v{config.MEMORY_SCHEMA_VERSION}"
+def collection_name(user_id: str) -> str:
+    """该用户的长期记忆集合名称。
+
+    owner：现有的 `<MEMORY_COLLECTION_NAME>_v<版本>`（不变，零迁移）；
+    其他用户：同前缀加 `_u_` 再加 sha256(user_id) 的前 16 位十六进制。user_id 先过 validate_user_id。
+    """
+    validate_user_id(user_id)
+    owner_name = f"{config.MEMORY_COLLECTION_NAME}_v{config.MEMORY_SCHEMA_VERSION}"
+    if user_id == OWNER_USER_ID:
+        return owner_name
+    return f"{owner_name}_u_{hashlib.sha256(user_id.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _member_collection_names(c) -> List[str]:
+    """库里所有 member 的记忆集合（以 `<owner集合名>_u_` 开头的集合）。"""
+    prefix = f"{collection_name(OWNER_USER_ID)}_u_"
+    try:
+        return sorted(n for n in c.list_collections() if n.startswith(prefix))
+    except Exception as e:
+        print(f"⚠️ [记忆集合枚举失败]: {e}")
+        return []
+
+
+def _create_memory_collection(c, name: str) -> None:
+    """创建一个记忆集合 (Schema v2)：关闭 dynamic_field，显式声明全部标量字段。owner 与 member 集合共用。"""
+    print(f"--- [初始化] 正在创建长期记忆集合 '{name}' ---")
+    schema = c.create_schema(auto_id=False, enable_dynamic_field=False)
+    schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
+    schema.add_field(field_name="vector", datatype=DataType.FLOAT_VECTOR, dim=1024)
+    schema.add_field(field_name="text", datatype=DataType.VARCHAR, max_length=2048)
+    schema.add_field(field_name="kind", datatype=DataType.VARCHAR, max_length=16)
+    schema.add_field(field_name="status", datatype=DataType.VARCHAR, max_length=16)
+    schema.add_field(field_name="source", datatype=DataType.VARCHAR, max_length=32)
+    schema.add_field(field_name="evidence", datatype=DataType.VARCHAR, max_length=512)
+    schema.add_field(field_name="retired_evidence", datatype=DataType.VARCHAR, max_length=512)
+    schema.add_field(field_name="created_at", datatype=DataType.INT64)
+    schema.add_field(field_name="updated_at", datatype=DataType.INT64)
+    schema.add_field(field_name="supersedes", datatype=DataType.INT64)
+
+    index_params = c.prepare_index_params()
+    index_params.add_index(field_name="vector", index_type="FLAT", metric_type="IP")
+
+    c.create_collection(
+        collection_name=name,
+        schema=schema,
+        index_params=index_params,
+    )
+    print(f"✅ 长期记忆集合 '{name}' 初始化成功！")
 
 
 def init_memory_collection() -> None:
     """
-    初始化长期记忆集合 (Schema v2)：
+    初始化 owner 的长期记忆集合 (Schema v2)（member 的集合在各自首次写入时惰性创建，不在这里）：
     1. v2 集合不存在则创建，关闭 dynamic_field，显式声明全部标量字段。
-    2. 若配置 CLEAR_MEMORY_ON_STARTUP=True，则物理清空 v2 (delete filter='id >= 0')，跳过迁移并写标记文件。
+    2. 若配置 CLEAR_MEMORY_ON_STARTUP=True，则物理清空 v2 (delete filter='id >= 0')，以及所有 member 的记忆集合，
+       跳过迁移并写标记文件。
     3. 若旧集合存在且标记文件不存在，且非 CLEAR_MEMORY_ON_STARTUP，则执行幂等、非破坏性平滑迁移：
        复用向量、旧集合不删除、写入标记文件。
     4. REFRESH_COLLECTION 不再影响长期记忆库。
     """
-    v2_name = collection_name()
+    v2_name = collection_name(OWNER_USER_ID)
     flag_path = os.path.join(config.STORAGE_DIR, "memory_v2_migrated.flag")
 
     with _write_lock:
@@ -46,29 +99,7 @@ def init_memory_collection() -> None:
 
             # 1. 确保 v2 集合存在
             if not c.has_collection(v2_name):
-                print(f"--- [初始化] 正在创建长期记忆集合 '{v2_name}' ---")
-                schema = c.create_schema(auto_id=False, enable_dynamic_field=False)
-                schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
-                schema.add_field(field_name="vector", datatype=DataType.FLOAT_VECTOR, dim=1024)
-                schema.add_field(field_name="text", datatype=DataType.VARCHAR, max_length=2048)
-                schema.add_field(field_name="kind", datatype=DataType.VARCHAR, max_length=16)
-                schema.add_field(field_name="status", datatype=DataType.VARCHAR, max_length=16)
-                schema.add_field(field_name="source", datatype=DataType.VARCHAR, max_length=32)
-                schema.add_field(field_name="evidence", datatype=DataType.VARCHAR, max_length=512)
-                schema.add_field(field_name="retired_evidence", datatype=DataType.VARCHAR, max_length=512)
-                schema.add_field(field_name="created_at", datatype=DataType.INT64)
-                schema.add_field(field_name="updated_at", datatype=DataType.INT64)
-                schema.add_field(field_name="supersedes", datatype=DataType.INT64)
-
-                index_params = c.prepare_index_params()
-                index_params.add_index(field_name="vector", index_type="FLAT", metric_type="IP")
-
-                c.create_collection(
-                    collection_name=v2_name,
-                    schema=schema,
-                    index_params=index_params,
-                )
-                print(f"✅ 长期记忆集合 '{v2_name}' 初始化成功！")
+                _create_memory_collection(c, v2_name)
             else:
                 try:
                     c.load_collection(collection_name=v2_name)
@@ -86,6 +117,17 @@ def init_memory_collection() -> None:
                         pass
                 except Exception as ce:
                     print(f"⚠️ [清空记忆异常]: {ce}")
+                # 多用户：每个用户一个独立集合，一并清空（集合本身保留，下次写入沿用）
+                for member_name in _member_collection_names(c):
+                    print(f"--- [清理模式] 清空 member 记忆集合 '{member_name}' ---")
+                    try:
+                        c.delete(collection_name=member_name, filter="id >= 0")
+                        try:
+                            c.flush(member_name)
+                        except Exception:
+                            pass
+                    except Exception as ce:
+                        print(f"⚠️ [清空记忆异常]: {ce}")
                 os.makedirs(config.STORAGE_DIR, exist_ok=True)
                 with open(flag_path, "w", encoding="utf-8") as f:
                     f.write(str(int(time.time())))
@@ -176,17 +218,34 @@ def _ensure_loaded(c, coll_name: str) -> None:
         pass
 
 
-def search_memory(query: str, top_k: int = 3, min_score: Optional[float] = None) -> List[str]:
-    """检索长期记忆，只返回相似度 >= 阈值的有效事实（status=active 且 kind=fact），按相似度从高到低。"""
+def _resolve_collection(c, user_id: str, *, create: bool) -> Optional[str]:
+    """返回该用户的集合名；集合不存在时：
+    - owner：走 init_memory_collection()（含旧集合平滑迁移，行为与改造前完全一致）；
+    - member：create=True 时惰性创建（调用方必须已持有 _write_lock），否则返回 None，调用方当作“没有任何记忆”。
+    """
+    name = collection_name(user_id)
+    if c.has_collection(name):
+        _ensure_loaded(c, name)
+        return name
+    if user_id == OWNER_USER_ID:
+        init_memory_collection()
+        return name
+    if not create:
+        return None
+    _create_memory_collection(c, name)
+    return name
+
+
+def search_memory(query: str, top_k: int = 3, min_score: Optional[float] = None, *, user_id: str) -> List[str]:
+    """检索该用户的长期记忆，只返回相似度 >= 阈值的有效事实（status=active 且 kind=fact），按相似度从高到低。"""
+    validate_user_id(user_id)            # 在 try 之外：编程错误要响亮地抛出，而不是被吞成“没有记忆”
     if min_score is None:
         min_score = config.MEMORY_MIN_SCORE
     try:
         c = get_client()
-        coll_name = collection_name()
-        if not c.has_collection(coll_name):
-            init_memory_collection()
-        else:
-            _ensure_loaded(c, coll_name)
+        coll_name = _resolve_collection(c, user_id, create=False)
+        if coll_name is None:
+            return []
 
         vector = models.embeddings.embed_query(query)
         res = c.search(
@@ -213,20 +272,19 @@ def search_memory(query: str, top_k: int = 3, min_score: Optional[float] = None)
         return []
 
 
-def recall_similar(text: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
+def recall_similar(text: str, top_k: Optional[int] = None, *, user_id: str) -> List[Dict[str, Any]]:
     """
-    阶段2对账候选召回：按向量相似度召回 top-K 条 active+fact 候选记忆，不设分数下限。
+    阶段2对账候选召回：按向量相似度从该用户自己的集合里召回 top-K 条 active+fact 候选记忆，不设分数下限。
     返回每条候选的 dict: {"id": hit_id, "text": hit_text, "score": hit_score}
     """
+    validate_user_id(user_id)
     if top_k is None:
         top_k = config.MEMORY_RECALL_TOP_K
     try:
         c = get_client()
-        coll_name = collection_name()
-        if not c.has_collection(coll_name):
-            init_memory_collection()
-        else:
-            _ensure_loaded(c, coll_name)
+        coll_name = _resolve_collection(c, user_id, create=False)
+        if coll_name is None:
+            return []
 
         vector = models.embeddings.embed_query(text)
         res = c.search(
@@ -257,22 +315,20 @@ def add_memory(
     evidence: str,
     vector: Optional[List[float]] = None,
     source: str = "user_msg",
+    user_id: str,
 ) -> Optional[int]:
     """
-    新增一条原子事实记忆（status=active, supersedes=-1）。
+    在该用户自己的集合里新增一条原子事实记忆（status=active, supersedes=-1）；member 的集合在首次写入时惰性创建。
     D5 e: ADD 前做'规范化文本完全相同'的幂等检查（与任一 active 记忆相同 → 跳过）。
     """
+    validate_user_id(user_id)
     if vector is None:
         vector = models.embeddings.embed_query(text)
 
-    coll_name = collection_name()
     with _write_lock:
         try:
             c = get_client()
-            if not c.has_collection(coll_name):
-                init_memory_collection()
-            else:
-                _ensure_loaded(c, coll_name)
+            coll_name = _resolve_collection(c, user_id, create=True)
 
             # 幂等检查
             norm_new = normalize_text(text)
@@ -319,24 +375,25 @@ def supersede_memory(
     *,
     evidence: str,
     vector: Optional[List[float]] = None,
+    user_id: str,
 ) -> Optional[int]:
     """
-    更新事实记忆（原子化版本演进）：
+    更新事实记忆（原子化版本演进），只在该用户自己的集合里查 old_id（别人的 id 一律当作不存在）：
     1. 锁内确认 old 记忆仍处于 active 状态。
     2. 先插入新行 (status=active, supersedes=old_id)。
     3. 再把旧行置 superseded (partial_update upsert 改 status 和 updated_at)。
     4. 第二步失败则删除刚插入的新行作为补偿并上抛。
     """
+    validate_user_id(user_id)
     if vector is None:
         vector = models.embeddings.embed_query(new_text)
 
-    coll_name = collection_name()
     with _write_lock:
         c = get_client()
-        if not c.has_collection(coll_name):
-            init_memory_collection()
-        else:
-            _ensure_loaded(c, coll_name)
+        coll_name = _resolve_collection(c, user_id, create=False)
+        if coll_name is None:
+            print(f"🧠 [记忆写入] UPDATE 丢弃: 目标记忆 (id={old_id}) 不存在或状态非 active")
+            return None
 
         old_rows = c.query(
             collection_name=coll_name,
@@ -403,16 +460,16 @@ def supersede_memory(
         return new_id
 
 
-def retire_memory(mem_id: int, *, evidence: str = "") -> bool:
-    """撤回/删除记忆（软删除）：active -> deleted，记录 retired_evidence。"""
-    coll_name = collection_name()
+def retire_memory(mem_id: int, *, evidence: str = "", user_id: str) -> bool:
+    """撤回/删除记忆（软删除）：active -> deleted，记录 retired_evidence。只在该用户自己的集合里查 mem_id。"""
+    validate_user_id(user_id)
     with _write_lock:
         try:
             c = get_client()
-            if not c.has_collection(coll_name):
-                init_memory_collection()
-            else:
-                _ensure_loaded(c, coll_name)
+            coll_name = _resolve_collection(c, user_id, create=False)
+            if coll_name is None:
+                print(f"🧠 [记忆写入] DELETE 丢弃: 目标记忆 (id={mem_id}) 不存在或状态非 active")
+                return False
 
             old_rows = c.query(
                 collection_name=coll_name,
@@ -445,16 +502,16 @@ def retire_memory(mem_id: int, *, evidence: str = "") -> bool:
             return False
 
 
-def restore_memory(mem_id: int) -> bool:
-    """恢复已软删除的记忆：deleted -> active。"""
-    coll_name = collection_name()
+def restore_memory(mem_id: int, *, user_id: str) -> bool:
+    """恢复已软删除的记忆：deleted -> active。只在该用户自己的集合里查 mem_id。"""
+    validate_user_id(user_id)
     with _write_lock:
         try:
             c = get_client()
-            if not c.has_collection(coll_name):
-                init_memory_collection()
-            else:
-                _ensure_loaded(c, coll_name)
+            coll_name = _resolve_collection(c, user_id, create=False)
+            if coll_name is None:
+                print(f"🧠 [记忆写入] RESTORE 丢弃: 目标记忆 (id={mem_id}) 不存在或状态非 deleted")
+                return False
 
             old_rows = c.query(
                 collection_name=coll_name,
@@ -482,15 +539,14 @@ def restore_memory(mem_id: int) -> bool:
             return False
 
 
-def list_memories(include_inactive: bool = False) -> List[Dict[str, Any]]:
-    """查询事实记忆列表。默认只返回 active，include_inactive=True 则包含 superseded 与 deleted。"""
+def list_memories(include_inactive: bool = False, *, user_id: str) -> List[Dict[str, Any]]:
+    """查询该用户的事实记忆列表。默认只返回 active，include_inactive=True 则包含 superseded 与 deleted。"""
+    validate_user_id(user_id)
     try:
         c = get_client()
-        coll_name = collection_name()
-        if not c.has_collection(coll_name):
-            init_memory_collection()
-        else:
-            _ensure_loaded(c, coll_name)
+        coll_name = _resolve_collection(c, user_id, create=False)
+        if coll_name is None:
+            return []
 
         filter_expr = 'kind == "fact"' if include_inactive else 'status == "active" and kind == "fact"'
         results = c.query(
@@ -507,11 +563,12 @@ def list_memories(include_inactive: bool = False) -> List[Dict[str, Any]]:
         return []
 
 
-def purge_memories(ids: List[int]) -> int:
-    """物理清除指定 ID 记忆（仅供运维脚本显式命令调用）。"""
+def purge_memories(ids: List[int], *, user_id: str) -> int:
+    """物理清除该用户集合里指定 ID 的记忆（仅供运维脚本显式命令调用）。"""
+    validate_user_id(user_id)
     if not ids:
         return 0
-    coll_name = collection_name()
+    coll_name = collection_name(user_id)
     with _write_lock:
         try:
             c = get_client()

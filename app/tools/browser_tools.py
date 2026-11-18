@@ -3,6 +3,7 @@
 from langchain_core.tools import tool
 from app import config
 from app.infra.browser_service import fetch_generic_webpage_content, run_browser_task
+from app.utils.context import get_request_context, require_owner
 
 
 @tool
@@ -18,6 +19,13 @@ async def read_webpage_content(url: str) -> str:
 @tool
 async def execute_complex_browser_action(instruction: str) -> str:
     """用于需要模拟真人操作浏览器的复杂网页任务，例如：在网页上点击按钮、输入文字搜索、登录、翻页，或是处理极度复杂的动态交互网页。仅当普通的网页内容读取(read_webpage_content)无法满足需求，或用户明确要求“操作”、“点击”时才使用此工具。"""
+    # 纵深防御：这会操作用户电脑上真实的浏览器（带登录态），只有 owner 能用（member 的图里本来就没有 BrowserAgent）
+    try:
+        require_owner()
+    except (PermissionError, RuntimeError) as e:
+        ctx = get_request_context()
+        print(f"🚫 [execute_complex_browser_action] 已拒绝（用户 {ctx.user_id if ctx else '无请求上下文'}）: {e}")
+        return "Error: execute_complex_browser_action 仅管理员可用，已拒绝执行。"
     # 这里直接调用原有的服务函数，传入配置好的 VLM
     return await run_browser_task(instruction)
 

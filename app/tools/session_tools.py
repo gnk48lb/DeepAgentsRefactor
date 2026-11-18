@@ -13,6 +13,7 @@ from langchain_core.tools import tool
 
 from app import config
 from app.infra import session_store
+from app.utils.identity import validate_user_id
 
 _GET_MAX_LIMIT = 20
 _SEARCH_MAX_LIMIT = 10
@@ -108,19 +109,35 @@ def _snippet(text: str, tokens: list[str]) -> str:
     return ("…" if start > 0 else "") + text[start:end].replace("\n", " ") + ("…" if end < len(text) else "")
 
 
-def _resolve(store, session_id: str, config_: Optional[RunnableConfig]):
-    """会话解析优先级：session_id 参数 > RunnableConfig.thread_id > 活动会话。"""
+def _user_id_of(config_: Optional[RunnableConfig]) -> Optional[str]:
+    """当前用户：只取自 RunnableConfig.configurable.user_id（由 chat_service 的 _run_config 写入）。
+
+    取不到或格式不合法返回 None，调用方必须拒绝；绝不回落到活动会话或 owner。
+    """
+    user_id = ((config_ or {}).get("configurable") or {}).get("user_id")
+    if not isinstance(user_id, str) or not user_id:
+        return None
+    try:
+        return validate_user_id(user_id)
+    except ValueError:
+        return None
+
+
+def _resolve(store, session_id: str, config_: Optional[RunnableConfig], user_id: str):
+    """会话解析优先级：session_id 参数 > RunnableConfig.thread_id > 该用户的活动会话。
+    三条路径都只在 user_id 自己的会话里找：别人的会话（哪怕猜中了完整 id）对它等同于不存在。"""
     if session_id and session_id.strip():
-        info = store.resolve_session(session_id.strip())
+        info = store.resolve_session(session_id.strip(), user_id=user_id)
         if info is None:
             raise LookupError(f"找不到会话 {session_id}。可以先用 search_session_history 不带关键词查看会话列表。")
         return info
     thread_id = ((config_ or {}).get("configurable") or {}).get("thread_id")
     if thread_id:
-        info = store.get_session(str(thread_id))
-        if info is not None:
-            return info
-    info = store.get_session(store.get_active_session_id())
+        info = store.get_session(str(thread_id), user_id=user_id)
+        if info is None:
+            raise LookupError("找不到当前会话。")     # thread_id 不属于该用户：拒绝，不回落到别的会话
+        return info
+    info = store.get_session(store.get_active_session_id(user_id=user_id), user_id=user_id)
     if info is None:
         raise LookupError("当前没有任何会话记录。")
     return info
@@ -143,9 +160,12 @@ def get_session_events(
     - types: 事件类型过滤，逗号分隔，可选 user_message, assistant_message, expert_report, tool_call, tool_result。留空表示不过滤。
     - session_id: 会话 id（可只写前几位）。留空表示当前对话所在的会话。
     """
+    user_id = _user_id_of(config)
+    if user_id is None:
+        return "无法确定当前用户，已拒绝读取会话记录。"
     try:
         store = session_store.get_store()
-        info = _resolve(store, session_id, config)
+        info = _resolve(store, session_id, config, user_id)
         limit = max(1, min(int(limit or 10), _GET_MAX_LIMIT))
         type_list = [t.strip() for t in (types or "").split(",") if t.strip()]
         start_seq = int(start_seq or 0)
@@ -205,13 +225,16 @@ def search_session_history(
     - limit: 最多返回条数，默认 5，最大 10。
     - session_id: 会话 id（可只写前几位）。留空表示在全部会话里搜索；填写则只搜该会话。
     """
+    user_id = _user_id_of(config)
+    if user_id is None:
+        return "无法确定当前用户，已拒绝搜索会话记录。"
     try:
         store = session_store.get_store()
         limit = max(1, min(int(limit or 5), _SEARCH_MAX_LIMIT))
         tokens = [t for t in (query or "").split() if t]
 
         if not tokens:
-            sessions = store.list_sessions(limit=limit)
+            sessions = store.list_sessions(limit=limit, user_id=user_id)
             if not sessions:
                 return "目前没有任何会话记录。"
             rows = [
@@ -222,12 +245,12 @@ def search_session_history(
 
         scope_id = None
         if session_id and session_id.strip():
-            info = store.resolve_session(session_id.strip())
+            info = store.resolve_session(session_id.strip(), user_id=user_id)
             if info is None:
                 return f"找不到会话 {session_id}。可以不带关键词调用本工具查看会话列表。"
             scope_id = info.id
 
-        events = store.search_events(" ".join(tokens), session_id=scope_id, limit=limit)
+        events = store.search_events(" ".join(tokens), user_id=user_id, session_id=scope_id, limit=limit)
         if not events:
             return f"没有找到同时包含「{' '.join(tokens)}」的记录。可以换个关键词（更短、更口语化，或只用其中一个词）再试。"
 
@@ -236,7 +259,7 @@ def search_session_history(
         used = 0
         for ev in events:
             if ev.session_id not in titles:
-                s = store.get_session(ev.session_id)
+                s = store.get_session(ev.session_id, user_id=user_id)
                 titles[ev.session_id] = (s.title if s else "") or "（无标题）"
             line = (
                 f"[{ev.session_id[:8]}「{titles[ev.session_id]}」 #{ev.seq} {_fmt_ts(ev.ts)} {_event_label(ev)}] "

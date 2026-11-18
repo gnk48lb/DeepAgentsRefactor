@@ -10,6 +10,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt
 
 from app.infra import models
+from app.utils.context import get_request_context, require_owner
 from app.utils.text import extract_text
 from app.agents.prompts import WORKER_BASE_PROMPT
 from app.agents.budget import tool_limit_for
@@ -212,7 +213,20 @@ def build_desktop_agent_subgraph(desktop_tools: list, system_prompt: str, llm=No
         tc = pending[0]
         tool_name = tc["name"]
         args = tc.get("args", {})
-        
+
+        # 纵深防御：这会操控用户真实的桌面（截屏 / 点击 / 键盘），只有 owner 能用（member 的图里本来就没有 DesktopAgent）。
+        # 放在执行任何工具之前；这条路径在生产里不可达，所以只回一条错误结果让模型停手，不让它炸掉整轮。
+        try:
+            require_owner()
+        except (PermissionError, RuntimeError) as e:
+            ctx = get_request_context()
+            print(f"🚫 [DesktopAgent] 已拒绝工具 '{tool_name}'（用户 {ctx.user_id if ctx else '无请求上下文'}）: {e}")
+            return {"messages": [ToolMessage(
+                content="Error: 桌面操作仅管理员可用，已拒绝执行。请直接汇报这一点，不要再尝试任何桌面工具。",
+                tool_call_id=tc["id"],
+                name=tool_name,
+            )]}
+
         is_high_risk = False
         warning_msg = ""
         if tool_name == "press_hotkey":

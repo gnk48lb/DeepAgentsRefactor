@@ -13,6 +13,7 @@ from urllib.parse import urlparse, unquote
 from langchain_core.tools import BaseTool, StructuredTool
 
 from app import config
+from app.utils.context import get_request_context, require_owner
 
 
 async def normalize_uri(
@@ -134,6 +135,13 @@ def build_tools(mcp_tools: list[BaseTool], workspace_dir: str | Path) -> list[Ba
         return []
 
     async def _run(uri: str) -> str:
+        # 纵深防御：这个工具读的是宿主机上的文件，只有 owner 能用（member 的图里本来就没有它）
+        try:
+            require_owner()
+        except (PermissionError, RuntimeError) as e:
+            ctx = get_request_context()
+            print(f"🚫 [convert_to_markdown] 已拒绝（用户 {ctx.user_id if ctx else '无请求上下文'}）: {e}")
+            return "convert_to_markdown 调用被拒绝：仅管理员可用。"
         try:
             mapped = await normalize_uri(uri, workspace_dir=workspace_dir)
         except ValueError as e:

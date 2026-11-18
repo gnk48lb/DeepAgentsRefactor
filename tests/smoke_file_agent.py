@@ -29,6 +29,7 @@ from app.agents.experts import file_agent
 from app.tools import markitdown_tool
 from app.runtime import hitl
 from langchain_core.tools import StructuredTool
+from _support import owner_context
 
 from deepagents import (
     create_deep_agent,
@@ -955,7 +956,10 @@ def main():
     failed = 0
     for name, func in SCENARIOS:
         try:
-            func()
+            # run_host_command / convert_to_markdown 现在有 require_owner() 门控：这些场景都以 owner 身份运行
+            # （asyncio.run 会继承当前上下文，同步与异步场景都覆盖）。member / 无上下文被拒绝的断言在 smoke_multiuser.py 里。
+            with owner_context():
+                func()
             print(f"  [PASS] {name}")
             passed += 1
         except Exception as e:

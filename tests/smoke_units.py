@@ -144,6 +144,68 @@ def test_f_sql_hardening():
     assert captured["sql"].endswith("LIMIT 50") and captured["closed"]
 
 
+def test_f2_sql_hardening_multiuser():
+    """F2 多用户新增的 SQL 加固（member 现在也能驱动 MediaAgent 生成 SQL）：系统库、延迟 / 锁函数、加锁读各自拒绝；
+    注释写法绕不过；正常查询不受影响。原有规则的用例见 F。"""
+    prep = sql_tools._prepare_select_sql
+
+    def denied(sql, keyword):
+        try:
+            prep(sql)
+        except ValueError as e:
+            assert keyword in str(e), (sql, str(e))
+            return
+        raise AssertionError(f"应拒绝: {sql}")
+
+    # 系统库：information_schema / mysql / performance_schema / sys（反引号、大小写、空白、注释隔开都一样）
+    for sql in (
+        "SELECT * FROM information_schema.tables",
+        "SELECT * FROM `information_schema`.`tables`",
+        "SELECT * FROM INFORMATION_SCHEMA.TABLES",
+        "SELECT * FROM information_schema . tables",
+        "SELECT * FROM information_schema/**/.tables",
+        "SELECT table_name FROM works w JOIN information_schema.columns c ON 1=1",
+    ):
+        denied(sql, "System schemas")
+    for sql in ("SELECT user, authentication_string FROM mysql.user", "SELECT * FROM `mysql`.`user`", "select * from MySQL.db"):
+        denied(sql, "System schemas")
+    for sql in ("SELECT * FROM performance_schema.threads", "SELECT * FROM `performance_schema` . `events_statements_current`"):
+        denied(sql, "System schemas")
+    for sql in ("SELECT * FROM sys.session", "SELECT * FROM sys . host_summary", "SELECT * FROM `sys`.`version`"):
+        denied(sql, "System schemas")
+
+    # SLEEP( / BENCHMARK( / GET_LOCK(
+    for sql in ("SELECT SLEEP(5)", "select sleep (5)", "SELECT 1 FROM works WHERE SLEEP(1)", "SELECT /*!50000 SLEEP*/(5)",
+                "SELECT /*!50000SLEEP*/ (5)"):
+        denied(sql, "SLEEP")
+    for sql in ("SELECT BENCHMARK(1000000, MD5('a'))", "select benchmark ( 100, 1 )"):
+        denied(sql, "BENCHMARK")
+    for sql in ("SELECT GET_LOCK('x', 10)", "select get_lock ('x', 0)"):
+        denied(sql, "GET_LOCK")
+
+    # FOR UPDATE / LOCK IN SHARE MODE（以及 MySQL 8 的 FOR SHARE）
+    for sql in ("SELECT * FROM works FOR UPDATE", "select * from works for   update", "SELECT * FROM works\nFOR\nUPDATE",
+                "SELECT * FROM works FOR UPDATE NOWAIT", "SELECT * FROM works FOR UPDATE SKIP LOCKED"):
+        denied(sql, "Locking reads")
+    for sql in ("SELECT * FROM works LOCK IN SHARE MODE", "select * from works lock  in  share  mode", "SELECT * FROM works FOR SHARE"):
+        denied(sql, "Locking reads")
+
+    # 原有规则在注释隔开时同样不被绕过
+    denied("SELECT 1 INTO/**/OUTFILE '/tmp/x'", "File read/write")
+    denied("SELECT /*!50000 LOAD_FILE*/('/etc/passwd')", "File read/write")
+
+    # 正常查询不受影响：只含“长得像”的字样，但不是系统库 / 函数 / 加锁读；原语句原样保留（只补 LIMIT）
+    for sql in (
+        "SELECT name, height FROM actresses WHERE height > 165 LIMIT 10",
+        "SELECT COUNT(*) FROM works WHERE release_year = 2020",
+        "SELECT * FROM works WHERE title LIKE '%sleeping%'",
+        "SELECT systime, mysql_col, w.sys_id FROM works w",
+        "SELECT * FROM av_db.works",
+        "SELECT name FROM actresses /* 身高筛选 */ WHERE height >= 160",
+        "SELECT updated_at FROM works",
+    ):
+        out = prep(sql)
+        assert out == sql or out == sql + "\nLIMIT 50", (sql, out)
 
 
 def test_g_rag_image_description_dedup():
@@ -671,6 +733,7 @@ SCENARIOS = [
     ("D DesktopAgent 截图历史处理", test_d_desktop_screenshot_history),
     ("E DesktopAgent 未应答 tool_calls", test_e_unanswered_tool_calls),
     ("F SQL 加固与超时只读", test_f_sql_hardening),
+    ("F2 SQL 加固（多用户新增规则）", test_f2_sql_hardening_multiuser),
     ("G rag 同源图片描述只展开一次", test_g_rag_image_description_dedup),
     ("H browser_service 幂等关闭", test_h_browser_close_idempotent),
     ("I milvus_client 生命周期与双重检查锁", test_i_milvus_client_lifecycle),

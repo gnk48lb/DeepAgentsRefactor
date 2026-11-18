@@ -2,9 +2,10 @@
 
 查看 / 删除会话。彻底删除（事件日志 + 挂起态 + checkpoint 线程）只走这里；
 聊天里的 /reset 只清上下文，不删事件日志。
+运维脚本不限用户：list 默认列出所有用户的会话（--user 过滤），show / delete 按 id 前缀跨用户解析。
 
 用法：
-    uv run python scripts/manage_sessions.py list
+    uv run python scripts/manage_sessions.py list [--user owner|<user_id前缀>]
     uv run python scripts/manage_sessions.py show <id前缀> [--from N --limit N --types a,b]
     uv run python scripts/manage_sessions.py delete <id前缀> [--yes]
 """
@@ -32,8 +33,9 @@ def format_time(ts: float) -> str:
 
 
 def _resolve(store, ref: str):
+    """运维脚本跨用户解析会话 id / 前缀（聊天链路里的解析永远限定在当前用户自己的会话内）。"""
     try:
-        info = store.resolve_session(ref)
+        info = store.resolve_session_any(ref)
     except ValueError as e:
         print(f"❌ {e}")
         return None
@@ -42,17 +44,50 @@ def _resolve(store, ref: str):
     return info
 
 
-def list_sessions(store, limit: int):
-    active = store.get_active_session_id() if store.count_sessions() else None
-    infos = store.list_sessions(limit=limit)
-    print(f"=== 会话列表（库: {store.path}，共 {store.count_sessions()} 个，显示最近 {len(infos)} 个）===")
+def _resolve_user(store, ref: str):
+    """--user 的取值：owner、完整 user_id 或唯一前缀。返回 user_id；找不到返回 None。"""
+    if ref.strip().lower() == "owner":
+        return "owner"
+    try:
+        user = store.resolve_user(ref)
+    except ValueError as e:
+        print(f"❌ {e}")
+        return None
+    if user is None:
+        print(f"❌ 没有找到用户: {ref}")
+        return None
+    return user.user_id
+
+
+def _user_label(store, user_id: str) -> str:
+    """显示用：owner 原样；其他用户给 id 前 8 位 + 备注。"""
+    if user_id == "owner":
+        return "owner"
+    user = store.get_user(user_id)
+    label = f"（{user.label}）" if user is not None and user.label else ""
+    return f"{user_id[:8]}{label}"
+
+
+def list_sessions(store, limit: int, user_ref: str = ""):
+    user_id = None
+    if user_ref:
+        user_id = _resolve_user(store, user_ref)
+        if user_id is None:
+            return 1
+    infos = store.list_sessions_any(limit=limit, user_id=user_id)
+    total = store.count_sessions(user_id=user_id)
+    # 每个出现的用户各取一次活动会话（这些用户都至少有一个会话，不会触发新建）
+    active = {uid: store.get_active_session_id(user_id=uid) for uid in {i.user_id for i in infos}}
+    scope = f"，用户 {_user_label(store, user_id)}" if user_id else "，全部用户"
+    print(f"=== 会话列表（库: {store.path}{scope}，共 {total} 个，显示最近 {len(infos)} 个）===")
     for info in infos:
-        mark = " [活动]" if info.id == active else ""
+        mark = " [活动]" if info.id == active.get(info.user_id) else ""
         print(
             f"{info.id}{mark}\n"
-            f"  标题: {info.title or '（无标题）'} | 轮数: {info.turns} | 事件: {info.events} | "
+            f"  用户: {_user_label(store, info.user_id)} | 标题: {info.title or '（无标题）'} | 轮数: {info.turns} | 事件: {info.events} | "
             f"最后活跃: {format_time(info.updated_at)} | 创建: {format_time(info.created_at)}"
         )
+    return 0
 
 
 def show_session(store, ref: str, start_seq: int, limit: int, types: str):
@@ -86,7 +121,7 @@ def delete_session(store, ref: str, yes: bool):
         if answer != "yes":
             print("已取消。")
             return 1
-    was_active = info.id == store.get_active_session_id() if store.count_sessions() else False
+    was_active = info.id == store.get_active_session_id(user_id=info.user_id)
     store.delete_session(info.id)
     # checkpoint 线程：用官方同步 SqliteSaver 在 checkpoints.db 上删除（自己开连接，用完关闭）
     try:
@@ -105,6 +140,7 @@ def main():
 
     p_list = sub.add_parser("list", help="列出会话")
     p_list.add_argument("--limit", type=int, default=50, help="最多显示多少个（默认 50）")
+    p_list.add_argument("--user", default="", help="只看某个用户：owner、user_id 或唯一前缀（默认全部用户）")
 
     p_show = sub.add_parser("show", help="查看某个会话的事件")
     p_show.add_argument("id", help="会话 id 或唯一前缀")
@@ -124,8 +160,7 @@ def main():
     store = session_store.get_store()
     try:
         if args.command == "list":
-            list_sessions(store, args.limit)
-            return 0
+            return list_sessions(store, args.limit, args.user)
         if args.command == "show":
             return show_session(store, args.id, args.start_seq, args.limit, args.types)
         return delete_session(store, args.id, args.yes)

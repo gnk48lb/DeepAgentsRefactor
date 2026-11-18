@@ -209,6 +209,24 @@ REFRESH_BM25 = False
 # QQ 回复最大字符数限制
 QQ_MAX_REPLY_CHARS = 10000
 
+
+# ── 多用户（见 README「多用户模式」）──
+def _parse_id_set(raw: str) -> frozenset:
+    """逗号分隔，去空白、去空项。"""
+    return frozenset(p.strip() for p in (raw or "").split(",") if p.strip())
+
+
+# owner = 命中这些平台 openid 的 QQ 用户 + 本地 CLI；其余用户都是 member（没有文件 / 命令 / 桌面 / 浏览器 / 代码能力）。
+# openid 只在当前机器人 AppID 范围内有效：先让主号私聊机器人发 /whoami 取得 ID，再写进 .env 并重启
+OWNER_USER_IDS = _parse_id_set(os.getenv("OWNER_USER_IDS", ""))
+# member 同时在跑的轮数上限（owner 不占用）。至少为 1：0 会让信号量永远阻塞
+MAX_CONCURRENT_MEMBER_TURNS = max(1, int(os.getenv("MAX_CONCURRENT_MEMBER_TURNS", "3")))
+# 新 member 的第一条回复前附带一次
+MEMBER_WELCOME_TEXT = os.getenv("MEMBER_WELCOME_TEXT") or (
+    "你好，这是个人机器人。你的对话内容与长期记忆保存在运营者的电脑上；"
+    "可用 /new 新建会话，/reset 清空当前会话的上下文。"
+)
+
 # Agent 执行 recursion_limit
 AGENT_RECURSION_LIMIT = 60
 

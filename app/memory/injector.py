@@ -23,9 +23,11 @@ def strip_memory_block(text: str) -> str:
 def build_initial_messages(
     user_query: str,
     history_messages: Optional[List[BaseMessage]] = None,
+    *,
+    user_id: str,
 ) -> List[BaseMessage]:
     """
-    构造 deepagents 的初始消息列表。
+    构造 deepagents 的初始消息列表。长期记忆只从 user_id 自己的集合里检索。
 
     前缀静态原则（为了 Gemini 前缀缓存命中）：
     - 绝不在此产生任何 SystemMessage。若在历史中引入 SystemMessage，langchain-google-genai
@@ -35,7 +37,7 @@ def build_initial_messages(
       未检索到记忆时保持纯 user_query。
     """
     messages: List[BaseMessage] = []
-    memories = memory_store.search_memory(user_query, top_k=config.MEMORY_TOP_K)
+    memories = memory_store.search_memory(user_query, top_k=config.MEMORY_TOP_K, user_id=user_id)
     if memories:
         query_content = f"{MEMORY_TAG_OPEN}\n" + "\n".join(memories) + f"\n{MEMORY_TAG_CLOSE}\n{user_query}"
     else:

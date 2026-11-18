@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 from app import config
 import app.infra.mcp_service as mcp_service
 import app.tools.markitdown_tool as markitdown_tool
+from _support import owner_context
 
 
 async def main():
@@ -50,7 +51,8 @@ async def main():
 
         # 4. 执行虚拟路径转换调用
         print("正在调用包装后的 convert_to_markdown 转换 /workspace/test_sample.html ...")
-        res = await tool.ainvoke({"uri": "/workspace/test_sample.html"})
+        with owner_context():           # convert_to_markdown 有 require_owner() 门控
+            res = await tool.ainvoke({"uri": "/workspace/test_sample.html"})
         print("转换结果:")
         print("-" * 50)
         print(res.strip())

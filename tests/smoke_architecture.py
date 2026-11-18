@@ -227,7 +227,7 @@ def test_d_prompt_uniqueness_and_identity():
     # 2. 验证 _identify_agent 准确性
     from langchain_core.messages import SystemMessage
     from app.runtime.cli_logger import _identify_agent
-    from app.agents.prompts import MAIN_AGENT_PROMPT
+    from app.agents.prompts import MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT
     from app.memory.extractor import MEMORY_EXTRACTOR_PROMPT, MEMORY_RECONCILER_PROMPT
     from app.agents.experts import (
         knowledge_agent,
@@ -243,6 +243,7 @@ def test_d_prompt_uniqueness_and_identity():
         return _identify_agent([[SystemMessage(content=p)]], None, None)
 
     assert ident(MAIN_AGENT_PROMPT) == "MainAgent (Orchestrator)"
+    assert ident(MEMBER_MAIN_AGENT_PROMPT) == "MainAgent (Orchestrator)"
     assert ident(MEMORY_EXTRACTOR_PROMPT) == "MemoryExtractor"
     assert ident(MEMORY_RECONCILER_PROMPT) == "MemoryExtractor"
     assert ident(knowledge_agent.PROMPT) == "KnowledgeAgent"
@@ -252,7 +253,7 @@ def test_d_prompt_uniqueness_and_identity():
     assert ident(browser_agent.PROMPT) == "BrowserAgent"
     assert ident(desktop_agent.PROMPT) == "DesktopAgent"
     assert ident(file_agent.PROMPT + file_agent.PROMPT_MARKITDOWN) == "FileAgent"
-    for _p in (media_agent.PROMPT, media_agent.DESCRIPTION, MAIN_AGENT_PROMPT):
+    for _p in (media_agent.PROMPT, media_agent.DESCRIPTION, MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT):
         assert "SQLAgent" not in _p, "合并后不应再出现 SQLAgent"
     assert len(re.findall(r"(?<!如果)你是\s*[A-Za-z]+Agent", media_agent.PROMPT)) == 1
 
@@ -316,6 +317,8 @@ import sys
 import app.config
 import app.utils.text
 import app.utils.images
+import app.utils.context
+import app.utils.identity
 import app.runtime.hitl
 import app.runtime.outbox
 import app.agents.spec

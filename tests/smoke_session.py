@@ -28,6 +28,8 @@ from app.infra.session_store import INBOUND_EVENT_TYPES, SessionStore
 from app.services import session_log
 from app.tools import session_tools
 
+U = "owner"      # 本文件的场景都以 owner 身份操作；跨用户隔离在 smoke_multiuser.py 里测
+
 
 class _Env:
     """临时目录里的 SessionStore；退出时先关连接（含 -wal / -shm）再删目录（Windows 要求）。"""
@@ -55,44 +57,44 @@ def test_a_sessions_basics():
     with _Env() as env:
         s = env.store
         assert s.count_sessions() == 0
-        sid = s.get_active_session_id()                       # 首次无会话 → 自动建默认会话
+        sid = s.get_active_session_id(user_id=U)                       # 首次无会话 → 自动建默认会话
         assert s.count_sessions() == 1 and s.get_session(sid).title == ""
         first = s.get_events(sid)
         assert [e.type for e in first] == ["session_created"], first
-        assert s.get_active_session_id() == sid               # 幂等
+        assert s.get_active_session_id(user_id=U) == sid               # 幂等
 
         s.emit_event(sid, "user_message", {"text": "帮我查一下北京\n今天的天气", "processed_text": "x", "has_image": False})
         assert s.get_session(sid).title == "帮我查一下北京 今天的天气"[: config.SESSION_TITLE_MAX_CHARS]
         s.emit_event(sid, "user_message", {"text": "第二句不应改标题"})
         assert "第二句" not in s.get_session(sid).title
 
-        b = s.create_session("手动标题" + "长" * 50, activate=False)
+        b = s.create_session("手动标题" + "长" * 50, activate=False, user_id=U)
         assert len(b.title) == config.SESSION_TITLE_MAX_CHARS
-        assert s.get_active_session_id() == sid               # activate=False 不动指针
-        s.set_active_session(b.id)
-        assert s.get_active_session_id() == b.id
+        assert s.get_active_session_id(user_id=U) == sid               # activate=False 不动指针
+        s.set_active_session(b.id, user_id=U)
+        assert s.get_active_session_id(user_id=U) == b.id
         try:
-            s.set_active_session("nope")
+            s.set_active_session("nope", user_id=U)
             raise AssertionError("不存在的会话应抛 ValueError")
         except ValueError:
             pass
 
         # 前缀解析
-        assert s.resolve_session(sid).id == sid and s.resolve_session(sid[:8]).id == sid
-        assert s.resolve_session("zzzz") is None and s.resolve_session("") is None
+        assert s.resolve_session(sid, user_id=U).id == sid and s.resolve_session(sid[:8], user_id=U).id == sid
+        assert s.resolve_session("zzzz", user_id=U) is None and s.resolve_session("", user_id=U) is None
         # 构造多义：两个 id 共享前缀
         with s._tx() as c:
-            c.execute("INSERT INTO sessions(id,title,created_at,updated_at) VALUES ('abc111','',1,1)")
-            c.execute("INSERT INTO sessions(id,title,created_at,updated_at) VALUES ('abc222','',1,1)")
+            c.execute("INSERT INTO sessions(id,title,created_at,updated_at,user_id) VALUES ('abc111','',1,1,'owner')")
+            c.execute("INSERT INTO sessions(id,title,created_at,updated_at,user_id) VALUES ('abc222','',1,1,'owner')")
         try:
-            s.resolve_session("abc")
+            s.resolve_session("abc", user_id=U)
             raise AssertionError("多义前缀应抛 ValueError")
         except ValueError:
             pass
-        assert s.resolve_session("abc1").id == "abc111"
-        s.rename_session(sid, "改名")
+        assert s.resolve_session("abc1", user_id=U).id == "abc111"
+        s.rename_session(sid, "改名", user_id=U)
         assert s.get_session(sid).title == "改名"
-        lst = s.list_sessions(limit=2)
+        lst = s.list_sessions(limit=2, user_id=U)
         assert len(lst) == 2 and lst[0].updated_at >= lst[1].updated_at
         assert s.get_session(sid).turns == 2 and s.get_session(sid).events == 3
 
@@ -100,7 +102,7 @@ def test_a_sessions_basics():
 def test_b_events():
     with _Env() as env:
         s = env.store
-        a, b = s.create_session("a").id, s.create_session("b").id
+        a, b = s.create_session("a", user_id=U).id, s.create_session("b", user_id=U).id
         for i in range(5):
             s.emit_event(a, "user_message" if i % 2 == 0 else "assistant_message", {"text": f"a{i}"})
         s.emit_event(b, "user_message", {"text": "b0"})
@@ -119,13 +121,13 @@ def test_b_events():
 def test_c_idempotent_key():
     with _Env() as env:
         s = env.store
-        sid = s.create_session("k").id
+        sid = s.create_session("k", user_id=U).id
         n0 = s.count_events(sid)
         seq = s.emit_event(sid, "tool_call", {"calls": []}, key="msg:1")
         assert seq == n0 + 1
         assert s.emit_event(sid, "tool_call", {"calls": [1]}, key="msg:1") is None
         assert s.count_events(sid) == n0 + 1
-        other = s.create_session("o").id
+        other = s.create_session("o", user_id=U).id
         assert s.emit_event(other, "tool_call", {}, key="msg:1") is not None      # key 只在会话内唯一
         assert s.emit_event(sid, "tool_call", {}, key=None) is not None
         assert s.emit_event(sid, "tool_call", {}, key=None) is not None            # 无 key 不去重
@@ -135,7 +137,7 @@ def test_d_pending_cursor():
     with _Env() as env:
         s = env.store
         assert INBOUND_EVENT_TYPES == ("user_message", "approval")
-        sid = s.create_session("p").id
+        sid = s.create_session("p", user_id=U).id
         assert s.get_pending_events(sid) == [] and s.sessions_with_pending() == []
         s.emit_event(sid, "assistant_message", {"text": "x"})
         s.emit_event(sid, "tool_result", {"text": "x"})
@@ -158,7 +160,7 @@ def test_d_pending_cursor():
 def test_e_turn_state():
     with _Env() as env:
         s = env.store
-        sid = s.create_session("t").id
+        sid = s.create_session("t", user_id=U).id
         assert s.load_turn_state(sid) is None
         big = [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * (1024 * 1024 + 10)}}]
         s.save_turn_state(sid, "原话", big)
@@ -177,44 +179,44 @@ def test_e_turn_state():
 def test_f_search():
     with _Env() as env:
         s = env.store
-        a, b = s.create_session("a").id, s.create_session("b").id
+        a, b = s.create_session("a", user_id=U).id, s.create_session("b", user_id=U).id
         s.emit_event(a, "user_message", {"text": "查一下 Beijing 的天气"})
         s.emit_event(a, "expert_report", {"expert": "MapAgent", "task": "天气", "text": "北京今天晴 25度 100% 湿度_低"})
         s.emit_event(b, "user_message", {"text": "查一下上海的菜谱"})
-        assert len(s.search_events("查一下")) == 2
-        assert len(s.search_events("查一下 天气")) == 1                               # 多关键词 AND
-        assert len(s.search_events("beijing")) == 1                                   # 大小写不敏感
-        assert len(s.search_events("北京 晴")) == 1                                   # 中文
-        assert len(s.search_events("100%")) == 1 and len(s.search_events("%")) == 1   # % 被转义
-        assert len(s.search_events("湿度_低")) == 1 and len(s.search_events("湿度_高")) == 0
-        assert len(s.search_events("_")) == 1                                         # _ 被转义，不当作通配符
-        assert len(s.search_events("查一下", session_id=b)) == 1                      # 限定会话
-        assert s.search_events("", session_id=a) == [] and s.search_events("   ") == []
-        res = s.search_events("查一下", limit=1)
+        assert len(s.search_events("查一下", user_id=U)) == 2
+        assert len(s.search_events("查一下 天气", user_id=U)) == 1                               # 多关键词 AND
+        assert len(s.search_events("beijing", user_id=U)) == 1                                   # 大小写不敏感
+        assert len(s.search_events("北京 晴", user_id=U)) == 1                                   # 中文
+        assert len(s.search_events("100%", user_id=U)) == 1 and len(s.search_events("%", user_id=U)) == 1   # % 被转义
+        assert len(s.search_events("湿度_低", user_id=U)) == 1 and len(s.search_events("湿度_高", user_id=U)) == 0
+        assert len(s.search_events("_", user_id=U)) == 1                                         # _ 被转义，不当作通配符
+        assert len(s.search_events("查一下", session_id=b, user_id=U)) == 1                      # 限定会话
+        assert s.search_events("", session_id=a, user_id=U) == [] and s.search_events("   ", user_id=U) == []
+        res = s.search_events("查一下", limit=1, user_id=U)
         assert len(res) == 1 and res[0].session_id == b                               # 最新优先
-        assert len(s.search_events("北京", types=["user_message"])) == 0
+        assert len(s.search_events("北京", types=["user_message"], user_id=U)) == 0
 
 
 def test_g_reopen_integrity():
     with _Env() as env:
         s = env.store
-        sid = s.create_session("g").id
+        sid = s.create_session("g", user_id=U).id
         for i in range(10):
             s.emit_event(sid, "user_message", {"text": f"中文 {i}"})
         before = [(e.seq, e.type, e.payload) for e in s.get_events(sid, limit=100)]
         env.reopen()
         s2 = env.store
         assert [(e.seq, e.type, e.payload) for e in s2.get_events(sid, limit=100)] == before
-        assert s2.get_active_session_id() == sid
+        assert s2.get_active_session_id(user_id=U) == sid
         assert s2.emit_event(sid, "user_message", {"text": "继续"}) == len(before) + 1
-        assert s2._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert s2._conn.execute("PRAGMA user_version").fetchone()[0] == 2       # schema v2（多用户）
         assert s2._conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
 
 
 def test_h_concurrent_emit():
     with _Env() as env:
         s = env.store
-        sid = s.create_session("h").id
+        sid = s.create_session("h", user_id=U).id
         n_threads, per = 8, 25
         errs = []
 
@@ -236,17 +238,17 @@ def test_h_concurrent_emit():
 def test_i_delete_session():
     with _Env() as env:
         s = env.store
-        a, b = s.create_session("a").id, s.create_session("b").id
+        a, b = s.create_session("a", user_id=U).id, s.create_session("b", user_id=U).id
         s.emit_event(b, "user_message", {"text": "keep"})
         s.save_turn_state(b, "u", [])
-        s.set_active_session(b)
+        s.set_active_session(b, user_id=U)
         assert s.delete_session(b) is True
         assert s.get_session(b) is None and s.get_events(b) == [] and s.load_turn_state(b) is None
-        assert s.search_events("keep") == []
-        assert s.get_active_session_id() == a                                          # 指针回落
+        assert s.search_events("keep", user_id=U) == []
+        assert s.get_active_session_id(user_id=U) == a                                          # 指针回落
         assert s.delete_session("nope") is False
         s.delete_session(a)
-        new = s.get_active_session_id()                                                # 全删后自动建默认会话
+        new = s.get_active_session_id(user_id=U)                                                # 全删后自动建默认会话
         assert new not in (a, b) and s.count_sessions() == 1
 
 
@@ -270,7 +272,7 @@ def _mk_msgs(big=False):
 def test_j_mirror_messages():
     with _Env() as env:
         s = env.store
-        sid = s.create_session("j").id
+        sid = s.create_session("j", user_id=U).id
         base = s.count_events(sid)
         msgs = _mk_msgs()
         n = session_log.mirror_messages(s, sid, msgs)
@@ -290,7 +292,7 @@ def test_j_mirror_messages():
         assert session_log.mirror_messages(s, sid, msgs[2:]) == 0
         assert s.count_events(sid) == base + 3
         # 超长截断
-        sid2 = s.create_session("j2").id
+        sid2 = s.create_session("j2", user_id=U).id
         session_log.mirror_messages(s, sid2, _mk_msgs(big=True))
         rep = [e for e in s.get_events(sid2, limit=100) if e.type == "expert_report"][0].payload
         assert rep.get("truncated") is True and len(rep["text"]) < config.SESSION_EVENT_TEXT_MAX_CHARS + 100, len(rep["text"])
@@ -300,15 +302,19 @@ def test_j_mirror_messages():
         assert session_log.mirror_messages(s, sid, [m]) == 1 and session_log.mirror_messages(s, sid, [m]) == 0
 
 
-def _cfg(thread_id):
-    return {"configurable": {"thread_id": thread_id}}
+def _cfg(thread_id=None, user_id=U):
+    """chat_service 的 _run_config 写进 configurable 的内容：thread_id 可省（省了就取该用户的活动会话），user_id 必须有。"""
+    configurable = {"user_id": user_id}
+    if thread_id:
+        configurable["thread_id"] = thread_id
+    return {"configurable": configurable}
 
 
 def test_k_session_tools():
     with _Env() as env:
         s = env.store
-        a = s.create_session("天气会话").id
-        b = s.create_session("菜谱会话").id                                             # 活动会话 = b
+        a = s.create_session("天气会话", user_id=U).id
+        b = s.create_session("菜谱会话", user_id=U).id                                             # 活动会话 = b
         for i in range(25):
             s.emit_event(a, "user_message", {"text": f"A消息{i} 北京天气"})
         s.emit_event(b, "user_message", {"text": "B消息 红烧肉怎么做"})
@@ -324,58 +330,65 @@ def test_k_session_tools():
         # 会话解析优先级：参数 > RunnableConfig.thread_id > 活动会话
         assert "A消息" in g.invoke({"session_id": a[:8]}, config=_cfg(b))
         assert "A消息" in g.invoke({}, config=_cfg(a))
-        assert "B消息" in g.invoke({})                                                 # 无 config → 活动会话 b
+        assert "B消息" in g.invoke({}, config=_cfg())                                  # 只有 user_id → 该用户的活动会话 b
+        out = g.invoke({"session_id": a})                                              # 没有 user_id：拒绝，不回落到活动会话或 owner
+        assert "无法确定当前用户" in out and "A消息" not in out and "B消息" not in out, out
+        out = g.invoke({}, config={"configurable": {"thread_id": a}})                  # 只有 thread_id 也不行
+        assert "无法确定当前用户" in out and "A消息" not in out, out
         # start_seq<=0 取最新 N 条；>=1 向后切片
-        out = g.invoke({"start_seq": 0, "limit": 3, "session_id": a})
+        out = g.invoke({"start_seq": 0, "limit": 3, "session_id": a}, config=_cfg())
         assert "A消息24" in out and "A消息22" in out and "A消息21" not in out, out
-        out = g.invoke({"start_seq": 3, "limit": 2, "session_id": a})
+        out = g.invoke({"start_seq": 3, "limit": 2, "session_id": a}, config=_cfg())
         assert "#3 " in out and "#4 " in out and "#5 " not in out and "start_seq=5" in out, out
         assert "A消息1 " in out and "A消息2 " in out and "A消息0" not in out, out      # seq1=session_created, seq3=A消息1
         # limit 上限 20
-        out = g.invoke({"start_seq": 1, "limit": 999, "session_id": a})
+        out = g.invoke({"start_seq": 1, "limit": 999, "session_id": a}, config=_cfg())
         assert out.count("\n#") + (1 if "\n#" not in out and "#1 " in out else 0) <= 20, out.count("\n#")
         # types 过滤
-        out = g.invoke({"types": "expert_report", "session_id": b})
+        out = g.invoke({"types": "expert_report", "session_id": b}, config=_cfg())
         assert "expert_report/KnowledgeAgent" in out and "B消息" not in out
         # 单条截断 vs limit=1 放宽
-        out = g.invoke({"types": "expert_report", "limit": 5, "session_id": b})
+        out = g.invoke({"types": "expert_report", "limit": 5, "session_id": b}, config=_cfg())
         assert "start_seq=" in out and len(out) < config.SESSION_TOOL_OUTPUT_MAX_CHARS + 300
         seq = [e for e in s.get_events(b, limit=100) if e.type == "expert_report"][0].seq
-        one = g.invoke({"start_seq": seq, "limit": 1, "session_id": b})
-        short = g.invoke({"start_seq": seq, "limit": 2, "session_id": b})
+        one = g.invoke({"start_seq": seq, "limit": 1, "session_id": b}, config=_cfg())
+        short = g.invoke({"start_seq": seq, "limit": 2, "session_id": b}, config=_cfg())
         assert len(one) > len(short) and len(one) <= config.SESSION_TOOL_OUTPUT_MAX_CHARS + 300, (len(one), len(short))
         # 总输出上限
         for i in range(20):
             s.emit_event(a, "expert_report", {"expert": "X", "task": "t", "text": "数据" * 600})
-        out = g.invoke({"limit": 20, "session_id": a})
+        out = g.invoke({"limit": 20, "session_id": a}, config=_cfg())
         assert len(out) <= config.SESSION_TOOL_OUTPUT_MAX_CHARS + 400, len(out)
         # 异常转文本
-        assert "找不到会话" in g.invoke({"session_id": "nope"})
+        assert "找不到会话" in g.invoke({"session_id": "nope"}, config=_cfg())
         s.close()                                                                       # 底层故障：不抛，转文本
-        out = g.invoke({"session_id": a})
+        out = g.invoke({"session_id": a}, config=_cfg())
         assert "失败" in out, out
 
 
 def test_k2_search_tool():
     with _Env() as env:
         s = env.store
-        a = s.create_session("天气会话").id
-        b = s.create_session("菜谱会话").id
+        a = s.create_session("天气会话", user_id=U).id
+        b = s.create_session("菜谱会话", user_id=U).id
         s.emit_event(a, "expert_report", {"expert": "MapAgent", "task": "天气", "text": "北京今天晴，气温 25 度，适合出门"})
         s.emit_event(b, "user_message", {"text": "红烧肉怎么做"})
         f = session_tools.search_session_history
-        out = f.invoke({"query": "气温"})
+        out = f.invoke({"query": "气温"}, config=_cfg())
         assert a[:8] in out and "天气会话" in out and "MapAgent" in out and "气温" in out, out
         assert b[:8] not in out
-        assert "红烧肉" in f.invoke({"query": "红烧肉"})                                 # 默认跨会话
-        assert "没有找到" in f.invoke({"query": "红烧肉", "session_id": a})                # 限定会话
-        assert "红烧肉" in f.invoke({"query": "红烧肉", "session_id": b[:8]})
-        assert "没有找到" in f.invoke({"query": "火星基地"}) and "换个关键词" in f.invoke({"query": "火星基地"})
-        ov = f.invoke({"query": ""})                                                     # 空 query → 概览
+        assert "红烧肉" in f.invoke({"query": "红烧肉"}, config=_cfg())                                 # 默认跨会话
+        assert "没有找到" in f.invoke({"query": "红烧肉", "session_id": a}, config=_cfg())                # 限定会话
+        assert "红烧肉" in f.invoke({"query": "红烧肉", "session_id": b[:8]}, config=_cfg())
+        assert "没有找到" in f.invoke({"query": "火星基地"}, config=_cfg()) and "换个关键词" in f.invoke({"query": "火星基地"}, config=_cfg())
+        ov = f.invoke({"query": ""}, config=_cfg())                                                     # 空 query → 概览
         assert "天气会话" in ov and "菜谱会话" in ov and "轮" in ov, ov
-        out = f.invoke({"query": "北京 晴", "limit": 99})
+        out = f.invoke({"query": "北京 晴", "limit": 99}, config=_cfg())
         assert a[:8] in out
-        assert "找不到会话" in f.invoke({"query": "x", "session_id": "nope"})
+        assert "找不到会话" in f.invoke({"query": "x", "session_id": "nope"}, config=_cfg())
+        out = f.invoke({"query": "气温"})                                              # 没有 user_id：拒绝，不搜任何会话
+        assert "无法确定当前用户" in out and "气温" not in out, out
+        assert "无法确定当前用户" in f.invoke({"query": ""})
 
 
 SCENARIOS = [

@@ -17,6 +17,7 @@ logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s -
 
 from app.services import chat_service
 from app import config
+from app.utils.identity import Identity, cli_member_identity, owner_identity
 from app.utils.images import guess_mime_type
 
 
@@ -131,7 +132,22 @@ async def main():
     parser = argparse.ArgumentParser(description="GNK48-Agent Chat CLI")
     parser.add_argument("--image", type=str, default=None, help="图片路径或 URL (附带在第一条消息)")
     parser.add_argument("--rebuild", action="store_true", help="强制重建知识库索引")
+    parser.add_argument(
+        "--member",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help="以 member 身份运行（不开 QQ 就能在终端体验 member：没有文件 / 命令 / 桌面 / 浏览器 / 代码能力）；"
+             "NAME 只能由字母、数字、下划线组成。不写则以 owner 身份运行",
+    )
     args = parser.parse_args()
+
+    # 注意用 is not None 判断：--member "" 必须报错，而不是悄悄变成 owner
+    identity: Identity
+    try:
+        identity = cli_member_identity(args.member) if args.member is not None else owner_identity()
+    except ValueError as e:
+        parser.error(str(e))
 
     if args.rebuild:
         config.REFRESH_COLLECTION = True
@@ -141,6 +157,7 @@ async def main():
 
     print("=" * 60)
     print("启动 Chat CLI...")
+    print(f"当前身份：{'管理员 (owner)' if identity.is_owner else f'成员 (member: {identity.user_id})'}")
     print("输入 'exit' 或 'quit' 退出；任务运行中输入 /stop 可中止。")
     print("=" * 60)
 
@@ -180,7 +197,7 @@ async def main():
                         current_img = _local_image_to_data_uri(current_img)
 
                     turn = asyncio.create_task(
-                        chat_service.process_message(text=user_input, image_url=current_img)
+                        chat_service.process_message(text=user_input, image_url=current_img, identity=identity)
                     )
                     stop_sent = _is_stop_like(user_input)
                     if not user_input.startswith("/"):
@@ -200,7 +217,7 @@ async def main():
                     continue
 
                 if line is None:                            # 运行期间读到 EOF：视为 /stop 后退出
-                    reply = await chat_service.process_message(text="/stop")
+                    reply = await chat_service.process_message(text="/stop", identity=identity)
                     if reply is not None:
                         _print_reply(reply)
                     await asyncio.wait({turn}, timeout=config.AGENT_STOP_WAIT_SECONDS)
@@ -216,7 +233,7 @@ async def main():
                 if _is_stop_like(text):
                     stop_sent = True
                 # /stop、/reset、忙提示都由 chat_service 处理
-                reply = await chat_service.process_message(text=text)
+                reply = await chat_service.process_message(text=text, identity=identity)
                 if reply is not None:
                     _print_reply(reply)
 

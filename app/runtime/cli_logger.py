@@ -118,6 +118,14 @@ def _ns_and_thread(metadata: Optional[Dict[str, Any]]) -> tuple:
     return str(md.get("langgraph_checkpoint_ns", "") or ""), str(md.get("thread_id", "") or "")
 
 
+def _user_of(metadata: Optional[Dict[str, Any]]) -> str:
+    """从回调 metadata 取这次 LLM 调用属于哪个用户（chat_service 的 _run_config 把 user_id 写进了 configurable，
+    LangChain 会把 configurable 里的原生类型值带进回调 metadata）。取不到记空串。
+    和 _ns_and_thread 一样，必须在 *_start 阶段取：on_llm_end 的 kwargs 里没有 metadata。"""
+    md = metadata if isinstance(metadata, dict) else {}
+    return str(md.get("user_id", "") or "")
+
+
 def _usage_numbers(usage: Any) -> Dict[str, int]:
     """从 usage_metadata 取四个数值（含缓存读写），拿不到一律记 0"""
 
@@ -384,6 +392,7 @@ class CLIDebugCallbackHandler(BaseCallbackHandler):
             agent_name = _identify_agent(messages, metadata, serialized)
             model_name = _model_name_of(serialized, kwargs)
             ns, thread = _ns_and_thread(metadata)
+            user = _user_of(metadata)
 
             # 与 CLI_DEBUG 解耦：即使不打彩色日志，也要记下 begin 信息供 on_llm_end 计算耗时与落盘
             self._llm_runs[run_id] = {
@@ -391,6 +400,7 @@ class CLIDebugCallbackHandler(BaseCallbackHandler):
                 "model": model_name,
                 "ns": ns,
                 "thread": thread,
+                "user": user,
                 "start": time.perf_counter(),
             }
 
@@ -427,12 +437,14 @@ class CLIDebugCallbackHandler(BaseCallbackHandler):
 
             model_name = _model_name_of(serialized, kwargs)
             ns, thread = _ns_and_thread(metadata)
+            user = _user_of(metadata)
 
             self._llm_runs[run_id] = {
                 "agent": agent_name,
                 "model": model_name,
                 "ns": ns,
                 "thread": thread,
+                "user": user,
                 "start": time.perf_counter(),
             }
 
@@ -493,6 +505,7 @@ class CLIDebugCallbackHandler(BaseCallbackHandler):
                 "model": info.get("model", "unknown-model"),
                 "ns": info.get("ns", ""),
                 "thread": info.get("thread", ""),
+                "user": info.get("user", ""),
                 "run_id": str(run_id),
                 "parent_run_id": str(parent_run_id) if parent_run_id else "",
                 "has_tool_calls": bool(tool_calls),

@@ -15,6 +15,7 @@ from app.memory.guards import (
     validate_statement,
     validate_reconciliation_ops,
 )
+from app.utils.identity import validate_user_id
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -123,9 +124,11 @@ async def _invoke_structured(prompt: str, schema: Type[T]) -> Optional[T]:
         return None
 
 
-async def extract_and_store_memory(user_text: str) -> None:
-    """后台异步执行记忆提取、对账与保存，fail-closed 永不抛异常。"""
+async def extract_and_store_memory(user_text: str, *, user_id: str) -> None:
+    """后台异步执行记忆提取、对账与保存，fail-closed 永不抛异常。记忆只读写 user_id 自己的集合。"""
     try:
+        validate_user_id(user_id)           # 非法 user_id：落入下面的 except，什么都不写
+
         # D1: 输入隔离与门控
         if not user_text or not isinstance(user_text, str):
             return
@@ -178,6 +181,7 @@ async def extract_and_store_memory(user_text: str) -> None:
                 memory_store.recall_similar,
                 s["text"],
                 config.MEMORY_RECALL_TOP_K,
+                user_id=user_id,
             )
             for c in cands:
                 candidates_by_id[c["id"]] = c
@@ -190,6 +194,7 @@ async def extract_and_store_memory(user_text: str) -> None:
                         memory_store.add_memory,
                         s["text"],
                         evidence=s["evidence"],
+                        user_id=user_id,
                     )
                 else:
                     print(f"🧠 [记忆对账] 无候选旧记忆，撤回操作丢弃: {s['text']}")
@@ -241,6 +246,7 @@ async def extract_and_store_memory(user_text: str) -> None:
                     memory_store.add_memory,
                     stmt["text"],
                     evidence=stmt["evidence"],
+                    user_id=user_id,
                 )
             elif op == "UPDATE":
                 if target_id is not None:
@@ -249,6 +255,7 @@ async def extract_and_store_memory(user_text: str) -> None:
                         target_id,
                         stmt["text"],
                         evidence=stmt["evidence"],
+                        user_id=user_id,
                     )
             elif op == "DELETE":
                 if target_id is not None:
@@ -256,6 +263,7 @@ async def extract_and_store_memory(user_text: str) -> None:
                         memory_store.retire_memory,
                         target_id,
                         evidence=stmt["evidence"],
+                        user_id=user_id,
                     )
             elif op == "NONE":
                 print(f"🧠 [记忆对账] {op_info['statement_alias']} 对账判定为 NONE，跳过")

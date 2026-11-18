@@ -25,6 +25,7 @@ from app import config
 from app.agents.prompts import WORKER_BASE_PROMPT
 from app.agents.budget import build_budget_middleware, tool_limit_for
 from app.infra import host_shell
+from app.utils.context import get_request_context, require_owner
 
 NAME = "FileAgent"
 
@@ -198,6 +199,14 @@ def make_workspace_tools(workspace_dir: str) -> list:
         timeout 单位秒，0 表示使用默认超时（较短），确需更久再传（有上限）；超时会终止整个进程树。输出过长只保留开头和结尾。
         列目录、读写、搜索、移动文件请用 ls / read_file / write_file / edit_file / grep / glob / move_file，不要用本工具跑 dir / type / del。
         除少数只读状态查询（如 git status）外，所有命令都会先请求用户授权。"""
+        # 纵深防御：member 的图里本来就没有 FileAgent，这里是第二道保险——没有请求上下文或不是 owner，一律不执行
+        # （守卫放在这个工具函数里，不放进 L1 的 host_shell.run_command：运维脚本与测试要能直接用后者）
+        try:
+            require_owner()
+        except (PermissionError, RuntimeError) as e:
+            ctx = get_request_context()
+            print(f"🚫 [run_host_command] 已拒绝（用户 {ctx.user_id if ctx else '无请求上下文'}）: {e}")
+            return "Error: run_host_command 仅管理员可用，已拒绝执行。"
         if timeout < 0 or timeout > config.HOST_SHELL_MAX_TIMEOUT_SECONDS:
             return (f"Error: timeout 必须在 0~{config.HOST_SHELL_MAX_TIMEOUT_SECONDS} 秒之间"
                     f"（0 表示默认 {config.HOST_SHELL_TIMEOUT_SECONDS} 秒），收到 {timeout}")
