@@ -137,7 +137,7 @@ async def main():
         type=str,
         default=None,
         metavar="NAME",
-        help="以 member 身份运行（不开 QQ 就能在终端体验 member：没有文件 / 命令 / 桌面 / 浏览器 / 代码能力）；"
+        help="以 member 身份运行（不开 QQ 就能在终端体验 member：没有文件 / 命令 / 桌面 / 浏览器能力；代码只能在云端沙箱里跑）；"
              "NAME 只能由字母、数字、下划线组成。不写则以 owner 身份运行",
     )
     args = parser.parse_args()

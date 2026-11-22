@@ -44,7 +44,7 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 1. **KnowledgeAgent**: 知识检索专家，优先检索本地 Milvus 知识库 (`rag`)，无果且具时效性时通过 Tavily 全网搜索 (`web_search`)；时间类问题由主 Agent 通过自己挂载的 get_current_time 就地回答，KnowledgeAgent 不挂载该工具。
 2. **MediaAgent**: 成人影视专家，同时挂载 Neo4j 知识图谱检索 (`av_graph_rag`) 与 MySQL 只读查询 (`execute_sql`)：图谱负责实体 / 合作关系网络与题材标签，数据库负责身高、罩杯、出生年份等精确属性过滤与发行年份统计，复合问题由它自己组合完成。
 3. **MapAgent**: 地理与出行专家，挂载高德地图本地工具（共 12 个高德本地 Tool），支持天气查询、周边检索、路径规划与地理编码。约定：路线、周边搜索、测距的位置参数既可传文字地址也可传'经度,纬度'，工具内部自动解析（文字地址跨城有歧义时会报错要求补城市）；只有 maps_regeocode 必须传坐标。
-4. **CodeAgent**: 代码执行与数据分析沙箱工作台。基于 deepagents 的 `CompiledSubAgent` 模式，挂载 `FilesystemMiddleware`（提供 `ls`、`read_file`、`write_file`、`edit_file`、`glob`、`grep`、`execute` 7 个沙箱工具，故意不含 `delete` 工具）与快捷通道 `execute_python_code`。通过 `/workspace/...` 只读访问用户工作区，沙箱专属可读写会话工作目录为 `/work/...`（脚本、数据与多文件处理），专属交付箱为 `/work/outputs/...`（生成的图表由 `SandboxOutputsMiddleware` 统一按指纹提取并自动推送到模型与用户发件箱）。绘图规范由 Skill `matplotlib-chart` 提供，数据分析规范由 Skill `data-analysis` 提供。沙箱预置中文字体、热启动支持与流式输出截断。
+4. **CodeAgent**: 代码执行与数据分析沙箱工作台。基于 deepagents 的 `CompiledSubAgent` 模式，挂载 `FilesystemMiddleware`（提供 `ls`、`read_file`、`write_file`、`edit_file`、`glob`、`grep`、`execute` 7 个沙箱工具，故意不含 `delete` 工具）与快捷通道 `execute_python_code`。通过 `/workspace/...` 只读访问用户工作区，沙箱专属可读写会话工作目录为 `/work/...`（脚本、数据与多文件处理），专属交付箱为 `/work/outputs/...`（生成的图表由 `SandboxOutputsMiddleware` 统一按指纹提取并自动推送到模型与用户发件箱）。绘图规范由 Skill `matplotlib-chart` 提供，数据分析规范由 Skill `data-analysis` 提供。沙箱预置中文字体、热启动支持与流式输出截断。**owner 用本机 Docker 沙箱，member 用 Modal 云端沙箱**（见 2.4「member 的云端 CodeAgent」），两者的代码路径完全分开：上面这段（`/workspace` 只读访问等）说的是 owner 的 Docker 版。
 5. **BrowserAgent**: 浏览器自动化专家，基于 Playwright/browser-use 操控真实浏览器（可见模式），处理网页端交互。
 6. **FileAgent (HITL)**: 本地文件专家，内置 FilesystemMiddleware + FilesystemBackend + 原生 HITL。提供工具：`ls`/`glob`/`grep`/`read_file` 免授权，`convert_to_markdown`（由 markitdown-mcp 提供，支持富文档转 Markdown），`write_file`/`edit_file`/`create_directory`/`move_file` 需授权，删除 = 移动到 archive_trash 归档；另有自定义工具 `run_host_command`（在用户 Windows 宿主机上执行命令，仅少数只读状态查询如 `git status` 免授权，其余需授权，见 2.10）。文件工具只能在 workspace 工作区内操作；`run_host_command` 不受路径限制（仅以工作区根目录作为 cwd）。转换结果过大时会暂存到 `/_artifacts/large_tool_results/<id>`，FileAgent 用 `read_file` 分页读回。
 7. **DesktopAgent (HITL)**: 桌面操作专家，基于网格坐标截屏、模拟点击与键鼠交互。
@@ -63,13 +63,25 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 | 专家 | owner 图 | member 图 |
 | --- | --- | --- |
 | KnowledgeAgent、MediaAgent、MapAgent | 有 | 有 |
-| CodeAgent | 有（本机 Docker） | 无 |
+| CodeAgent | 有（本机 Docker） | 有（Modal 云端沙箱，需配置令牌；仅在 Modal 可用时） |
 | FileAgent、BrowserAgent、DesktopAgent | 有 | 无 |
 
-- member 永远碰不到：本机 Docker 沙箱及其 `/workspace` 镜像、宿主机命令、桌面、真实浏览器、MCP 的 `desktop` 与 `markitdown` 工具、`workspace/` 目录。member 本阶段没有任何代码执行能力，也绝不会落到本机 Docker 沙箱上。
-- owner 图的构造路径与单用户时代完全等价（7 个专家、顺序、工具、`MAIN_AGENT_PROMPT` 都没变）；member 图使用独立的 `MEMBER_MAIN_AGENT_PROMPT`，其中有【能力边界】一节，要求如实告知做不到读写文件 / 运行代码 / 操作桌面或浏览器。
-- **启动期断言**（失败即阻止启动）：member 图的专家名必须是 Knowledge / Media / Map 的子集，不允许预编译子专家，主管与各声明式子专家的工具都不得含 `run_host_command`、`move_file`、`create_directory`、`convert_to_markdown`、`take_grid_screenshot`、`click_grid_center`、`safe_input_text`、`press_hotkey`、`execute_complex_browser_action`、`execute_python_code`、`execute`、`write_file`、`edit_file`。
+- member 永远碰不到：本机 Docker 沙箱及其 `/workspace` 镜像、宿主机命令、桌面、真实浏览器、MCP 的 `desktop` 与 `markitdown` 工具、`workspace/` 目录。member 的代码只能在 Modal 云端沙箱里跑，绝不会落到本机 Docker 沙箱上。
+- owner 图的构造路径与单用户时代完全等价（7 个专家、顺序、工具、`MAIN_AGENT_PROMPT` 都没变）；member 图使用独立的 `MEMBER_MAIN_AGENT_PROMPT`（带云端 CodeAgent 时用 `MEMBER_MAIN_AGENT_PROMPT_CODE`），其中有【能力边界】一节，要求如实告知做不到读写用户电脑上的文件 / 操作桌面或浏览器。
+- **启动期断言**（失败即阻止启动）：member 图的专家名必须是 Knowledge / Media / Map 再加可选的一个经过验证的 CodeAgent；预编译子专家只允许这一个，且它的工具集（恰为 8 个，不含 `delete`）、后端（默认是云端路由沙箱而不是本机 Docker）与路由（`/skills/` 只读且指向 `skills_member/`、`/_artifacts/` 是内存 state）都严格校验；主管与各声明式子专家的工具都不得含 `run_host_command`、`move_file`、`create_directory`、`convert_to_markdown`、`take_grid_screenshot`、`click_grid_center`、`safe_input_text`、`press_hotkey`、`execute_complex_browser_action`、`execute_python_code`、`execute`、`write_file`、`edit_file`。
 - **纵深防御**：`run_host_command`、`convert_to_markdown`、`execute_complex_browser_action` 与 DesktopAgent 的工具节点都会调用 `require_owner()`，没有请求上下文或不是 owner 一律拒绝并写日志（请求上下文由 `chat_service.wake` 设置，经 `contextvars` 传到 `task` 子专家、线程池里的同步工具与 `asyncio.to_thread`）。
+
+**member 的云端 CodeAgent（阶段 2）**
+- **编译期门控**：member 图是否带 CodeAgent 由静态函数 `modal_sandbox.member_code_status()` 决定，不联网，依次检查：`MODAL_DISABLED` 总开关、`MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` 是否都配了、`modal` 包是否已装、版本是否 ≥ 1.6。任何一项不满足，member 图与阶段 1 完全一致（3 个专家，没有任何代码能力）。它的语义是“可以编译进图”，不是“现在一定能用”：令牌是否有效、镜像是否已发布、Modal 是否可达，要到第一次真的创建沙箱时才知道，那时的失败只会让 member 收到“云端代码沙箱暂时不可用，请稍后再试”，不影响机器人的其他功能。启动时会打印“member 云端 CodeAgent：已启用 / 未启用（原因）”，`/whoami` 也会显示。
+- **永不回退 Docker**：member 路径上任何情况下都不会触达本机 Docker 沙箱（`get_sandbox` 等）与宿主机命令；`ModalRoutedSandbox` 在没有请求上下文、owner、非法 user_id、空 session_id 时一律拒绝。
+- **每个 (用户, 会话) 一个沙箱**，第一次真的要执行时才惰性创建。`/new`、`/switch` 不动它（切走再切回来文件还在）；`/reset` 终止当前会话的沙箱；闲置超过 `MODAL_IDLE_TIMEOUT_SECONDS`（默认 600 秒）由 Modal 自己回收，回收后下一次命令会惰性重建并提示“/work 里之前的文件已不存在”；owner 执行 `/block` 时回收该用户的全部沙箱；关闭服务时全部终止。沙箱最长存活 `MODAL_MAX_LIFETIME_SECONDS`（默认 3600 秒）。
+- **资源与并发护栏**（应用层只有这些，没有按用户的次数或额度）：CPU `(0.25, 2.0)`、内存 `(512, 2048)` MiB；每用户同时最多 2 个沙箱、全局最多 8 个（满了先按 LRU 回收空闲的，全部在忙才拒绝）；单次 exec 默认 120 秒、上限 300 秒（容器里的 `timeout -k 3` 是主超时，客户端 deadline 只是兜底）；创建沙箱整体超时 120 秒；连续 3 次创建失败后 60 秒内直接拒绝新的创建（熔断）。回合上限 `AGENT_TURN_TIMEOUT_SECONDS` 不变。**费用上限要在 Modal 控制台设**（预算上限与 $0 超额限制），那是代码之外的最后一道兜底。
+- **网络与凭证**：沙箱默认可联网（`MODAL_BLOCK_NETWORK=true` 可断网）；不挂 Secret、Volume、端口、PTY；传给沙箱的环境变量只有 `PYTHONUNBUFFERED`、`PYTHONIOENCODING`、`LANG`、`HOME` 四项白名单。Modal 令牌只存在宿主机 `.env`，由 SDK 自己从环境变量读取，`config` 里只有一个布尔值 `MODAL_TOKENS_PRESENT`，不进沙箱、日志、异常文本与审计日志（所有异常文本先脱敏）。
+- **命名镜像**：`gnk48-python-ds:v1`（`MODAL_IMAGE_NAME`），由 `scripts/build_modal_image.py` 手动构建并发布一次，运行时只做 `Image.from_name`，绝不在运行时构建；依赖版本与 Docker 镜像共用 `deploy/sandbox/requirements.txt`。
+- **`/skills/` 对 member 只读**：member 的 CodeAgent 有 `write_file` / `edit_file`，如果 `/skills/` 路由到可写的真实目录，member 就能改写 owner 的 Agent 之后会读的技能文件。所以 member 的技能目录物理分离为 `skills_member/`，并用 `ReadOnlyFilesystemBackend` 包装（写 / 改 / 删 / 上传一律返回只读错误，路径穿越被挡住）；owner 的 `skills/` 不被 member 图引用。
+- **产物**：沿用 `/work/outputs/` 的约定，图片自动发给用户，非图片产物不导出，没有 QQ 文件上传到沙箱。
+- **`/stop`**：member 的 `/stop` 只中断自己这个会话里正在跑的命令（默认“软杀”：只杀沙箱里我们自己起的命令进程、保留 `/work`，失败自动回退为终止沙箱；`MODAL_INTERRUPT_MODE=terminate` 可改为直接终止），不会触发宿主机 / Docker 的进程级终止原语，也不影响 owner 与其他 member。
+- **审计与排查**：`storage/modal_audit.log`（5 MB × 3 轮转）记录创建 / 执行 / 终止 / 拒绝 / 熔断事件，用户与会话 ID 一律哈希，命令截断到 500 字符，不记录输出内容与任何凭证。每个沙箱打标签 `svc=gnk48`、`role=member-code`、`u=<用户哈希>`、`s=<会话哈希>`；没有启动时孤儿清理，手动用 `scripts/manage_modal_sandboxes.py list / kill`（见 5.5）。
 
 **数据隔离**
 - 会话库（`sessions.db`）里每个会话归属一个 `user_id`，所有会话相关接口都带必填的 `user_id`：会话列表、`/switch` 的序号与前缀、活动会话指针、全文搜索、会话回溯工具都只在用户自己的会话里查找；别人的会话（哪怕猜中完整 id）对你等同于不存在，回复与“不存在”无法区分。
@@ -86,13 +98,13 @@ L0 Config & Utils    (app/config.py, app/utils/*)
   - `/new [标题]`：新建并切换到新会话，旧会话原样保留（含挂起的授权）。
   - `/sessions [N]`：列出自己最近 N 个会话（默认 10，最多 30），标出 `[当前]` 与 `[待授权]`。
   - `/switch <序号|id前缀>`：序号按 `/sessions` 的顺序，只在自己的会话里解析；切到有待授权操作的会话时会附上授权内容。
-  - `/reset`：只清空当前会话的对话上下文（含挂起的授权），**事件日志保留**；**只有 owner 的 `/reset` 才会重置本机 Docker 沙箱**（沙箱仍是进程级全局，`/new`、`/switch` 不会动它）。任务正在运行时，`/reset` 会先中止你自己的当前任务（回复以“已先中止正在运行的任务。”开头），再执行清空。
-  - `/stop`：中止**你自己**正在运行的任务（语义见 2.11「中止（/stop）语义」）。它不等用户锁，任务运行期间也能立即生效；CLI 里任务运行期间同样可以输入 `/stop`。没有任务在跑时只回复“当前没有正在运行的任务。”。宿主机命令与 Docker 沙箱的终止原语是进程级全局的，只有 owner 的 `/stop` 才会触发；member 的 `/stop` 只取消自己那一轮，不会波及任何人。
-  - `/whoami`：纯文本显示平台 ID、内部 ID、身份（管理员 / 成员）与 CodeAgent 后端（owner 为本机 Docker，member 为未启用）。
+  - `/reset`：只清空当前会话的对话上下文（含挂起的授权），**事件日志保留**；**只有 owner 的 `/reset` 才会重置本机 Docker 沙箱**（Docker 沙箱仍是进程级全局，`/new`、`/switch` 不会动它）；member 的 `/reset` 只终止自己当前会话的云端沙箱。任务正在运行时，`/reset` 会先中止你自己的当前任务（回复以“已先中止正在运行的任务。”开头），再执行清空。
+  - `/stop`：中止**你自己**正在运行的任务（语义见 2.11「中止（/stop）语义」）。它不等用户锁，任务运行期间也能立即生效；CLI 里任务运行期间同样可以输入 `/stop`。没有任务在跑时只回复“当前没有正在运行的任务。”。宿主机命令与 Docker 沙箱的终止原语是进程级全局的，只有 owner 的 `/stop` 才会触发；member 的 `/stop` 只取消自己那一轮（并中断自己会话里的云端命令），不会波及任何人。
+  - `/whoami`：纯文本显示平台 ID、内部 ID、身份（管理员 / 成员）与 CodeAgent 后端（owner 为本机 Docker，member 为云端沙箱（Modal）或未启用）。
 - 仅 owner（非 owner 发送时固定回复“该命令仅管理员可用”，不泄露任何信息）：
   - `/users`：列出序号、备注、id 前 8 位、最后活跃时间、会话数与 `[已封禁]` 标记；序号按首次出现的先后排，保持稳定。备注是留给你记数字 QQ 号或昵称的。
   - `/label <序号|id前缀> <备注>`：给用户加备注（最长 40 字符，留空清除）。
-  - `/block <序号|id前缀>` / `/unblock <序号|id前缀>`：封禁 / 解封。被封的 member 对任何输入都只会收到“你当前无法使用本机器人。”，不会进入任何流程；封禁时会顺手中止他正在跑的任务。owner 不可被封禁。
+  - `/block <序号|id前缀>` / `/unblock <序号|id前缀>`：封禁 / 解封。被封的 member 对任何输入都只会收到“你当前无法使用本机器人。”，不会进入任何流程；封禁时会顺手中止他正在跑的任务，并回收他的全部云端沙箱。owner 不可被封禁。
   - 管理命令与 `/new`、`/switch` 一样在用户锁内处理：你自己有任务在跑时会收到忙提示，先 `/stop` 再发。
 
 **隐私与可见性提示**
@@ -148,6 +160,7 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 
 ### 2.9 代码沙箱设计取舍与演进路径
 系统在代码沙箱的设计上遵循严格的权责分离、纵深防御与平滑演进原则：
+- **两个后端，两条完全分开的路径**：owner 的 CodeAgent 用本机 Docker 沙箱（下面各条描述的就是它）；member 的 CodeAgent 用 Modal 云端沙箱（`app/infra/modal_sandbox.py`，**已在阶段 2 实现**，见 2.4「member 的云端 CodeAgent」）。Docker 沙箱仍然只属于 owner，member 路径上永远不会触达它。
 - **从 v1 单一执行器到 Phase 2 沙箱工作台**：
   - **v1 设计**：初期坚持单一 `execute_python_code` 快速通道，保证代码执行轻量、低认知负荷与零文件副作用。
   - **Phase 2 演进需求**：随着复杂数据分析、批量文本处理与长链任务增多，模型需要编写多文件模块、局部微调脚本（`edit_file`）、运行 Linux 命令行工具（`rg` / `jq` / `unzip` / `file` / `tree` 等）以及排查环境状态，单一 Python 字符串执行已无法满足需求。
@@ -167,7 +180,7 @@ L0 Config & Utils    (app/config.py, app/utils/*)
   - 生成的新图表通过 `publish_images()` 实现双份投递：一份推送到接入层图片发件箱（Outbox）直发给用户，一份压缩编码为低分辨率预览 block 反哺给模型进行图表自检；同一指纹在会话生命周期内不重复投递。
 
 ### 2.10 宿主机命令与沙箱的分工
-`FileAgent` 通过自定义工具 `run_host_command` 在用户的 Windows 宿主机上执行命令（`cmd.exe /d /s /c`），`CodeAgent` 仍在 Docker 沙箱里执行。主管按“要不要联网 / 要不要碰用户这台电脑 / 要不要真正改 workspace”选择：
+`FileAgent` 通过自定义工具 `run_host_command` 在用户的 Windows 宿主机上执行命令（`cmd.exe /d /s /c`），owner 的 `CodeAgent` 仍在本机 Docker 沙箱里执行（member 的 CodeAgent 在 Modal 云端沙箱里，没有 FileAgent 也碰不到宿主机，见 2.4）。主管按“要不要联网 / 要不要碰用户这台电脑 / 要不要真正改 workspace”选择：
 
 | 场景 | 联网 | 碰宿主机 | 改 workspace | 派给 |
 | --- | --- | --- | --- | --- |
@@ -192,7 +205,7 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 | `getEvents` | `get_events` / `get_last_events` / `get_pending_events` |
 | `emitEvent` | `SessionStore.emit_event`（带 `key` 时幂等） |
 | `wake(session_id)`（无载荷） | `chat_service.wake`：载荷全部从事件日志里读 |
-| Sandbox / Tools | 已满足，未改动；沙箱仍是进程级全局，不按会话隔离 |
+| Sandbox / Tools | 已满足，未改动；owner 的 Docker 沙箱仍是进程级全局，member 的云端沙箱按 (用户, 会话) 隔离 |
 
 **两个库文件（都在被 git 忽略的 `storage/`，路径可由 `SESSIONS_DB_PATH` / `CHECKPOINT_DB_PATH` 覆盖）**
 - `sessions.db`（标准库 `sqlite3`，WAL，schema v2）：`sessions`（含归属用户 `user_id` 与处理游标 `processed_seq`）、`events`（只追加的事件日志）、`turn_state`（授权挂起期间暂存的用户原话与已生成的图片）、`meta`（每个用户一个活动会话指针，键为 `active_session_id:<user_id>`）、`users`（用户、备注、封禁、首次 / 最后出现）。旧库首次打开时在一个 `BEGIN IMMEDIATE` 事务里自动迁移（幂等、非破坏性）：旧会话全部归 `owner`，旧指针键改名为 `active_session_id:owner`；**schema v2 是单向的**，旧版代码打不开 v2 库，回滚只能靠备份（升级前备份 `storage/sessions.db*`）。会话相关接口都带必填的 `user_id`；事件级接口（`emit_event`、`get_events`、`mark_processed`、`save_turn_state` ……）仍只认 `session_id`，调用方必须已经通过带 `user_id` 的接口拿到了会话。
@@ -210,7 +223,7 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 
 **中止（/stop）语义**
 - 取消范围：一轮普通对话（含 Y/N 授权恢复）跑在 `chat_service` 自己创建的独立 task 里，每个用户各有一个句柄（`_current_turns`，键为 `user_id`）；`/stop` 只取消**发送者自己**的那个 task，不会取消调用方（NoneBot handler / CLI 主 task），更不会波及别的用户；斜杠命令在该用户的锁内同步执行，不可被 `/stop` 取消。顺序是先 cancel 再终止进程（反过来的话，被杀进程的“失败结果”会让图再往前走一步）。
-- 同时终止的副作用（**仅 owner 的 `/stop`**）：`host_shell.kill_all_running()` 杀掉所有在跑的宿主机命令的整个进程树，`sandbox.interrupt_sandbox()` 杀掉 Docker 沙箱里沙箱用户的全部进程（不销毁容器、不清 `/work`）。这两个终止原语是进程级全局的，而宿主机命令与沙箱只有 owner 能用，所以 member 的 `/stop` 绝不触发它们（否则会杀掉 owner 正在跑的命令）。asyncio 的 cancel 只放弃 await、杀不死线程，所以这两步对 owner 是必须的；线程里的其它同步工具（rag、SQL、图谱检索等）会自然跑完，结果被丢弃。
+- 同时终止的副作用（**仅 owner 的 `/stop`**）：`host_shell.kill_all_running()` 杀掉所有在跑的宿主机命令的整个进程树，`sandbox.interrupt_sandbox()` 杀掉 Docker 沙箱里沙箱用户的全部进程（不销毁容器、不清 `/work`）。这两个终止原语是进程级全局的，而宿主机命令与沙箱只有 owner 能用，所以 member 的 `/stop` 绝不触发它们（否则会杀掉 owner 正在跑的命令）。member 的云端命令改由 `modal_sandbox.interrupt_session_nowait(user_id, session_id)` 中断：只中断它自己那个会话的沙箱，起守护线程、立即返回；回合因超时 / 递归上限 / 异常失败时也会同样中断（`/stop` 引起的失败不重复）。asyncio 的 cancel 只放弃 await、杀不死线程，所以这两步对 owner 是必须的；线程里的其它同步工具（rag、SQL、图谱检索等）会自然跑完，结果被丢弃。
 - 不回滚：已经点过的击、已写入的文件、已跑完的命令都不回滚，`/stop` 的回复里会明说。
 - 被中止的那条请求返回 `None`：`plugins/chat.py` 对 `None` 直接 return，所以原消息不会再多发一条回复，`/stop` 自己的回复才是确认；CLI 也不会打印“(空)”。
 - 日志与游标：事件日志追加 `turn_failed{reason:"user_stop"}`，其余未处理事件写 `turn_abandoned`，处理游标照常推进，锁释放，下一条消息正常处理。悬空的 `task` 调用由 deepagents 默认的 `PatchToolCallsMiddleware` 在下一轮开头补一条 “…was cancelled…” 的 ToolMessage（由 O2 钉死）。
@@ -220,7 +233,7 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 - member 排队等并发名额期间被 `/stop`：直接取消排队中的那一轮，名额不泄漏。
 
 **`/reset` 与脚本删除的区别**
-- `/reset`：只清上下文（删 checkpoint 线程 + 挂起态；owner 还会重置沙箱），事件日志保留并追加 `session_reset`。
+- `/reset`：只清上下文（删 checkpoint 线程 + 挂起态；owner 会重置 Docker 沙箱，member 会终止当前会话的云端沙箱），事件日志保留并追加 `session_reset`。
 - `uv run python scripts/manage_sessions.py delete <id前缀> [--yes]`：彻底删除（事件日志 + 挂起态 + checkpoint 线程），不可恢复。另有 `list [--user owner|<user_id前缀>]`（默认列出所有用户的会话，显示所属用户）、`show <id前缀> [--from N --limit N --types a,b]`。运维脚本不限用户：`show` / `delete` 按 id 前缀跨用户解析会话（聊天链路里的解析永远限定在当前用户自己的会话内）。
 
 **嵌套 checkpoint 清理**：DesktopAgent 截图的 base64 会让子专家的嵌套 checkpoint 迅速膨胀，而一轮正常结束后它们不会再被读取。每轮**正常结束**时清理 `checkpoint_ns != ''` 的行（`CHECKPOINT_PRUNE_NESTED`，默认开启）；失败 / 超时 / 挂起时不清理，根命名空间永不清理，也不调用 `aprune()`。
@@ -253,7 +266,9 @@ DeepAgentsRefactor/
 │   ├── infra/                # L1: 基础设施与外设服务
 │   │   ├── models.py         # LLM / VLM / 向量模型 / 重排器惰性单例
 │   │   ├── milvus_client.py  # Milvus 客户端单例工厂
-│   │   ├── sandbox.py        # Docker Python 沙箱代码执行环境
+│   │   ├── sandbox.py        # Docker Python 沙箱代码执行环境（只属于 owner）
+│   │   ├── modal_sandbox.py  # Modal 云端沙箱：ModalSandbox / 池（上限、驱逐、熔断）/ 按请求上下文路由 / 审计日志 / member_code_status 编译期门控（member 的 CodeAgent，`modal` 惰性导入）
+│   │   ├── modal_image.py    # Modal 命名镜像的纯定义（apt / pip 列表、环境变量、字体自检、build_image）；由 scripts/build_modal_image.py 使用
 │   │   ├── host_shell.py     # 宿主机命令运行器 / 环境变量白名单 / 免授权判定（FileAgent run_host_command）
 │   │   ├── session_store.py  # 会话 / 事件日志 / 挂起态 / 每用户活动会话指针 / users 表（标准库 sqlite3，sessions.db，schema v2）
 │   │   ├── checkpointer.py   # LangGraph checkpoint 的 AsyncSqliteSaver 打开 / 关闭 / 嵌套命名空间清理（checkpoints.db）
@@ -278,15 +293,15 @@ DeepAgentsRefactor/
 │   │   ├── session_tools.py  # 主 Agent 的会话记录回溯工具（get_session_events / search_session_history，只读，只读当前用户自己的会话）
 │   │   ├── media_tools.py    # 媒体图谱检索工具
 │   │   ├── sql_tools.py      # MySQL 查询工具
-│   │   ├── code_tools.py     # Python 代码执行沙箱工具
+│   │   ├── code_tools.py     # Python 代码执行沙箱工具（owner 的 Docker 版 execute_python_code + member 的云端版 build_member_tools）
 │   │   ├── browser_tools.py  # 网页自动化浏览工具
 │   │   ├── markitdown_tool.py# FileAgent 专属 MarkItDown 工具包装
 │   │   └── amap/             # 高德地图本地 Tool 实现与契约快照
 │   ├── agents/               # L4: 智能体编排与专家定义
 │   │   ├── spec.py           # 声明式 ExpertSpec 数据结构
 │   │   ├── budget.py         # 专家工具调用预算（软 / 硬两级停止条件）
-│   │   ├── prompts.py        # 主 Agent 提示词（owner 的 MAIN_AGENT_PROMPT、member 的 MEMBER_MAIN_AGENT_PROMPT）与唯一的 WORKER_BASE_PROMPT
-│   │   ├── skills.py         # Skills 虚拟文件系统 Backend 路由
+│   │   ├── prompts.py        # 主 Agent 提示词（owner 的 MAIN_AGENT_PROMPT、member 的 MEMBER_MAIN_AGENT_PROMPT / 带云端 CodeAgent 的 MEMBER_MAIN_AGENT_PROMPT_CODE）与唯一的 WORKER_BASE_PROMPT
+│   │   ├── skills.py         # Skills 虚拟文件系统 Backend 路由（含 member 只读的 ReadOnlyFilesystemBackend 与 skills_member/ 的路由）
 │   │   ├── orchestrator.py   # owner / member 两张主图的构建与多专家编排（member 图编译期不含任何宿主机路径）
 │   │   └── experts/          # 7 个垂直领域子专家实现
 │   │       ├── knowledge_agent.py
@@ -312,14 +327,21 @@ DeepAgentsRefactor/
 │   ├── login_setup.py        # 浏览器自动化持久化登录引导脚本
 │   ├── manage_memory.py      # Milvus 长期记忆管理工具 (list/delete/restore，--user 选择操作谁的记忆)
 │   ├── manage_sessions.py    # 会话管理工具 (list/show/delete，list 支持 --user；彻底删除会话与其 checkpoint)
+│   ├── build_modal_image.py  # 构建并发布 Modal 云端沙箱镜像，并在临时沙箱里验收（手动运行；--check-only 只验收）
+│   ├── manage_modal_sandboxes.py # 手动管理 Modal 云端沙箱：list / kill --all / kill --user <哈希前缀>
 │   └── migrate_to_mysql.py   # 数据迁移至 MySQL
-├── skills/                   # deepagents 官方 Skills 目录
+├── skills/                   # deepagents 官方 Skills 目录（owner 用）
 │   └── matplotlib-chart/     # Matplotlib 绘图规范技能
+├── skills_member/            # member 的 CodeAgent 用的技能（云端沙箱版，物理分离、只读）
+│   ├── matplotlib-chart/
+│   └── data-analysis/
 ├── tests/                    # 测试用例
 │   ├── fixtures/amap/        # 高德工具契约与 Golden 样本数据
 │   ├── live_amap_golden.py   # 高德在线 Golden 数据集比对测试
+│   ├── live_modal.py         # Modal 真机验收与实测（只由用户运行，需要真实令牌，会产生少量费用；不带 --live 什么都不做）
 │   ├── run_smoke.py          # 一键运行全部离线冒烟测试
 │   ├── _support.py           # 测试公用辅助（owner_context() / member_context()）
+│   ├── _fake_modal.py        # 忠实的 FakeModal（复刻真实 SDK 的签名与会让天真实现出错的行为），所有 Modal 相关测试靠它离线运行
 │   ├── smoke_amap_contract.py# 高德工具快照与契约冒烟测试
 │   ├── smoke_amap_http.py    # 高德工具 HTTP 异常与密钥脱敏测试
 │   ├── smoke_architecture.py # 架构分层、规范与契约冒烟测试
@@ -330,6 +352,7 @@ DeepAgentsRefactor/
 │   ├── smoke_knowledge.py    # 知识库离线冒烟测试
 │   ├── smoke_markitdown_e2e.py # MarkItDown 端到端离线冒烟测试
 │   ├── smoke_memory.py       # 长期记忆两阶段召回对账、版本化与按用户隔离离线冒烟测试
+│   ├── smoke_modal.py        # Modal 云端沙箱离线冒烟测试（配置与门控、池与熔断、执行 / 中止语义、路由与隔离、镜像与管理脚本、member CodeAgent 越权尝试）
 │   ├── smoke_multiuser.py    # 多用户：身份与上下文、会话库 v2 迁移与隔离、回溯工具隔离、上下文传播、纵深防御离线冒烟测试
 │   ├── smoke_orchestrator.py # 主管编排（owner / member 双图）与专家装配冒烟测试
 │   ├── smoke_session.py      # 会话存储 / 事件日志镜像 / 回溯工具离线冒烟测试
@@ -365,6 +388,7 @@ uv sync
 - `SESSIONS_DB_PATH` / `CHECKPOINT_DB_PATH` / `CHECKPOINT_PRUNE_NESTED`（可选）：会话库、checkpoint 库路径与嵌套 checkpoint 清理开关，默认 `storage/sessions.db`、`storage/checkpoints.db`、开启，见 2.11。
 - `OWNER_USER_IDS`（多用户）：逗号分隔的平台 openid，命中的 QQ 用户与本地 CLI 是 owner（管理员），其余是 member。先用主号私聊机器人发 `/whoami` 取得平台 ID，再写进来并重启；openid 与机器人 AppID 绑定，见 2.4。
 - `MAX_CONCURRENT_MEMBER_TURNS`（可选，默认 3）：member 同时处理的轮数上限，owner 不占用；`MEMBER_WELCOME_TEXT`（可选）：新 member 的第一条回复前附带一次的欢迎语。
+- `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`（可选）：Modal 云端沙箱令牌（member 的 CodeAgent 用）。**不配置则 member 没有代码能力，行为与阶段 1 一致**；令牌只放在 `.env` 里，绝不会传进沙箱。另有一组 `MODAL_*` 旁路可调项（总开关 `MODAL_DISABLED`、镜像名、CPU / 内存、空闲超时、每用户 / 全局沙箱上限、是否断网、中止方式 `MODAL_INTERRUPT_MODE`、审计日志路径……），默认值与说明见 `.env.example` 与 2.4；费用上限要在 Modal 控制台设。
 
 #### LLM 角色与 Magpie 网关
 
@@ -400,7 +424,7 @@ uv sync
 - **MySQL**:
   - 存储女优与作品结构化关系数据，供 `MediaAgent` 的 `execute_sql` 工具精确筛选查询。MySQL 需用户自备（`deploy/docker-compose.yml` 中不包含）。建议为该工具分配专用只读账号（如 `GRANT SELECT ON av_db.* TO 'readonly'@'%'`），并在 `.env` 中配置对应的 `MYSQL_USER` 与 `MYSQL_PASSWORD`。
 - **Docker Python 沙箱**:
-  - 供 `CodeAgent` 启动轻量容器 (`python-ds:latest`) 安全运行数据分析与绘图代码。
+  - 供 owner 的 `CodeAgent` 启动轻量容器 (`python-ds:latest`) 安全运行数据分析与绘图代码（member 的 CodeAgent 用 Modal 云端沙箱，见 2.4 与 5.5，不需要本机 Docker）。
   - 镜像基于 `python:3.13-slim`，预置了完整的数据科学常用依赖（pandas, numpy, matplotlib, seaborn, scipy, scikit-learn, openpyxl, xlrd, tabulate, pyyaml, sympy 等）与开箱即用的中文字体（Noto Sans CJK SC/JP），并预热了 matplotlib 字体缓存以实现亚秒级热启动。
   - 可通过 `docker build -t python-ds:latest deploy/sandbox` 构建镜像。
   - > **注意**：修改 `deploy/sandbox/Dockerfile`、`requirements.txt` 或 `matplotlibrc` 后，需重新执行镜像构建命令；若已有常驻沙箱容器正在运行，需重启机器人进程或等待空闲 TTL（`SANDBOX_IDLE_TTL_SECONDS=1800`）触发容器自动重建后方可生效。
@@ -426,7 +450,7 @@ uv sync
 # 启动普通交互式控制台（以 owner 身份，行为与单用户时代一致）
 uv run python main.py
 
-# 以 member 身份体验（不开 QQ 就能在终端测试：没有文件 / 命令 / 桌面 / 浏览器 / 代码能力，NAME 为字母数字下划线）
+# 以 member 身份体验（不开 QQ 就能在终端测试：没有文件 / 命令 / 桌面 / 浏览器能力；代码只能在云端沙箱里跑，NAME 为字母数字下划线）
 uv run python main.py --member alt1
 
 # 首条消息附带图片
@@ -478,6 +502,30 @@ uv run python main.py --rebuild
 ```
 
 `--rebuild` 会删除 `knowledge` 集合（不影响媒体库和记忆库），从 `data/source/` 全量重新建库并重新拟合 BM25。代价是所有片段都会重新调用 Embedding API，比重刷 BM25 慢且费额度。
+
+### 5.5 构建 Modal 镜像与管理云端沙箱（member 的 CodeAgent）
+先在 `.env` 里配好 `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`（Modal 控制台 Settings → API Tokens），并在控制台设好预算上限与 $0 超额限制。
+
+```bash
+# 构建并发布命名镜像（只需一次；要几分钟，会产生少量费用，运行前会要求确认；--yes 跳过确认）
+uv run python scripts/build_modal_image.py
+
+# 只做验收（不构建、不发布）。这也是判断“镜像到底发布了没有”的唯一方式：运行时的 Image.from_name 是惰性的，
+# 镜像不存在要等第一次创建沙箱失败才知道
+uv run python scripts/build_modal_image.py --check-only
+
+# 列出 / 终止云端沙箱（只处理带 svc=gnk48 标签的；只显示对象 id 与哈希后的标签；删除类操作默认要确认）
+uv run python scripts/manage_modal_sandboxes.py list
+uv run python scripts/manage_modal_sandboxes.py kill --all
+uv run python scripts/manage_modal_sandboxes.py kill --user <list 里显示的用户哈希前缀>
+
+# 真机验收与实测（只由你运行；不带 --live 什么都不做；--slow 多等几分钟测空闲回收）
+uv run python tests/live_modal.py --live
+```
+- 镜像验收会在一个临时沙箱里（创建参数与运行时一致，结束后一定终止）逐项检查：Python 版本、root 与 `/work`、全部库可导入、`pip freeze` 与 `deploy/sandbox/requirements.txt` 的固定版本一致、命令行工具齐全、matplotlib 环境变量、中文与负号出图、公网（仅 `MODAL_BLOCK_NETWORK` 为假时，失败只警告）。
+- **镜像内容变了就升 tag**（如 `gnk48-python-ds:v2`）并改 `.env` 里的 `MODAL_IMAGE_NAME`，不要原地覆盖 `:v1`；正在运行的沙箱不受影响，但新旧行为混用时很难排查。
+- 没有启动时孤儿清理（同一台机器上可能同时跑着另一个进程，启动时杀“看起来没人管”的沙箱会误杀它的沙箱）：进程被强杀时云端沙箱最多存活 `MODAL_MAX_LIFETIME_SECONDS`，用上面的脚本提前清理；第一周留意 Modal 控制台的用量。
+- **走系统代理的机器要额外装一个包**：Modal 的 gRPC 走代理时需要 `python-socks`，缺了它 SDK 会报 `ConnectionError: Could not connect to the Modal server.`（真因藏在异常链里，本项目的报错会附带打出来）。装法：`uv add 'modal[api-proxy-support]'`（等价于 `uv pip install 'python-socks[asyncio]'`），装进依赖而不是只装进虚拟环境——`uv sync` 会把只装进虚拟环境的包清掉。**没有系统代理的机器（机房里的 Linux，例如 Oracle 云主机）不需要这个包，Modal 会直接连。** 实在装不上、或你就是不想走系统代理，就在 `.env` 里设 `MODAL_DISABLE_API_PROXY=1` 改为直连——Modal 的 SDK 会自动读这个变量，机器人与脚本都生效。
 
 ---
 
@@ -532,25 +580,27 @@ uv run python main.py --rebuild
 uv run python tests/run_smoke.py
 ```
 
-测试包含以下 16 个离线测试套件：
+测试包含以下 17 个离线测试套件（Modal 相关的全部靠 `tests/_fake_modal.py` 的 FakeModal 离线运行：不联网、不读 `.env`、不调用真实 Modal；用户机器上 `.env` 里即使有真实令牌，结果也一致，因为测试自己控制 `config.MODAL_*`）：
 1. `tests/smoke_architecture.py`：分层单向依赖、语法禁令、空 `__init__`、提示词单例、专家规格、轻量隔离导入、无 Key 安全导入与 MCP 路径校验（8 个场景）。
 2. `tests/smoke_file_agent.py`：FileAgent 离线冒烟测试（含 MarkItDown 路径安全拦截、越界隔离、HITL 恢复映射以及 `run_host_command` 的工具白名单、免授权、批准/拒绝、绕过变体与授权提示内容等 23 个场景；`run_host_command` / `convert_to_markdown` 现在有 `require_owner()` 门控，场景运行器里统一套 `owner_context()`，断言不变）。
-3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试（2 个场景）。
+3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试；阶段 2 新增 member 的 `skills_member/` 规范与禁用词检查、`ReadOnlyFilesystemBackend`（写 / 改 / 删 / 上传全部返回只读错误且磁盘上没有任何变化、读类方法仍可用）与经 `CompositeBackend` 的路径穿越检查。
 4. `tests/smoke_amap_contract.py`：高德地图 12 个本地工具契约与 Schema 快照测试（5 个场景）。
 5. `tests/smoke_amap_http.py`：高德工具 HTTP 异常与密钥脱敏测试（13 个场景）。
-6. `tests/smoke_chat_service.py`：以生产同款 `AsyncSqliteSaver` + `SessionStore` 驱动的服务层测试，覆盖多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复、`/reset`、图片轮不提取记忆，以及重启恢复、多会话 `/new` `/sessions` `/switch`、崩溃遗留、事件日志镜像、嵌套 checkpoint 清理、`/reset` 保留日志与 `wake` 幂等消费，以及 `/stop`（O1 慢模型中止、O2 子专家工具中止与悬空 tool_calls 补 cancelled、O3 空闲 `/stop`、O4 忙提示与忙时 `/reset`、O5 授权恢复阶段被中止、O6 终止原语在 cancel 之后被触发）；多用户新增 P1–P14（owner 与 member 各用各的图、不同用户互不阻塞与同用户忙提示、会话 / `/switch` 越权与“不存在”不可区分、member 的 `/reset` 不碰沙箱、管理命令仅 owner 与封禁、`/whoami`、欢迎语只出现一次、member 并发上限、缺图失败即关闭、identity 校验、多用户崩溃遗留、启动提示、`wake` 设置请求上下文、`init_service` 编译双图与 `shutdown_service` 中止所有人并清空状态）与 Q1–Q4（member 的 `/stop` 只中止自己、宿主机 / 沙箱终止原语只有 owner 的 `/stop` 才触发、owner 的 `/stop` 不中止 member、`/block` 与关闭服务时中止所有人）（38 个场景）。
+6. `tests/smoke_chat_service.py`：以生产同款 `AsyncSqliteSaver` + `SessionStore` 驱动的服务层测试，覆盖多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复、`/reset`、图片轮不提取记忆，以及重启恢复、多会话 `/new` `/sessions` `/switch`、崩溃遗留、事件日志镜像、嵌套 checkpoint 清理、`/reset` 保留日志与 `wake` 幂等消费，以及 `/stop`（O1 慢模型中止、O2 子专家工具中止与悬空 tool_calls 补 cancelled、O3 空闲 `/stop`、O4 忙提示与忙时 `/reset`、O5 授权恢复阶段被中止、O6 终止原语在 cancel 之后被触发）；多用户新增 P1–P14（owner 与 member 各用各的图、不同用户互不阻塞与同用户忙提示、会话 / `/switch` 越权与“不存在”不可区分、member 的 `/reset` 不碰沙箱、管理命令仅 owner 与封禁、`/whoami`、欢迎语只出现一次、member 并发上限、缺图失败即关闭、identity 校验、多用户崩溃遗留、启动提示、`wake` 设置请求上下文、`init_service` 编译双图与 `shutdown_service` 中止所有人并清空状态）与 Q1–Q4（member 的 `/stop` 只中止自己、宿主机 / 沙箱终止原语只有 owner 的 `/stop` 才触发、owner 的 `/stop` 不中止 member、`/block` 与关闭服务时中止所有人）；阶段 2 新增 R1–R7（替换 `modal_sandbox` 模块属性来观察钩子：member 的 `/reset` 终止当前会话的云端沙箱且不碰 Docker、member 的 `/stop` 只中断自己会话的云端命令且不走进程级终止原语、失败的回合中断 member 沙箱而 owner 不调用、`/block` 回收云端沙箱、关闭服务时 `shutdown_pool` 先于 MCP 且互不连累、启动横幅与 `/whoami`、启动提示文案）（共 45 个场景）。
 7. `tests/smoke_session.py`：`SessionStore` 建表 / 活动指针 / 标题 / 前缀解析、事件追加与幂等 key、处理游标、`turn_state`（含 ≥1MB 发件箱）、搜索、关闭重开、并发 emit、`delete_session`，以及 `session_log.mirror_messages` 与两个回溯工具（接口都带 `user_id`，回溯工具缺 `user_id` 时拒绝）（12 个场景）。
 8. `tests/smoke_knowledge.py`：知识库建库、pending 增量入库、混合检索、长期记忆与 Reranker 阈值/降级离线冒烟测试（6 个场景）。
 9. `tests/smoke_memory.py`：长期记忆两阶段召回对账、版本化演进、代码护栏、输入隔离、fail-closed、多线程并发与平滑迁移离线冒烟测试（9 个场景）；多用户新增 10–12：每用户一个集合的命名 / 惰性创建 / 互相检索不到 / 跨用户 id 的 supersede、retire、restore、purge 失败，提取器与注入器按用户，`CLEAR_MEMORY_ON_STARTUP` 清空全部集合（共 12 个场景）。
-10. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（A–D 针对 owner 图，含主管时间 / 会话回溯工具与专家预算装配；多用户新增 E–H：owner 仍是 7 个专家、member 恰为 Knowledge / Media / Map、启动期断言对 13 个黑名单工具逐个注入主管 / 声明式子专家并拒绝、member 构建从不读取 desktop / markitdown MCP 工具、`MEMBER_MAIN_AGENT_PROMPT` 不含任何宿主机相关词）（共 8 个场景）。
+10. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（A–D 针对 owner 图，含主管时间 / 会话回溯工具与专家预算装配；多用户新增 E–H：owner 仍是 7 个专家、member 恰为 Knowledge / Media / Map、启动期断言对 13 个黑名单工具逐个注入主管 / 声明式子专家并拒绝、member 构建从不读取 desktop / markitdown MCP 工具、`MEMBER_MAIN_AGENT_PROMPT` 不含任何宿主机相关词）；阶段 2 新增 H2 / H3（带 CodeAgent 的 member 提示词，`MAIN_AGENT_PROMPT` 的 sha256 不变且禁用 CodeAgent 的 member 提示词与阶段 1 逐字相同）、I（启用 CodeAgent 的 member 图；任何一种不可用都回到 3 个专家）、F2（预编译子专家的严格例外：逐项破坏构建物都拒绝，13 个黑名单工具照样拒绝）、G2（启用 CodeAgent 时仍不碰 Docker 与宿主机）。文件顶部固定 `MODAL_DISABLED=true`，让 A–H 在有真实令牌的机器上也不受影响（共 13 个场景）。
 11. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Neo4j图约束确保、图片编码与自检、Anthropic thinking 保留、浏览器 provider 选择与授权提示 URL 转义，以及多用户新增的 SQL 加固（系统库、`SLEEP(` / `BENCHMARK(` / `GET_LOCK(`、加锁读各自拒绝，注释写法绕不过）等 19 个场景）。
 12. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、超预算宿主机命令不弹授权、生产递归上限下失控保护等 19 个场景）。
-13. `tests/smoke_sandbox.py`：Docker 沙箱架构契约与防护离线冒烟测试（含配置参数校验、单例跨调用复用与 TTL 超时重建、执行超时防护、输出洪泛头尾截断、多模态产物解析与安全防御、Docker 未启动友好引导、只读挂载降级与软链接防御、BaseSandbox 与 CompositeBackend 抽象基类契约、资源释放幂等性、并发串行化、code_tools 工具层与 Outbox 旁路集成、P0 命令包装与输出上限、O 超时细分保留状态、P 客户端缓存与 clamp、Q 指纹去重、R 沙箱工作台装配、S 多模态中间件与 T `interrupt` 不抢沙箱锁（`/stop`）等 20 个场景）。
+13. `tests/smoke_sandbox.py`：Docker 沙箱架构契约与防护离线冒烟测试（含配置参数校验、单例跨调用复用与 TTL 超时重建、执行超时防护、输出洪泛头尾截断、多模态产物解析与安全防御、Docker 未启动友好引导、只读挂载降级与软链接防御、BaseSandbox 与 CompositeBackend 抽象基类契约、资源释放幂等性、并发串行化、code_tools 工具层与 Outbox 旁路集成、P0 命令包装与输出上限、O 超时细分保留状态、P 客户端缓存与 clamp、Q 指纹去重、R 沙箱工作台装配、S 多模态中间件与 T `interrupt` 不抢沙箱锁（`/stop`）、U owner 的 `execute_python_code` 描述（字节级 sha256）与工具集在阶段 2 之后不变等 21 个场景）。
 14. `tests/smoke_models.py`：模型角色默认 provider、Gemini 回退、未知 provider、缺 key 作用域、惰性单例与 thinking 文本隔离测试（5 个场景，构造过程不访问网络）。
 15. `tests/smoke_host_shell.py`：宿主机命令运行器测试（环境变量白名单、编码回退、免授权精确匹配、基础运行、子进程环境与 stdin、超时杀进程树、脱离孙进程不挂住、截断与洪泛硬上限、审计日志，仅 Windows 的专项用例，以及 H11 `kill_all_running`（`/stop` 终止在跑命令、之后新命令不受影响），共 11 个场景）。
 16. `tests/smoke_multiuser.py`：多用户改造离线冒烟测试（23 个场景）：身份与请求上下文（平台 id 格式 / 末尾换行 / 冒充 `owner`、`cli-`，`require_*` 失败即关闭）、会话库 v1→v2 迁移（数据归 owner、指针迁移、幂等、中途失败整体回滚）与用户隔离、users 表、回溯工具只读自己的会话、请求上下文穿过 `task` 子专家 / 线程池 / `asyncio.to_thread` 且并发互不串、`run_host_command` / `convert_to_markdown` / `execute_complex_browser_action` / DesktopAgent 工具节点在 member 与无上下文时一律拒绝、LLM 指标记录带 `user` 字段、QQ 插件只放行好友私聊（群 @ / 频道 / 频道私信忽略且日志限频，openid 格式不合法忽略，owner 的 openid 归一为 owner）。
 
-此外还提供 `tests/live_sandbox.py` 真机验收测试套件（包含 18 项端到端用例，需在已启动 Docker 守护进程的环境下执行 `uv run python tests/live_sandbox.py --live` 运行；慢测试需追加 `--slow` 参数）。
+17. `tests/smoke_modal.py`：Modal 云端沙箱离线冒烟测试（24 个场景）：S FakeModal 自检（`returncode` 在 `wait()` 之前访问抛错、兜底到点返回 -1 且静默、没有 `kill`、未知参数 `TypeError`、同名异常不继承内建……）、A 真实 SDK 表面（已安装 `modal` 时核对签名，没装就 SKIP；反方向检查 FakeModal 不接受真实 SDK 不认识的参数）、B 配置夹紧与 `member_code_status` 各分支与惰性导入、C 创建参数与环境白名单、D 池 / 租约 / 驱逐 / 上限、E 退出码与超时判定 / 不重试 / 重建、F 注入各类异常都不抛、G 路径规则、H 产物收集、I 软杀逻辑（伪造 `/proc`）与中止 / 关闭、J 熔断 / 创建超时 / 脱敏、K 路由与 `BaseSandbox` 契约（异步与线程池两条路径都拿得到上下文，没带上下文的线程 fail-closed）、L 审计日志、M 镜像定义与两个脚本、N 静态扫描（AST）、O member 的 `execute_python_code` 工具、P 提示词与描述的事实核对、K2 驱动真实编译的 member CodeAgent 做越权尝试、Q 真机验收脚本不带 `--live` 时完全离线。
+
+此外还提供 `tests/live_modal.py` 真机验收脚本（**不在一键运行里**，需要真实 Modal 令牌与已发布的镜像，会产生少量 Modal 费用；不带 `--live` 只打印用法；`uv run python tests/live_modal.py --live [--slow]`，把终端里 `=== MEASUREMENTS ===` 那一整块复制出来用来决定 `MODAL_INTERRUPT_MODE` 等默认值）与 `tests/live_sandbox.py` 真机验收测试套件（包含 18 项端到端用例，需在已启动 Docker 守护进程的环境下执行 `uv run python tests/live_sandbox.py --live` 运行；慢测试需追加 `--slow` 参数）。
 
 `tests/live_magpie.py` 是独立的 Magpie 协议探针，覆盖文本、工具轮次、普通图片、工具结果内图片和 browser_use 结构化输出。它不会启动真实浏览器/Desktop，也不会执行真实工具；只有显式设置 `RUN_MAGPIE_LIVE=1` 后运行 `uv run python tests/live_magpie.py` 才会访问网关，且不会加入离线 smoke 或 CI。
 
@@ -573,16 +623,21 @@ uv run python tests/run_smoke.py
 13. **免批 git 命令在不可信仓库里可能执行代码**: `git status` / `git diff` 等免授权命令可能经仓库配置（如 `core.fsmonitor`、外部 diff 驱动）执行代码；不要让 workspace 指向不可信仓库，或把相关条目从 `HOST_SHELL_AUTO_APPROVE_COMMANDS` 中移除。
 14. **进程树清理有边界**: `taskkill /T` 杀不到父进程已退出的孙进程；超时后遗留的后台进程不会被清理。
 15. **授权提示可能发不出去**: QQ 若拒收含“像域名”的文本（如命令里的 `a.b`），授权提示可能发不出，此时用 `/reset` 兜底。
-16. **沙箱是进程级全局，不按会话隔离**: `/new`、`/switch` 不动 Docker 沙箱，所以不同会话共用同一个 `/work`；只有 owner 的 `/reset` 会重置沙箱。沙箱只属于 owner，member 本阶段没有任何代码执行能力。
+16. **owner 的 Docker 沙箱是进程级全局，不按会话隔离**: `/new`、`/switch` 不动 Docker 沙箱，所以 owner 的不同会话共用同一个 `/work`；只有 owner 的 `/reset` 会重置它。Docker 沙箱只属于 owner；member 的云端沙箱按 (用户, 会话) 隔离，member 的 `/reset` 只重置当前会话的那一个（见 2.4）。
 17. **根命名空间 checkpoint 不清理**: 只清理子专家的嵌套命名空间（见 2.11）；`checkpoints.db` 会随对话轮数持续增长，需要时用 `scripts/manage_sessions.py delete` 删除整个会话。
 18. **刚挂起即崩溃会丢授权前已生成的图片**: 挂起态（用户原话与已生成图片）在授权提示发出的同一轮收尾时才落库；若进程恰好在 checkpoint 落盘之后、挂起态写入之前崩溃，授权仍可恢复，但授权前已生成的图片会丢失。
 19. **事件时间戳是写入时间**: 事件日志里的 `ts` 是事件写入日志的时间，不是原始发生时间（镜像发生在每轮收尾，启动恢复时补镜像）。
-20. **`/stop` 不能杀线程**: `/stop` 只放弃异步等待，并（仅 owner 的 `/stop`）终止宿主机命令的进程树与 Docker 沙箱里的进程；跑在 executor 线程里的 rag、SQL、图谱检索等同步工具会自然跑完，结果被丢弃。
+20. **`/stop` 不能杀线程**: `/stop` 只放弃异步等待，并（仅 owner 的 `/stop`）终止宿主机命令的进程树与 Docker 沙箱里的进程（member 的 `/stop` 只中断自己会话的云端命令）；跑在 executor 线程里的 rag、SQL、图谱检索等同步工具会自然跑完，结果被丢弃。
 21. **桌面操作无法在 `/stop` 瞬间刹住**: 已发往桌面 MCP 服务的那一步（最多一步）仍可能执行；已执行的点击、按键等副作用不回滚。物理急停仍是 pyautogui 的 FAILSAFE（鼠标移到屏幕左上角）。
 22. **授权恢复阶段被 `/stop` 后仍可能处于待授权**: 回 `Y` 之后、专家还在跑时发 `/stop`，图里的授权中断仍然保留（实测 `has_pending_interrupts` 为 `True`），`/stop` 的回复会再附上授权内容与“回复 Y 重试 / N 放弃 / 或 /reset 清空”。授权前已经执行完的那部分操作不回滚，回 `Y` 重试可能让同一操作再执行一次，请先确认现状。
-23. **member 的数据与资源边界（多用户）**: 知识库（Milvus `knowledge`）、媒体库（Neo4j / MySQL）的内容对所有成员可见；会话、事件日志、挂起授权、长期记忆按用户隔离，但全部明文存放在运营者电脑的 `storage/` 下，运营者可以读到所有人的对话（欢迎语里会告知）。member 没有任何文件 / 命令 / 桌面 / 浏览器 / 代码能力，也不能触碰 `workspace/`。
+23. **member 的数据与资源边界（多用户）**: 知识库（Milvus `knowledge`）、媒体库（Neo4j / MySQL）的内容对所有成员可见；会话、事件日志、挂起授权、长期记忆按用户隔离，但全部明文存放在运营者电脑的 `storage/` 下，运营者可以读到所有人的对话（欢迎语里会告知）。member 没有文件 / 命令 / 桌面 / 浏览器能力，也不能触碰 `workspace/`；**member 的代码与其中的数据会发到 Modal 云端处理（沙箱默认可联网）**，想告知朋友可以在 `.env` 的 `MEMBER_WELCOME_TEXT` 里自己加一句。
 24. **openid 与机器人 AppID 绑定**: `OWNER_USER_IDS` 里的 ID 只在当前 AppID 范围内有效；换 AppID，或在沙箱 / 正式环境之间切换后，要重新用 `/whoami` 取得 ID。`OWNER_USER_IDS` 为空时 QQ 上没有 owner（本地 CLI 始终是 owner）。
 25. **member 排队没有超时与提示**: 超过 `MAX_CONCURRENT_MEMBER_TURNS` 的 member 会静默排队等名额（排队期间可 `/stop` 取消），最坏情况下等待时间约为“排在前面的轮数 × 单轮时长”。
 26. **管理命令与普通命令共用用户锁**: owner 自己有任务在跑时，`/users`、`/label`、`/block`、`/unblock`、`/whoami` 也会得到忙提示，先 `/stop` 再发。
 27. **MediaAgent 的 SQL 仍用 `.env` 里的 MySQL 账号**: 虽然只放行单条 SELECT 并拒绝系统库 / 延迟与锁函数 / 加锁读，账号本身仍是你配置的那个（默认 `root`，启动会警告）；建议改用只读专用账号。SQL 校验按文本匹配，字符串字面量里恰好出现被拒绝的词也会被拒（宁可误拒）。
 28. **schema v2 单向**: 会话库升级后旧版代码打不开；升级前备份 `storage/sessions.db*`。
+29. **云端沙箱的费用上限只能在 Modal 控制台设**: 应用层没有按用户的次数或额度限制，只有资源与并发护栏（每用户 2 个、全局 8 个、CPU / 内存上限、单次 exec 超时、熔断）；控制台里的预算上限与 $0 超额限制是代码之外的最后一道兜底。
+30. **进程被强杀时云端沙箱会残留**: 没走正常关闭流程（`kill -9`、断电）时，云端沙箱最多存活 `MODAL_MAX_LIFETIME_SECONDS`（默认 3600 秒），用 `scripts/manage_modal_sandboxes.py list / kill` 提前清理；没有启动时孤儿清理（会误杀同一台机器上另一个进程的沙箱）。
+31. **云端沙箱的 `/work` 会丢**: 闲置超过 `MODAL_IDLE_TIMEOUT_SECONDS` 被 Modal 回收、`/reset`、以及软杀失败回退为终止沙箱时，`/work` 里的文件都会丢失；下一次命令会惰性重建并提示。第一条代码请求有冷启动延迟。
+32. **中止方式的实测结论（2026-11-22，`tests/live_modal.py --live`）**: `MODAL_INTERRUPT_MODE` 保持默认 `soft`。软杀耗时约 2 秒，**沙箱与 `/work` 都保留，之后的 exec 通道连续三轮都正常**；`terminate` 更快（约 0.34 秒）但沙箱没了、`/work` 丢失、重建还要约 4.5 秒，所以默认不改成 `terminate`。另外实测确认：`terminate` 之后读流是**静默结束**，但 `wait()` 会抛 `NotFoundError`（代码已按“沙箱被回收”处理）；exec 超时到点时 `wait()` 返回 `-1` 且不抛异常；**内存超限杀掉进程之后，Modal 很快会把整个沙箱一起回收**，`/work` 随之丢失（不只是杀进程）。冷启动约 5.6 秒、热调用约 2.3 秒。
+33. **云端沙箱镜像更新需手动重建并升 tag**: 镜像内容变了就升 tag（如 `:v2`）、改 `MODAL_IMAGE_NAME`，不要原地覆盖；运行时代码从不构建镜像。

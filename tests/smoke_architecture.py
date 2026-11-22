@@ -227,7 +227,7 @@ def test_d_prompt_uniqueness_and_identity():
     # 2. 验证 _identify_agent 准确性
     from langchain_core.messages import SystemMessage
     from app.runtime.cli_logger import _identify_agent
-    from app.agents.prompts import MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT
+    from app.agents.prompts import MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT_CODE
     from app.memory.extractor import MEMORY_EXTRACTOR_PROMPT, MEMORY_RECONCILER_PROMPT
     from app.agents.experts import (
         knowledge_agent,
@@ -253,9 +253,13 @@ def test_d_prompt_uniqueness_and_identity():
     assert ident(browser_agent.PROMPT) == "BrowserAgent"
     assert ident(desktop_agent.PROMPT) == "DesktopAgent"
     assert ident(file_agent.PROMPT + file_agent.PROMPT_MARKITDOWN) == "FileAgent"
-    for _p in (media_agent.PROMPT, media_agent.DESCRIPTION, MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT):
+    assert ident(code_agent.MEMBER_PROMPT) == "CodeAgent", "member 的云端 CodeAgent 提示词要能被 cli_logger 识别"
+    assert ident(MEMBER_MAIN_AGENT_PROMPT_CODE) == "MainAgent (Orchestrator)"
+    for _p in (media_agent.PROMPT, media_agent.DESCRIPTION, MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT,
+               MEMBER_MAIN_AGENT_PROMPT_CODE, code_agent.MEMBER_PROMPT, code_agent.MEMBER_DESCRIPTION):
         assert "SQLAgent" not in _p, "合并后不应再出现 SQLAgent"
     assert len(re.findall(r"(?<!如果)你是\s*[A-Za-z]+Agent", media_agent.PROMPT)) == 1
+    assert code_agent.MEMBER_PROMPT.count("你是 CodeAgent") == 1, "member 的 CodeAgent 提示词里 “你是 CodeAgent” 恰好一次"
 
 
 def test_e_expert_spec_table():
@@ -296,6 +300,9 @@ def test_e_expert_spec_table():
     assert "delete" not in code_agent.SANDBOX_FS_TOOLS
     assert "execute" in code_agent.SANDBOX_FS_TOOLS
     assert "read_file" in code_agent.SANDBOX_FS_TOOLS
+    # member 的云端 CodeAgent（阶段 2）
+    assert callable(code_agent.build_member_code_agent_runnable) and hasattr(code_agent, "MemberCodeAgentBuild")
+    assert isinstance(code_agent.MEMBER_DESCRIPTION, str) and isinstance(code_agent.MEMBER_PROMPT, str)
 
     # MapAgent 校验：工具名顺序需与 tools_snapshot.json 一致
     assert map_agent.SPEC.name == "MapAgent"
@@ -333,8 +340,10 @@ import app.infra.session_store
 import app.infra.checkpointer
 import app.tools.session_tools
 import app.services.session_log
+import app.infra.modal_sandbox
+import app.infra.modal_image
 
-forbidden = ["app.infra.models", "app.infra.milvus_client", "app.knowledge", "app.memory"]
+forbidden = ["app.infra.models", "app.infra.milvus_client", "app.knowledge", "app.memory", "modal"]
 loaded = [m for m in forbidden if any(name == m or name.startswith(m + ".") for name in sys.modules)]
 assert not loaded, f"轻量导入泄漏了受限模块: {loaded}"
 """

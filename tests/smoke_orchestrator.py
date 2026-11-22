@@ -16,12 +16,18 @@ tests/smoke_orchestrator.py
 不需要真实 API Key / 网络:模型客户端用占位 key 构造,构造时不会发请求。
 """
 import asyncio
+import contextlib
+import importlib.metadata
+import importlib.util
 import os
 import sys
 import traceback
 
 for _k in ("GEMINI_API_KEY", "SILICON_FLOW_API_KEY", "HUGGINGFACEHUB_API_TOKEN", "AMAP_API_KEY", "MAGPIE_API_KEY"):
     os.environ[_k] = "dummy"   # 显式覆盖:本测试绝不应使用真实 key
+# 本机 .env 里可能有真实的 Modal 令牌：load_dotenv 不覆盖已有的环境变量，所以这一行能压过它。
+# 否则 member 图会多出 CodeAgent，A–H 全红。启用 CodeAgent 的场景（I / F2 / G2）自己用 monkeypatch + FakeModal。
+os.environ["MODAL_DISABLED"] = "true"
 for _role in ("WORKER_LLM", "ORCHESTRATOR_LLM", "KNOWLEDGE_LLM", "INGESTION_VLM", "BROWSER_VLM", "DESKTOP_VLM"):
     os.environ[f"{_role}_PROVIDER"] = "magpie"
     os.environ.pop(f"{_role}_MODEL", None)
@@ -29,9 +35,14 @@ for _role in ("WORKER_LLM", "ORCHESTRATOR_LLM", "KNOWLEDGE_LLM", "INGESTION_VLM"
 from langchain_core.tools import tool  # noqa: E402
 from langgraph.checkpoint.memory import MemorySaver  # noqa: E402
 
-from app.infra import mcp_service, models  # noqa: E402
+from app import config  # noqa: E402
+from app.infra import mcp_service, models, modal_sandbox  # noqa: E402
+from app.infra import sandbox as docker_sandbox  # noqa: E402
 from app.agents import orchestrator  # noqa: E402
-from app.agents.prompts import MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT  # noqa: E402
+from app.agents.experts import code_agent  # noqa: E402
+from app.agents.skills import SKILLS_DIR, SKILLS_MEMBER_DIR, ReadOnlyFilesystemBackend  # noqa: E402
+from _fake_modal import FakeModal  # noqa: E402
+from app.agents.prompts import MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT_CODE  # noqa: E402
 
 EXPECTED_ORDER = ["KnowledgeAgent", "MediaAgent", "MapAgent", "CodeAgent",
                   "BrowserAgent", "FileAgent", "DesktopAgent"]
@@ -74,7 +85,7 @@ def _build():
         prompt = kwargs.get("system_prompt")
         if prompt is MAIN_AGENT_PROMPT:
             _captured.update(kwargs)
-        elif prompt is MEMBER_MAIN_AGENT_PROMPT:
+        elif prompt is MEMBER_MAIN_AGENT_PROMPT or prompt is MEMBER_MAIN_AGENT_PROMPT_CODE:
             _captured_member.update(kwargs)
         else:
             raise AssertionError("未知的主图 system_prompt")
@@ -224,8 +235,8 @@ def test_f_startup_assertion():
     reached = []
     real_subs, real_create = orchestrator._member_subagents, orchestrator.create_deep_agent
 
-    def poisoned():
-        subs = real_subs()
+    def poisoned(code=None):
+        subs = real_subs(code)
         subs[0]["tools"] = [*subs[0]["tools"], _dummy_tool("run_host_command")]
         return subs
 
@@ -248,6 +259,7 @@ def test_g_member_build_never_touches_host_paths():
 
     patched = [
         (orchestrator.code_agent, "build_code_agent_runnable"),
+        (orchestrator.code_agent, "build_member_code_agent_runnable"),     # 禁用状态下它也不应被调用
         (orchestrator.file_agent, "build_file_agent_runnable"),
         (orchestrator.desktop_agent, "build_desktop_agent_subgraph"),
         (orchestrator.markitdown_tool, "build_tools"),
@@ -277,6 +289,273 @@ def test_h_member_prompt():
         assert word in p, f"member 提示词应保留 {word!r}"
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 阶段 2：member 图带云端 CodeAgent（Modal 用 FakeModal 注入；A–H 针对 MODAL_DISABLED=true 的状态）
+# ══════════════════════════════════════════════════════════════════════════════
+
+# 阶段 1 的基线哈希（M0 在改动前算出）：MAIN_AGENT_PROMPT 一个字节都不能变；
+# 阶段 1 的 MEMBER_MAIN_AGENT_PROMPT 把占位句换回台北例句之后必须与它逐字相同（证明只改了那一句）
+_MAIN_PROMPT_SHA256 = "f9882a12a8c96ea5e98bef04a9cb678ac26664d3f7150aef4c2f013930f42816"
+_STAGE1_MEMBER_PROMPT_SHA256 = "153f528c668e82c74f5c4fbdde905b3ba571a7f9ebf60b73fde5b0fde514076a"
+_NEUTRAL_ADDRESS = "用户当前位置在（此处写用户给出的具体地址），请搜索附近的菜市场"
+_TAIPEI_ADDRESS = "用户当前位置在台北市信义区市府路1号，请搜索附近的菜市场"
+_CODE_TOOL_NAMES = {"execute_python_code", "ls", "read_file", "write_file", "edit_file", "glob", "grep", "execute"}
+_CODE_FORBIDDEN_WORDS = ("FileAgent", "DesktopAgent", "BrowserAgent", "workspace", "宿主机", "Docker")
+
+
+@contextlib.contextmanager
+def _code_enabled(**cfg):
+    """让 member_code_status() 为真：不禁用、有令牌、modal 已装（没装 / 版本不对就补丁），Modal 用 FakeModal 注入。"""
+    saved = {k: getattr(config, k) for k in ("MODAL_DISABLED", "MODAL_TOKENS_PRESENT", *cfg)}
+    config.MODAL_DISABLED, config.MODAL_TOKENS_PRESENT = False, True
+    for k, v in cfg.items():
+        setattr(config, k, v)
+    real_spec, real_version = importlib.util.find_spec, importlib.metadata.version
+    if not modal_sandbox.member_code_status()[0]:
+        importlib.util.find_spec = lambda name, *a, **k: object() if name == "modal" else real_spec(name, *a, **k)
+        importlib.metadata.version = lambda name: "1.6.4" if name == "modal" else real_version(name)
+    fake = FakeModal()
+    fake.publish_default_image()
+    modal_sandbox.set_modal_module(fake)
+    try:
+        assert modal_sandbox.member_code_status() == (True, "")
+        yield fake
+    finally:
+        modal_sandbox.set_modal_module(None)
+        importlib.util.find_spec, importlib.metadata.version = real_spec, real_version
+        for k, v in saved.items():
+            setattr(config, k, v)
+
+
+def _build_member_capturing():
+    """编译 member 图，返回 (图, 专家名元组, create_deep_agent 收到的参数, member CodeAgent 构建物或 None)。"""
+    captured, built = {}, []
+    real_create, real_build = orchestrator.create_deep_agent, code_agent.build_member_code_agent_runnable
+
+    def spy_create(*args, **kwargs):
+        captured.update(kwargs)
+        return _real_create(*args, **kwargs)
+
+    def spy_build(*args, **kwargs):
+        built.append(real_build(*args, **kwargs))
+        return built[-1]
+
+    orchestrator.create_deep_agent, code_agent.build_member_code_agent_runnable = spy_create, spy_build
+    try:
+        agent, experts = orchestrator._build_member_agent(MemorySaver())
+    finally:
+        orchestrator.create_deep_agent, code_agent.build_member_code_agent_runnable = real_create, real_build
+    return agent, experts, captured, (built[0] if built else None)
+
+
+def test_h2_member_prompt_with_code():
+    """H2 MEMBER_MAIN_AGENT_PROMPT_CODE：含识别短语与各段落，允许 CodeAgent / 沙箱，不含其余宿主机相关词；两个变体都没有真实地址。"""
+    p, base = MEMBER_MAIN_AGENT_PROMPT_CODE, MEMBER_MAIN_AGENT_PROMPT
+    assert p is not base and p != base and len(p) > len(base)
+    assert "你是一个多智能体系统的主 Agent" in p
+    for word in ("【能力边界】", "不要尝试委派", "CodeAgent", "沙箱", "【图文分离】", "【严格数据边界】", "<long_term_memory>",
+                 "KnowledgeAgent", "MediaAgent", "MapAgent", "get_current_time", "search_session_history", "get_session_events"):
+        assert word in p, f"member(CodeAgent) 提示词应含 {word!r}"
+    for word in _CODE_FORBIDDEN_WORDS:
+        assert word not in p, f"member(CodeAgent) 提示词不应出现 {word!r}"
+    assert p.index("【过程不可见】") < p.index("【图文分离】") < p.index("【长期记忆】"), "图文分离在过程不可见之后、长期记忆之前"
+    assert "MapAgent、CodeAgent 等" in p and "不要向用户提及沙箱内部的文件路径" in p
+    for variant in (p, base):
+        assert "台北市信义区市府路1号" not in variant and _NEUTRAL_ADDRESS in variant
+    assert "台北市信义区市府路1号" in MAIN_AGENT_PROMPT, "owner 的提示词继续保留它"
+    for word in ("CodeAgent", "沙箱"):
+        assert word not in base, "禁用 CodeAgent 时的变体与阶段 1 一样不含这些词"
+
+
+def test_h3_prompt_baselines_are_pinned():
+    """H3 MAIN_AGENT_PROMPT 的 sha256 不变；member 变体把占位句换回台北例句之后与阶段 1 逐字相同。"""
+    import hashlib
+    sha = lambda text: hashlib.sha256(text.encode("utf-8")).hexdigest()
+    assert sha(MAIN_AGENT_PROMPT) == _MAIN_PROMPT_SHA256, "MAIN_AGENT_PROMPT 一个字节都不能变"
+    assert sha(MEMBER_MAIN_AGENT_PROMPT.replace(_NEUTRAL_ADDRESS, _TAIPEI_ADDRESS)) == _STAGE1_MEMBER_PROMPT_SHA256, \
+        "禁用 CodeAgent 的 member 提示词应与阶段 1 逐字相同（只有委派例句里的地址换成了中性占位）"
+    assert orchestrator.MEMBER_MAIN_AGENT_PROMPT is MEMBER_MAIN_AGENT_PROMPT
+
+
+def test_i_member_graph_with_code():
+    """I 启用 CodeAgent 的 member 图；任何一种不可用都回到 3 个专家与阶段 1 的提示词，且不调用 CodeAgent 构建函数。"""
+    with _code_enabled():
+        agent, experts, cap, build = _build_member_capturing()
+        assert hasattr(agent, "ainvoke") and build is not None
+        assert experts == (*MEMBER_ORDER, "CodeAgent"), experts
+        assert cap["system_prompt"] is MEMBER_MAIN_AGENT_PROMPT_CODE
+        assert [t.name for t in cap["tools"]] == ["get_current_time", "get_session_events", "search_session_history"]
+        subs = cap["subagents"]
+        assert [_name(s) for s in subs] == [*MEMBER_ORDER, "CodeAgent"]
+        pre = [s for s in subs if "runnable" in s]
+        assert len(pre) == 1 and pre[0]["name"] == "CodeAgent" and pre[0]["runnable"] is build.runnable
+        assert pre[0]["description"] == code_agent.MEMBER_DESCRIPTION
+        assert build.tool_names == _CODE_TOOL_NAMES and "delete" not in build.tool_names
+        skills_route = cap["backend"].routes["/skills/"]
+        assert isinstance(skills_route, ReadOnlyFilesystemBackend) and os.path.realpath(str(skills_route.cwd)) == os.path.realpath(SKILLS_MEMBER_DIR)
+        # 同一次测试里 owner 图与禁用状态下完全一样
+        assert _captured["system_prompt"] is MAIN_AGENT_PROMPT and [_name(s) for s in _captured["subagents"]] == EXPECTED_ORDER
+
+    boom_calls = []
+
+    def boom(*args, **kwargs):
+        boom_calls.append(1)
+        raise AssertionError("不可用时不应调用 CodeAgent 构建函数")
+
+    real_build = code_agent.build_member_code_agent_runnable
+    code_agent.build_member_code_agent_runnable = boom
+    try:
+        real_spec, real_version = importlib.util.find_spec, importlib.metadata.version
+        variants = (
+            ("MODAL_DISABLED=true", dict(MODAL_DISABLED=True), None, None),
+            ("令牌缺失", dict(MODAL_TOKENS_PRESENT=False), None, None),
+            ("modal 没装", {}, lambda name, *a, **k: None if name == "modal" else real_spec(name, *a, **k), None),
+            ("modal 版本过低", {}, None, lambda name: "1.5.0" if name == "modal" else real_version(name)),
+        )
+        for label, cfg, spec_patch, version_patch in variants:
+            with _code_enabled():
+                for k, v in cfg.items():
+                    setattr(config, k, v)
+                if spec_patch:
+                    importlib.util.find_spec = spec_patch
+                if version_patch:
+                    importlib.metadata.version = version_patch
+                assert modal_sandbox.member_code_status()[0] is False, label
+                _agent, experts, cap, build = _build_member_capturing_plain()
+                assert experts == tuple(MEMBER_ORDER) and build is None, (label, experts)
+                assert cap["system_prompt"] is MEMBER_MAIN_AGENT_PROMPT and all("runnable" not in s for s in cap["subagents"]), label
+        assert boom_calls == []
+    finally:
+        code_agent.build_member_code_agent_runnable = real_build
+
+
+def _build_member_capturing_plain():
+    """同 _build_member_capturing，但不包装 CodeAgent 构建函数（调用方已经换成了会炸的替身）。"""
+    captured = {}
+    real_create = orchestrator.create_deep_agent
+
+    def spy_create(*args, **kwargs):
+        captured.update(kwargs)
+        return _real_create(*args, **kwargs)
+
+    orchestrator.create_deep_agent = spy_create
+    try:
+        agent, experts = orchestrator._build_member_agent(MemorySaver())
+    finally:
+        orchestrator.create_deep_agent = real_create
+    return agent, experts, captured, None
+
+
+def test_f2_strict_exception_for_vetted_code():
+    """F2 预编译子专家的严格例外：基线通过；逐个破坏构建物 / 子专家都 RuntimeError；13 个黑名单工具即使带着 vetted_code 也照样拒绝。"""
+    import dataclasses
+
+    from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
+    check = orchestrator._assert_member_graph_safe
+    sup = [orchestrator.knowledge_tools.get_current_time, *orchestrator.session_tools.TOOLS]
+
+    with _code_enabled():
+        build = code_agent.build_member_code_agent_runnable(llm=models.worker_llm, system_prompt=code_agent.MEMBER_PROMPT)
+        subs = orchestrator._member_subagents(build)
+        check(sup, subs, vetted_code=build)                                       # 基线通过
+        check(sup, orchestrator._member_subagents(), vetted_code=build)           # 带 vetted_code 但图里没有 CodeAgent：也可以
+        # 没有 vetted_code 时，预编译子专家一律拒绝（报错文案不变）
+        try:
+            check(sup, subs)
+            raise AssertionError("没有 vetted_code 时应拒绝预编译子专家")
+        except RuntimeError as e:
+            assert "member 图不允许预编译的子专家（无法检查其内部工具）" in str(e) or "member 图含有不允许的专家" in str(e), str(e)
+
+        other = code_agent.build_member_code_agent_runnable(llm=models.worker_llm, system_prompt=code_agent.MEMBER_PROMPT)
+        broken = {}
+        # a runnable 身份对不上（相等不行，必须是同一个对象）
+        subs_a = orchestrator._member_subagents(other)
+        broken["runnable 身份对不上"] = (subs_a, build)
+        # b 名字不是 CodeAgent
+        subs_b = orchestrator._member_subagents(build)
+        subs_b[-1] = {**subs_b[-1], "name": "FileAgent"}
+        broken["名字不是 CodeAgent"] = (subs_b, build)
+        # c 整张图里多一个预编译子专家
+        subs_c = orchestrator._member_subagents(build)
+        subs_c.append({"name": "CodeAgent", "description": "dup", "runnable": build.runnable})
+        broken["多一个预编译子专家"] = (subs_c, build)
+        # d 工具集多出 delete / 少一个
+        broken["tool_names 多出 delete"] = (orchestrator._member_subagents(build), dataclasses.replace(build, tool_names=build.tool_names | {"delete"}))
+        broken["tool_names 少一个"] = (orchestrator._member_subagents(build), dataclasses.replace(build, tool_names=build.tool_names - {"grep"}))
+        # e backend.default 换成本机 Docker 沙箱
+        routes = dict(build.backend.routes)
+        docker_backend = CompositeBackend(default=docker_sandbox.DockerSandbox(), routes=routes, artifacts_root="/_artifacts")
+        broken["默认后端是 Docker"] = (orchestrator._member_subagents(build), dataclasses.replace(build, backend=docker_backend))
+        # f 路由多出 /workspace/
+        extra_route = CompositeBackend(default=build.backend.default, routes={**routes, "/workspace/": StateBackend()}, artifacts_root="/_artifacts")
+        broken["路由多出 /workspace/"] = (orchestrator._member_subagents(build), dataclasses.replace(build, backend=extra_route))
+        # g /skills/ 换成可写的 FilesystemBackend / 指向 owner 的 SKILLS_DIR
+        writable = CompositeBackend(default=build.backend.default, artifacts_root="/_artifacts",
+                                    routes={**routes, "/skills/": FilesystemBackend(root_dir=SKILLS_MEMBER_DIR, virtual_mode=True)})
+        broken["/skills/ 可写"] = (orchestrator._member_subagents(build), dataclasses.replace(build, backend=writable))
+        owner_skills = CompositeBackend(default=build.backend.default, artifacts_root="/_artifacts",
+                                        routes={**routes, "/skills/": ReadOnlyFilesystemBackend(root_dir=SKILLS_DIR, virtual_mode=True)})
+        broken["/skills/ 指向 owner 的 skills/"] = (orchestrator._member_subagents(build), dataclasses.replace(build, backend=owner_skills))
+        # h /_artifacts/ 不是 StateBackend
+        fs_artifacts = CompositeBackend(default=build.backend.default, artifacts_root="/_artifacts",
+                                        routes={**routes, "/_artifacts/": FilesystemBackend(root_dir=SKILLS_MEMBER_DIR, virtual_mode=True)})
+        broken["/_artifacts/ 不是 state"] = (orchestrator._member_subagents(build), dataclasses.replace(build, backend=fs_artifacts))
+        # i 声明式的 CodeAgent（没有 runnable）
+        subs_i = orchestrator._member_subagents(build)[:-1]
+        subs_i.append({"name": "CodeAgent", "description": "x", "system_prompt": "x", "tools": []})
+        broken["声明式的 CodeAgent"] = (subs_i, build)
+        for label, (bad_subs, bad_build) in broken.items():
+            _expect_runtime_error(lambda: check(sup, bad_subs, vetted_code=bad_build))
+            assert label
+
+        # 13 个黑名单工具注入主管 / 声明式子专家：即使带着 vetted_code 也照样 RuntimeError
+        for name in sorted(FORBIDDEN_TOOLS):
+            bad = _dummy_tool(name)
+            _expect_runtime_error(lambda: check([*sup, bad], orchestrator._member_subagents(build), vetted_code=build))
+            for i in range(len(MEMBER_ORDER)):
+                subs_x = orchestrator._member_subagents(build)
+                subs_x[i]["tools"] = [*subs_x[i]["tools"], bad]
+                _expect_runtime_error(lambda: check(sup, subs_x, vetted_code=build))
+
+
+def test_g2_code_enabled_build_never_touches_docker_or_host():
+    """G2 启用 CodeAgent 时，member 构建也不得调用 owner 的 build_code_agent_runnable、sandbox.get_sandbox / set_docker_client、
+    markitdown_tool.build_tools，也不读取任何 MCP 工具；member CodeAgent 的构建函数里没有这些标识符。"""
+    import ast
+    import inspect
+
+    def boom(*args, **kwargs):
+        raise AssertionError("member 构建不应走到这里")
+
+    patched = [
+        (orchestrator.code_agent, "build_code_agent_runnable"),
+        (docker_sandbox, "get_sandbox"),
+        (docker_sandbox, "set_docker_client"),
+        (docker_sandbox, "reset_sandbox"),
+        (orchestrator.markitdown_tool, "build_tools"),
+        (orchestrator.file_agent, "build_file_agent_runnable"),
+        (orchestrator.desktop_agent, "build_desktop_agent_subgraph"),
+    ]
+    originals = [(mod, attr, getattr(mod, attr)) for mod, attr in patched]
+    with _code_enabled():
+        _mcp_requests.clear()
+        try:
+            for mod, attr in patched:
+                setattr(mod, attr, boom)
+            _agent, experts, _cap, build = _build_member_capturing()
+        finally:
+            for mod, attr, original in originals:
+                setattr(mod, attr, original)
+        assert experts == (*MEMBER_ORDER, "CodeAgent") and build is not None
+        assert _mcp_requests == [], f"member 构建不得读取任何 MCP 工具: {_mcp_requests}"
+
+    tree = ast.parse(inspect.getsource(code_agent.build_member_code_agent_runnable).lstrip())
+    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    for name in ("build_code_agent_runnable", "get_sandbox", "DockerSandbox", "set_docker_client", "reset_sandbox",
+                 "interrupt_sandbox", "shutdown_sandbox", "host_shell", "run_host_command", "SKILLS_DIR"):
+        assert name not in used, f"member 的 CodeAgent 构建函数不得引用 {name}"
+
+
 def main():
     print("=" * 70)
     print("开始运行编排层装配离线冒烟测试...")
@@ -293,7 +572,12 @@ def main():
                  ("E owner 图与 member 图", test_e_owner_and_member_graphs),
                  ("F member 启动期断言", test_f_startup_assertion),
                  ("G member 构建不碰宿主机路径", test_g_member_build_never_touches_host_paths),
-                 ("H member 主管提示词", test_h_member_prompt)]
+                 ("H member 主管提示词", test_h_member_prompt),
+                 ("H2 member 主管提示词（带 CodeAgent）", test_h2_member_prompt_with_code),
+                 ("H3 提示词基线哈希", test_h3_prompt_baselines_are_pinned),
+                 ("I 启用 CodeAgent 的 member 图", test_i_member_graph_with_code),
+                 ("F2 预编译子专家的严格例外", test_f2_strict_exception_for_vetted_code),
+                 ("G2 启用 CodeAgent 时不碰 Docker 与宿主机", test_g2_code_enabled_build_never_touches_docker_or_host)]
     passed = failed = 0
     for name, fn in scenarios:
         try:

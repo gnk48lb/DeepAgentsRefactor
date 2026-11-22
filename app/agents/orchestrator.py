@@ -8,6 +8,7 @@
 
 from dataclasses import dataclass
 from typing import Any, Optional
+import os
 from deepagents import (
     create_deep_agent,
     CompiledSubAgent,
@@ -16,14 +17,20 @@ from deepagents import (
     GeneralPurposeSubagentProfile,
     FilesystemPermission,
 )
+from deepagents.backends import CompositeBackend, StateBackend
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 
 from app import config
-from app.infra import models, mcp_service
+from app.infra import models, mcp_service, modal_sandbox
 from app.tools import amap, knowledge_tools, markitdown_tool, session_tools
-from app.agents.prompts import MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT
-from app.agents.skills import build_skills_backend
+from app.agents.prompts import MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT_CODE
+from app.agents.skills import (
+    SKILLS_MEMBER_DIR,
+    ReadOnlyFilesystemBackend,
+    build_member_skills_backend,
+    build_skills_backend,
+)
 from app.agents.experts import (
     knowledge_agent,
     media_agent,
@@ -143,49 +150,104 @@ def _tool_names(tools) -> set:
     return {getattr(t, "name", str(t)) for t in (tools or [])}
 
 
-def _member_subagents() -> list:
-    """member 图的子专家：只含 KnowledgeAgent / MediaAgent / MapAgent，按名字从 _DECLARATIVE_SPECS 里挑。"""
+# 经过验证的 member CodeAgent 的工具集合：恰为这 8 个，不含 delete
+_MEMBER_CODE_TOOL_NAMES = frozenset({
+    "execute_python_code", "ls", "read_file", "write_file", "edit_file", "glob", "grep", "execute",
+})
+
+
+def _member_subagents(code=None) -> list:
+    """member 图的子专家：KnowledgeAgent / MediaAgent / MapAgent（按名字从 _DECLARATIVE_SPECS 里挑），
+    code 是通过构建的 MemberCodeAgentBuild 时再追加云端 CodeAgent（顺序：Knowledge、Media、Map、Code）。"""
     by_name = {spec.name: spec for spec in _DECLARATIVE_SPECS}
     subagents = [by_name[name].to_subagent(models) for name in _MEMBER_EXPERT_NAMES]
-    # STAGE2: 云端 CodeAgent
+    if code is not None:
+        subagents.append(CompiledSubAgent(
+            name=code_agent.NAME,
+            description=code_agent.MEMBER_DESCRIPTION,
+            runnable=code.runnable,
+        ))
     return subagents
 
 
-def _assert_member_graph_safe(supervisor_tools: list, subagents: list) -> None:
+def _assert_vetted_code_build(vetted_code) -> None:
+    """member 的云端 CodeAgent 构建物断言（失败即关闭）：工具集恰为 8 个、后端默认是 ModalRoutedSandbox（不是本机 Docker）、
+    路由恰为 /skills/（只读、指向 skills_member/）与 /_artifacts/（内存 state）。"""
+    if vetted_code.tool_names != _MEMBER_CODE_TOOL_NAMES:
+        raise RuntimeError(f"member 的 CodeAgent 工具集不对: {sorted(vetted_code.tool_names)}")
+    backend = vetted_code.backend
+    if not isinstance(backend, CompositeBackend):
+        raise RuntimeError("member 的 CodeAgent 后端必须是 CompositeBackend")
+    if not isinstance(backend.default, modal_sandbox.ModalRoutedSandbox):
+        raise RuntimeError(f"member 的 CodeAgent 默认后端必须是云端路由沙箱，实际是 {type(backend.default).__name__}")
+    if set(backend.routes) != {"/skills/", "/_artifacts/"}:
+        raise RuntimeError(f"member 的 CodeAgent 路由不对: {sorted(backend.routes)}")
+    skills = backend.routes["/skills/"]
+    if not isinstance(skills, ReadOnlyFilesystemBackend):
+        raise RuntimeError("member 的 CodeAgent 的 /skills/ 必须是只读后端")
+    if os.path.realpath(str(skills.cwd)) != os.path.realpath(SKILLS_MEMBER_DIR):
+        raise RuntimeError("member 的 CodeAgent 的 /skills/ 必须指向 skills_member/")
+    if not isinstance(backend.routes["/_artifacts/"], StateBackend):
+        raise RuntimeError("member 的 CodeAgent 的 /_artifacts/ 必须是内存 state 后端")
+
+
+def _assert_member_graph_safe(supervisor_tools: list, subagents: list, vetted_code=None) -> None:
     """启动期断言（失败即关闭，违反直接阻止启动）：
-    - member 图的专家名必须是 {KnowledgeAgent, MediaAgent, MapAgent} 的子集；
-    - 预编译的子专家（CompiledSubAgent，如 CodeAgent / FileAgent / DesktopAgent）一律不允许：它们内部的工具查不到；
-    - 主管 tools 与各声明式子专家 tools 不得包含宿主机相关的工具名。
+    - member 图的专家名必须是 {KnowledgeAgent, MediaAgent, MapAgent} 的子集（带 vetted_code 时再额外允许 CodeAgent）；
+    - 预编译的子专家（CompiledSubAgent，如 FileAgent / DesktopAgent）一律不允许：它们内部的工具查不到。
+      唯一的严格例外：vetted_code 通过构建物断言，且名字是 CodeAgent、runnable 就是它的 runnable（身份比较）、整张图里只有这一个预编译专家；
+    - 主管 tools 与各声明式子专家 tools 不得包含宿主机相关的工具名（即使带着 vetted_code 也照样检查）。
     """
     names = [sa["name"] for sa in subagents]
-    extra = sorted(set(names) - set(_MEMBER_EXPERT_NAMES))
+    allowed = set(_MEMBER_EXPERT_NAMES) | ({code_agent.NAME} if vetted_code is not None else set())
+    extra = sorted(set(names) - allowed)
     if extra:
         raise RuntimeError(f"member 图含有不允许的专家: {extra}")
     bad = sorted(_tool_names(supervisor_tools) & _MEMBER_FORBIDDEN_TOOL_NAMES)
     if bad:
         raise RuntimeError(f"member 图的主管持有宿主机相关工具: {bad}")
+    precompiled = [sa for sa in subagents if "runnable" in sa]
     for sa in subagents:
         if "runnable" in sa:
-            raise RuntimeError(f"member 图不允许预编译的子专家（无法检查其内部工具）: {sa['name']}")
+            if (
+                vetted_code is None
+                or sa["name"] != code_agent.NAME
+                or sa["runnable"] is not vetted_code.runnable
+                or len(precompiled) != 1
+            ):
+                raise RuntimeError(f"member 图不允许预编译的子专家（无法检查其内部工具）: {sa['name']}")
+            _assert_vetted_code_build(vetted_code)
+            continue
+        if sa["name"] == code_agent.NAME:
+            raise RuntimeError(f"member 图里叫 {code_agent.NAME} 的子专家必须是经过验证的预编译 CodeAgent")
         bad = sorted(_tool_names(sa.get("tools")) & _MEMBER_FORBIDDEN_TOOL_NAMES)
         if bad:
             raise RuntimeError(f"member 图的子专家 '{sa['name']}' 持有宿主机相关工具: {bad}")
 
 
 def _build_member_agent(checkpointer: BaseCheckpointSaver):
-    """member 图：Knowledge / Media / Map 三个声明式专家 + 主管自带的时间与会话回溯工具。
-    绝不读取 desktop / markitdown 的 MCP 工具，也不构造 CodeAgent / FileAgent / DesktopAgent / BrowserAgent。"""
-    subagents = _member_subagents()
+    """member 图：Knowledge / Media / Map 三个声明式专家 + 主管自带的时间与会话回溯工具；
+    Modal 可用（member_code_status 为真）时再多一个云端 CodeAgent。不可用时与阶段 1 等价，不调用任何 CodeAgent 构建函数。
+    绝不读取 desktop / markitdown 的 MCP 工具，也不构造 owner 的 CodeAgent / FileAgent / DesktopAgent / BrowserAgent，
+    不触达本机 Docker 沙箱与宿主机命令。"""
+    ok, _reason = modal_sandbox.member_code_status()
+    code = None
+    if ok:
+        code = code_agent.build_member_code_agent_runnable(
+            llm=models.worker_llm,
+            system_prompt=code_agent.MEMBER_PROMPT,
+        )
+    subagents = _member_subagents(code)
     supervisor_tools = [knowledge_tools.get_current_time, *session_tools.TOOLS]
-    _assert_member_graph_safe(supervisor_tools, subagents)
+    _assert_member_graph_safe(supervisor_tools, subagents, vetted_code=code)
 
     agent = create_deep_agent(
         model=models.orchestrator_llm,
         tools=supervisor_tools,
-        system_prompt=MEMBER_MAIN_AGENT_PROMPT,
+        system_prompt=MEMBER_MAIN_AGENT_PROMPT_CODE if code is not None else MEMBER_MAIN_AGENT_PROMPT,
         subagents=subagents,
         middleware=[ToolCallLimitMiddleware(tool_name="task", run_limit=12, exit_behavior="continue")],
-        backend=build_skills_backend(),
+        backend=build_member_skills_backend(),
         permissions=_SUPERVISOR_PERMISSIONS,
         checkpointer=checkpointer,
     )

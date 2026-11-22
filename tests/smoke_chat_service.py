@@ -17,12 +17,15 @@ chat_service 服务层离线冒烟测试：用脚本化假模型驱动真实的 
 不需要任何 API Key / Docker / MCP / 网络：orchestrator / injector / extractor / startup 在 import 前被桩掉。
 """
 import asyncio
+import contextlib
+import io
 import json
 import operator
 import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import types
@@ -92,7 +95,7 @@ from app import config
 from app.services import chat_service as cs
 from app.services import session_log
 from app.agents.experts import file_agent
-from app.infra import checkpointer, sandbox, session_store
+from app.infra import checkpointer, modal_sandbox, sandbox, session_store
 from app.infra.session_store import SessionStore
 from app.runtime import hitl, outbox
 from app.utils.context import get_request_context
@@ -1459,6 +1462,261 @@ async def test_q4_block_and_stop_all_turns():
     await asyncio.sleep(1.1)
 
 
+# ── 阶段 2：member 的云端沙箱钩子（用替换 modal_sandbox 模块属性的方式观察；一律离线，池从不被创建）──
+
+class _ModalSpy:
+    """替换 modal_sandbox 上的钩子：记录 (名字, 参数, 调用所在的线程)；hooks 可以统一抛异常。"""
+
+    def __init__(self, reset_user_result=0, raises=None, status=(False, "测试里没有配置 Modal")):
+        self.reset_user_result, self.raises, self.status = reset_user_result, raises, status
+        self.calls = []
+
+    def __enter__(self):
+        self.loop_thread = threading.get_ident()
+        self._orig = {n: getattr(modal_sandbox, n) for n in
+                      ("reset_session", "reset_user", "interrupt_session_nowait", "shutdown_pool", "member_code_status")}
+
+        def make(name, result=None):
+            def hook(*args, **kwargs):
+                self.calls.append((name, args, threading.get_ident()))
+                if self.raises is not None and name != "member_code_status":
+                    raise self.raises
+                return result() if callable(result) else result
+            return hook
+
+        modal_sandbox.reset_session = make("reset_session")
+        modal_sandbox.reset_user = make("reset_user", lambda: self.reset_user_result)
+        modal_sandbox.interrupt_session_nowait = make("interrupt_session_nowait")
+        modal_sandbox.shutdown_pool = make("shutdown_pool")
+        modal_sandbox.member_code_status = make("member_code_status", lambda: self.status)
+        return self
+
+    def __exit__(self, *exc):
+        for name, fn in self._orig.items():
+            setattr(modal_sandbox, name, fn)
+
+    def named(self, name):
+        return [c for c in self.calls if c[0] == name]
+
+
+async def test_r1_reset_hook():
+    """R1 member 的 /reset → reset_session(member 的 user_id, 当前 session_id) 恰好一次，在事件循环线程之外执行，Docker 沙箱没被碰；
+    owner 反过来；钩子抛异常时回复文本不变。"""
+    await _install_two_graphs([AIMessage(content="o")], [AIMessage(content="m")])
+    await _say(MEMBER_A, "A 先出现")
+    sid = _sid(MEMBER_A.user_id)
+    with _ModalSpy() as spy:
+        reply = await _say(MEMBER_A, "/reset")
+        assert "已清空" in reply.text, reply.text
+        hooks = spy.named("reset_session")
+        assert len(hooks) == 1 and hooks[0][1] == (MEMBER_A.user_id, sid), hooks
+        assert hooks[0][2] != spy.loop_thread, "阻塞钩子必须在事件循环线程之外执行"
+        assert reset_calls == [], "member 的 /reset 绝不能重置 owner 的 Docker 沙箱"
+        assert spy.named("reset_user") == [] and spy.named("interrupt_session_nowait") == []
+    with _ModalSpy(raises=RuntimeError("boom")) as failing:
+        again = await _say(MEMBER_A, "/reset")
+        assert again.text == reply.text, "钩子失败不改变回复文本"
+        assert len(failing.named("reset_session")) == 1
+    with _ModalSpy() as spy_owner:
+        await _say(ID, "owner 先出现")
+        owner_reply = await _say(ID, "/reset")
+        assert "已清空" in owner_reply.text and reset_calls == [1], reset_calls
+        assert spy_owner.named("reset_session") == [], "owner 的 /reset 不得调用任何 Modal 钩子"
+
+
+async def test_r2_stop_hook():
+    """R2 member 的 /stop → interrupt_session_nowait(member 的 user_id, 那一轮的 session_id) 一次；host_shell 与 Docker 的终止原语都不碰；
+    不影响 owner 与其他 member 的轮；owner 的 /stop 不调用任何 modal_sandbox 函数。"""
+    await _install_two_graphs([AIMessage(content="owner慢回复")], [AIMessage(content="member慢回复")], owner_delay=1.2, member_delay=1.2)
+    with _KillSpy() as kill_spy, _ModalSpy() as spy:
+        member_turn, other_turn = _start(MEMBER_A, "A 慢问题"), _start(MEMBER_B, "B 慢问题")
+        owner_turn = _start(ID, "owner 慢问题")
+        await asyncio.sleep(0.4)
+        handle_sid = cs._current_turns[MEMBER_A.user_id].session_id
+        stop = await _say(MEMBER_A, "/stop")
+        assert "已中止" in stop.text and await member_turn is None
+        hooks = spy.named("interrupt_session_nowait")
+        assert len(hooks) == 1 and hooks[0][1] == (MEMBER_A.user_id, handle_sid), hooks
+        assert kill_spy.host_calls == [] and kill_spy.sandbox_calls == [], "member 的 /stop 绝不能走到进程级全局的终止原语"
+        assert not owner_turn.done() and not other_turn.done(), "member 的 /stop 不影响 owner 与其他 member 的轮"
+        spy.calls.clear()
+        owner_stop = await _say(ID, "/stop")
+        assert "已中止" in owner_stop.text and await owner_turn is None
+        assert spy.calls == [], f"owner 的 /stop 不得调用任何 modal_sandbox 函数: {spy.calls}"
+        assert kill_spy.host_calls == [1] and kill_spy.sandbox_calls == [1]
+        assert (await other_turn).text.endswith("member慢回复")
+    await asyncio.sleep(1.3)
+
+
+async def test_r3_failed_turn_interrupts_member_sandbox():
+    """R3 member 的回合超时 → interrupt_session_nowait 恰好一次；用户 /stop 引起的失败总共仍然只有一次（来自 _stop_current_turn，不重复）；
+    owner 失败 → 没有调用。"""
+    await _install_two_graphs([AIMessage(content="o")], [AIMessage(content="m")], owner_delay=1.5, member_delay=1.5)
+    old_timeout = config.AGENT_TURN_TIMEOUT_SECONDS
+    try:
+        with _ModalSpy() as spy:
+            config.AGENT_TURN_TIMEOUT_SECONDS = 0.4
+            reply = await _say(MEMBER_A, "A 的超时问题")
+            assert "还没完成" in reply.text, reply.text
+            sid = _sid(MEMBER_A.user_id)
+            hooks = spy.named("interrupt_session_nowait")
+            assert len(hooks) == 1 and hooks[0][1] == (MEMBER_A.user_id, sid), hooks
+
+            config.AGENT_TURN_TIMEOUT_SECONDS = old_timeout
+            spy.calls.clear()
+            turn = _start(MEMBER_A, "A 的慢问题")
+            await asyncio.sleep(0.3)
+            await _say(MEMBER_A, "/stop")
+            assert await turn is None
+            assert len(spy.named("interrupt_session_nowait")) == 1, "/stop 引起的失败只调用一次（不重复）"
+
+            config.AGENT_TURN_TIMEOUT_SECONDS = 0.4
+            spy.calls.clear()
+            await _say(ID, "owner 的超时问题")
+            assert spy.calls == [], "owner 的失败不得触发任何 Modal 钩子"
+    finally:
+        config.AGENT_TURN_TIMEOUT_SECONDS = old_timeout
+    await asyncio.sleep(1.6)
+
+
+async def test_r4_block_recycles_sandboxes():
+    """R4 /block：先中止再 reset_user 一次；返回 2 → 回复里有“已回收它的 2 个云端沙箱”；返回 0 → 回复与阶段 1 逐字一致；owner 不可被封禁且无调用。"""
+    await _install_two_graphs([AIMessage(content="owner慢回复")], [AIMessage(content="member慢回复")], owner_delay=0.5, member_delay=1.0)
+    await _say(ID, "owner 先出现")
+    await _say(MEMBER_A, "A 先出现")
+    await _say(MEMBER_B, "B 先出现")
+    await asyncio.sleep(0.1)
+    turn = _start(MEMBER_A, "A 的慢问题")
+    await asyncio.sleep(0.3)
+    with _ModalSpy(reset_user_result=2) as spy:
+        reply = await _say(ID, "/block 2")
+        assert "已封禁" in reply.text and "中止了它正在运行的任务" in reply.text and "已回收它的 2 个云端沙箱。" in reply.text, reply.text
+        assert await turn is None
+        order = [c[0] for c in spy.calls]
+        assert order == ["interrupt_session_nowait", "reset_user"], order
+        hooks = spy.named("reset_user")
+        assert hooks[0][1] == (MEMBER_A.user_id,) and hooks[0][2] != spy.loop_thread, "reset_user 在事件循环线程之外执行"
+    with _ModalSpy(reset_user_result=0) as spy:
+        reply = await _say(ID, "/block 3")
+        assert reply.text == f"已封禁 {MEMBER_B.user_id[:8]}。", reply.text      # 与阶段 1 逐字一致
+        assert len(spy.named("reset_user")) == 1
+    with _ModalSpy(raises=RuntimeError("boom")):
+        reply = await _say(ID, "/unblock 2")
+        assert "已解封" in reply.text, reply.text
+        reply = await _say(ID, "/block 2")
+        assert reply.text.startswith("已封禁") and "云端沙箱" not in reply.text, "钩子失败不改变回复"
+    with _ModalSpy() as spy:
+        reply = await _say(ID, "/block owner")
+        assert reply.text == "管理员不可被封禁。" and spy.calls == [], (reply.text, spy.calls)
+    await asyncio.sleep(0.6)
+
+
+async def test_r5_shutdown_order_and_isolation():
+    """R5 shutdown_service 调用 shutdown_pool 恰好一次，且在 mcp_service.shutdown_mcp 之前；
+    _stop_all_turns 抛异常或 shutdown_pool 自己抛异常时，后续的关闭步骤（MCP、checkpointer 等）照样执行。"""
+    from app.infra import mcp_service
+    real_mcp = mcp_service.shutdown_mcp
+    real_stop_all = cs._stop_all_turns
+
+    for label, stop_raises, pool_raises in (("正常", False, False), ("_stop_all_turns 抛异常", True, False), ("shutdown_pool 抛异常", False, True)):
+        await _install_two_graphs([AIMessage(content="o")], [AIMessage(content="m")])
+        order = []
+
+        async def traced_mcp():
+            order.append("mcp")
+            return await real_mcp()
+
+        async def broken_stop_all():
+            raise RuntimeError("stop-all failed")
+
+        mcp_service.shutdown_mcp = traced_mcp
+        if stop_raises:
+            cs._stop_all_turns = broken_stop_all
+        try:
+            with _ModalSpy(raises=RuntimeError("pool failed") if pool_raises else None) as spy:
+                spy_pool = modal_sandbox.shutdown_pool
+
+                def traced_pool(*args, **kwargs):
+                    order.append("pool")
+                    return spy_pool(*args, **kwargs)
+
+                modal_sandbox.shutdown_pool = traced_pool
+                await cs.shutdown_service()
+                assert len(spy.named("shutdown_pool")) == 1, label
+        finally:
+            mcp_service.shutdown_mcp = real_mcp
+            cs._stop_all_turns = real_stop_all
+        assert order == ["pool", "mcp"], (label, order)
+        assert cs._checkpointer is None and not cs.is_initialized() and cs._agents == {}, label
+        await _teardown()
+
+
+async def _init_service_with_member_experts(member_experts):
+    """照 P14 的做法：用假的 build_main_agents / open_checkpointer 跑真实的 init_service。"""
+    global _env
+    _env = _Env()
+    store = SessionStore(_env.db_path)
+    _env.store = store
+    session_store.set_store(store)
+    real_open, real_validate, real_build = checkpointer.open_checkpointer, cs.models.validate_required_keys, cs.orchestrator.build_main_agents
+
+    async def open_tmp(*args, **kwargs):
+        return await real_open(_env.cp_path)
+
+    async def fake_build(checkpointer):
+        def mk(reply):
+            return create_deep_agent(model=ScriptedModel(script=[AIMessage(content=reply)]), subagents=[], checkpointer=checkpointer)
+
+        return types.SimpleNamespace(owner=mk("o"), member=mk("m"), owner_experts=("FileAgent",), member_experts=member_experts)
+
+    checkpointer.open_checkpointer, cs.models.validate_required_keys, cs.orchestrator.build_main_agents = open_tmp, lambda: None, fake_build
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            await cs.init_service()
+        _env.saver = cs._checkpointer
+    finally:
+        checkpointer.open_checkpointer, cs.models.validate_required_keys, cs.orchestrator.build_main_agents = real_open, real_validate, real_build
+    return out.getvalue()
+
+
+async def test_r6_startup_banner_and_whoami():
+    """R6 member_experts 带 CodeAgent → _member_code_enabled 为真、启动横幅已打印、member 的 /whoami 是“云端沙箱（Modal）”、owner 仍是“本机 Docker”；
+    不带 CodeAgent → “未启用”并打印 member_code_status 的原因；shutdown_service 之后标志复位。"""
+    with _ModalSpy():
+        banner = await _init_service_with_member_experts(("KnowledgeAgent", "MediaAgent", "MapAgent", "CodeAgent"))
+        assert cs._member_code_enabled is True
+        assert "member 云端 CodeAgent：已启用（Modal）" in banner, banner
+        assert "云端沙箱（Modal）" in (await _say(MEMBER_A, "/whoami")).text
+        assert "CodeAgent 后端：本机 Docker" in (await _say(ID, "/whoami")).text
+        await cs.shutdown_service()
+        assert cs._member_code_enabled is False, "shutdown_service 之后标志复位"
+        await _teardown()
+
+    with _ModalSpy(status=(False, "MODAL_DISABLED=true")) as spy:
+        banner = await _init_service_with_member_experts(("KnowledgeAgent", "MediaAgent", "MapAgent"))
+        assert cs._member_code_enabled is False
+        assert "member 云端 CodeAgent：未启用（MODAL_DISABLED=true）" in banner, banner
+        assert len(spy.named("member_code_status")) == 1
+        whoami = (await _say(MEMBER_A, "/whoami")).text
+        assert "CodeAgent 后端：未启用" in whoami and "云端沙箱" not in whoami, whoami
+        assert "CodeAgent 后端：本机 Docker" in (await _say(ID, "/whoami")).text
+        await cs.shutdown_service()
+        await _teardown()
+
+
+async def test_r7_startup_notice_wording():
+    """R7 OWNER_USER_IDS 为空时的启动提示：不再说 member 没有“代码能力”，改为说明代码只能在云端沙箱里跑；P12 原有断言的关键词都在。"""
+    old_ids, old_user = config.OWNER_USER_IDS, config.MYSQL_USER
+    try:
+        config.OWNER_USER_IDS, config.MYSQL_USER = frozenset(), "root"
+        text = "\n".join(cs._startup_notices())
+        assert "代码能力" not in text and "云端沙箱" in text, text
+        assert "OWNER_USER_IDS" in text and "/whoami" in text and "root" in text and "只读" in text, text
+    finally:
+        config.OWNER_USER_IDS, config.MYSQL_USER = old_ids, old_user
+
+
 SCENARIOS = [
     ("A 多轮 HITL（批准/无关消息/拒绝）", test_a_multi_turn_hitl),
     ("B HITL 前的图片随最终回复发出", test_b_outbox_continuity),
@@ -1498,6 +1756,13 @@ SCENARIOS = [
     ("Q2 终止原语只有 owner 的 /stop 才触发", test_q2_kill_primitives_owner_only),
     ("Q3 owner 的 /stop 不中止 member", test_q3_owner_stop_does_not_stop_member),
     ("Q4 /block 与 _stop_all_turns", test_q4_block_and_stop_all_turns),
+    ("R1 member 的 /reset 钩子", test_r1_reset_hook),
+    ("R2 member 的 /stop 钩子", test_r2_stop_hook),
+    ("R3 失败的回合中断 member 沙箱", test_r3_failed_turn_interrupts_member_sandbox),
+    ("R4 /block 回收云端沙箱", test_r4_block_recycles_sandboxes),
+    ("R5 关闭顺序与隔离", test_r5_shutdown_order_and_isolation),
+    ("R6 启动横幅与 /whoami", test_r6_startup_banner_and_whoami),
+    ("R7 启动提示文案", test_r7_startup_notice_wording),
 ]
 
 

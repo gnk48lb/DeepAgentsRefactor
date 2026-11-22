@@ -10,6 +10,9 @@ process_message 只负责“写入入站事件 + wake(session_id)”，wake 不�
 - 每个用户一把锁：同一用户串行，不同用户互不阻塞；member 另有全局并发上限（信号量），owner 不占用。
 - 所有会话读写都带 user_id；wake 按会话归属设置 RequestContext，工具层的 require_owner() 靠它做纵深防御。
 - /stop 只中止发送者自己的那一轮；宿主机命令与 Docker 沙箱的终止原语是进程级全局的，只有 owner 的 /stop 才会触发。
+- member 的云端 CodeAgent（Modal 沙箱，按 (用户, 会话) 一个）的生命周期钩子都经 modal_sandbox 的模块属性调用：
+  /reset 终止当前会话的沙箱，/stop 与失败的回合只中断它自己会话里的命令，/block 回收该用户的全部沙箱，关闭服务时全部终止。
+  这些钩子都是尽力而为（失败只打印一行警告，不改变命令或回合的结果），owner 路径上没有任何 Modal 调用。
 """
 
 import asyncio
@@ -30,7 +33,7 @@ from app.agents import orchestrator
 from app.memory import injector, extractor
 from app.services import startup, session_log
 from app.runtime import outbox, hitl, cli_logger
-from app.infra import models, session_store, checkpointer
+from app.infra import models, session_store, checkpointer, modal_sandbox
 from app.utils.text import extract_text
 from app.utils.images import guess_mime_type
 from app.utils.context import RequestContext, set_request_context, reset_request_context
@@ -54,6 +57,8 @@ _checkpointer = None
 _user_locks: dict[str, asyncio.Lock] = {}
 # member 全局并发上限（owner 不占用）；惰性创建，容量取 config.MAX_CONCURRENT_MEMBER_TURNS
 _member_sem: Optional[asyncio.Semaphore] = None
+# member 图是否编译进了云端 CodeAgent（init_service 之后以真正编译出来的结果为准）：只用于启动提示与 /whoami，不用来门控任何钩子
+_member_code_enabled: bool = False
 _background_tasks: Set[asyncio.Task] = set()
 
 _SLASH_COMMANDS = {
@@ -111,10 +116,11 @@ def _member_semaphore() -> asyncio.Semaphore:
 def _reset_runtime_state() -> None:
     """清掉进程内的并发状态（锁 / 信号量 / 正在跑的轮的句柄）。shutdown 与测试共用：
     asyncio 的锁和信号量一旦在某个事件循环里发生过等待，就绑定了那个循环，不能跨 asyncio.run 复用。"""
-    global _member_sem
+    global _member_sem, _member_code_enabled
     _user_locks.clear()
     _current_turns.clear()
     _member_sem = None
+    _member_code_enabled = False
 
 
 def _identity_consistent(identity: Any) -> bool:
@@ -193,7 +199,7 @@ def _startup_notices() -> list[str]:
     notices: list[str] = []
     if not config.OWNER_USER_IDS:
         notices.append(
-            "⚠️⚠️ 未配置 OWNER_USER_IDS：此时 QQ 上没有 owner，所有 QQ 用户都是 member（没有文件 / 命令 / 桌面 / 浏览器 / 代码能力）。\n"
+            "⚠️⚠️ 未配置 OWNER_USER_IDS：此时 QQ 上没有 owner，所有 QQ 用户都是 member（没有文件 / 命令 / 桌面 / 浏览器能力；代码只能在云端沙箱里跑）。\n"
             "   请用主号私聊机器人发 /whoami 取得平台 ID，写入 .env 的 OWNER_USER_IDS 后重启。本地 CLI 始终是 owner，不受影响。"
         )
     bad = invalid_owner_ids()
@@ -209,7 +215,7 @@ def _startup_notices() -> list[str]:
 
 async def init_service() -> None:
     """初始化数据库、会话存储、checkpointer、MCP 服务并编译 owner / member 两张主图。"""
-    global _initialized, _agents, _checkpointer
+    global _initialized, _agents, _checkpointer, _member_code_enabled
     models.validate_required_keys()
     print("🚀 [chat_service] 正在初始化数据环境与 Agent 服务...")
     saver = None
@@ -232,6 +238,16 @@ async def init_service() -> None:
         raise
     print(f"🧩 [chat_service] owner 图专家: {', '.join(built.owner_experts)}")
     print(f"🧩 [chat_service] member 图专家: {', '.join(built.member_experts)}")
+    # 以真正编译出来的结果为准，不要自己再算一遍门控
+    _member_code_enabled = "CodeAgent" in built.member_experts
+    if _member_code_enabled:
+        print("☁️ [chat_service] member 云端 CodeAgent：已启用（Modal）")
+    else:
+        try:
+            reason = modal_sandbox.member_code_status()[1]          # 静态判断：不联网、不抛，只用于打印
+        except Exception:
+            reason = ""
+        print("☁️ [chat_service] member 云端 CodeAgent：未启用" + (f"（{reason}）" if reason else ""))
     if info is not None:
         print(f"💬 [chat_service] owner 当前会话 {info.short_id}「{info.title or '（无标题）'}」，事件 {info.events} 条。")
     for notice in _startup_notices():
@@ -252,6 +268,11 @@ async def shutdown_service() -> None:
         await _stop_all_turns()
     except Exception as e:
         print(f"⚠️ 警告：关闭前中止当前任务失败 (非致命): {e}")
+    # 云端沙箱按时计费：放在后面的 MCP / 浏览器 / Milvus 关闭之前，它们万一抛异常也不能把它漏掉（atexit 兜底只管正常退出）
+    try:
+        await asyncio.to_thread(modal_sandbox.shutdown_pool)
+    except Exception as e:
+        print(f"⚠️ 警告：云端沙箱销毁失败 (非致命): {e}")
     from app.infra import mcp_service, browser_service, milvus_client
     from app.tools import amap
     await mcp_service.shutdown_mcp()
@@ -399,7 +420,12 @@ async def _cmd_reset(turn_start: float, identity: Identity) -> ChatReply:
             await asyncio.to_thread(sandbox.reset_sandbox)
         except Exception as e:
             print(f"⚠️ 警告：沙箱重置失败 (非致命): {e}")
-    # STAGE2: member 的云端沙箱重置
+    else:
+        # member 的云端沙箱按 (用户, 会话) 隔离：只终止当前会话的那一个（/new、/switch 不动它）
+        try:
+            await asyncio.to_thread(modal_sandbox.reset_session, uid, sid)
+        except Exception as e:
+            print(f"⚠️ 警告：云端沙箱重置失败 (非致命): {e}")
     return _command_reply("对话上下文已清空，会话记录仍保留。已开始新的对话。", turn_start)
 
 
@@ -409,7 +435,7 @@ def _cmd_whoami(turn_start: float, identity: Identity) -> ChatReply:
         f"平台 ID：{identity.raw_id}\n"
         f"内部 ID：{identity.user_id}\n"
         f"身份：{'管理员' if identity.is_owner else '成员'}\n"
-        f"CodeAgent 后端：{'本机 Docker' if identity.is_owner else '未启用'}"
+        f"CodeAgent 后端：{'本机 Docker' if identity.is_owner else ('云端沙箱（Modal）' if _member_code_enabled else '未启用')}"
     )
     return _command_reply(msg, turn_start)
 
@@ -488,6 +514,13 @@ async def _cmd_block(arg: str, turn_start: float, *, blocked: bool) -> ChatReply
     status, _killed = await _stop_current_turn(user.user_id)      # 顺手中止它正在跑的轮（member 不会触发任何宿主机终止原语）
     if status != "idle":
         msg += "并中止了它正在运行的任务。"
+    recycled = 0
+    try:
+        recycled = await asyncio.to_thread(modal_sandbox.reset_user, user.user_id)     # 回收它的全部云端沙箱
+    except Exception as e:
+        print(f"⚠️ 警告：回收云端沙箱失败 (非致命): {e}")
+    if recycled and recycled > 0:
+        msg += f"已回收它的 {recycled} 个云端沙箱。"
     return _command_reply(msg, turn_start)
 
 
@@ -639,7 +672,13 @@ async def _stop_current_turn(user_id: str) -> tuple[str, int]:
         # 宿主机命令与 Docker 沙箱只有 owner 能用，而这两个终止原语是进程级全局的：member 的 /stop 绝不能触发它们，
         # 否则会杀掉 owner 正在跑的命令。
         killed = await asyncio.to_thread(_kill_side_effects)
-    # STAGE2: member 的云端沙箱中止
+    else:
+        # member：只中断它自己这个会话的云端命令（起守护线程，立即返回）；绝不走到 _kill_side_effects，
+        # 否则会杀掉 owner 正在跑的命令
+        try:
+            modal_sandbox.interrupt_session_nowait(user_id, handle.session_id)
+        except Exception as e:
+            print(f"⚠️ [/stop] 中断云端沙箱失败 (非致命): {e}")
     # 不用 wait_for：它超时会再取消一次
     await asyncio.wait({handle.task}, timeout=config.AGENT_STOP_WAIT_SECONDS)
     return ("stopped" if handle.task.done() else "timeout"), killed
@@ -869,6 +908,13 @@ async def wake(session_id: str, *, turn_start: Optional[float] = None) -> Option
                     sem.release()
         except (Exception, asyncio.CancelledError) as e:
             reason, detail = _failure_reason(e, user_id)
+            if not is_owner and reason != "user_stop":
+                # 超时 / 递归上限 / 异常 / 非 /stop 的取消：已经在云端沙箱里起了的命令不会因为 asyncio 任务被取消而停下（它跑在线程里）。
+                # user_stop 已由 _stop_current_turn 处理，不重复
+                try:
+                    modal_sandbox.interrupt_session_nowait(user_id, session_id)
+                except Exception as hook_err:
+                    print(f"⚠️ 警告：中断云端沙箱失败 (非致命): {hook_err}")
             try:
                 store.emit_event(session_id, "turn_failed", {"reason": reason, "detail": detail})
                 for rest in pending[failed_at + 1:]:

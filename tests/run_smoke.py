@@ -20,6 +20,7 @@ SMOKES = [
     "tests/smoke_models.py",
     "tests/smoke_units.py",
     "tests/smoke_sandbox.py",
+    "tests/smoke_modal.py",
     "tests/smoke_host_shell.py",
 ]
 

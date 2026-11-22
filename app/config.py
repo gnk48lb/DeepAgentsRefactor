@@ -1,5 +1,6 @@
 """全局配置模块，负责加载环境变量与解析路径常量 (L0)"""
 
+import math
 import os
 from dotenv import load_dotenv
 
@@ -179,6 +180,58 @@ SANDBOX_MAX_IMAGE_MB = int(os.getenv("SANDBOX_MAX_IMAGE_MB", "10"))
 SANDBOX_USER_IMAGE_MAX_SIDE = int(os.getenv("SANDBOX_USER_IMAGE_MAX_SIDE", "1600"))
 SANDBOX_MODEL_IMAGE_MAX_SIDE = int(os.getenv("SANDBOX_MODEL_IMAGE_MAX_SIDE", "768"))
 
+
+# ── Modal 云端沙箱（member 的 CodeAgent，见 app/infra/modal_sandbox.py）──
+# 下面的数值写错时一律回退或夹紧，不能让一个写错的数字把 import 搞崩。
+# 令牌 MODAL_TOKEN_ID / MODAL_TOKEN_SECRET 只在宿主机 .env 里，由 modal SDK 自己从环境变量读取；
+# 这里只记一个“是否都配了”的布尔值，绝不读取、保存或打印令牌本身。
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.getenv(name, "")).strip())
+    except ValueError:
+        return default
+
+
+def _env_pos_int(name: str, default: int) -> int:
+    """非数字、零、负数一律回退到默认值。"""
+    value = _env_int(name, default)
+    return value if value > 0 else default
+
+
+def _env_float(name: str, default: float) -> float:
+    """非数字、非有限值、非正数一律回退到默认值。"""
+    try:
+        value = float(str(os.getenv(name, "")).strip())
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+MODAL_DISABLED = os.getenv("MODAL_DISABLED", "false").strip().lower() in ("1", "true", "yes")
+MODAL_TOKENS_PRESENT = bool(os.getenv("MODAL_TOKEN_ID")) and bool(os.getenv("MODAL_TOKEN_SECRET"))
+MODAL_APP_NAME = (os.getenv("MODAL_APP_NAME") or "").strip() or "gnk48-code-sandbox"
+MODAL_IMAGE_NAME = (os.getenv("MODAL_IMAGE_NAME") or "").strip() or "gnk48-python-ds:v1"
+MODAL_CPU_LIMIT = _env_float("MODAL_CPU_LIMIT", 2.0)
+MODAL_CPU_REQUEST = min(_env_float("MODAL_CPU_REQUEST", 0.25), MODAL_CPU_LIMIT)
+MODAL_MEMORY_MB_LIMIT = max(256, _env_int("MODAL_MEMORY_MB_LIMIT", 2048))                    # MiB，至少 256
+MODAL_MEMORY_MB_REQUEST = min(_env_pos_int("MODAL_MEMORY_MB_REQUEST", 512), MODAL_MEMORY_MB_LIMIT)
+MODAL_IDLE_TIMEOUT_SECONDS = max(60, _env_int("MODAL_IDLE_TIMEOUT_SECONDS", 600))            # 空闲超时，至少 60
+MODAL_EXEC_MAX_TIMEOUT_SECONDS = max(1, _env_int("MODAL_EXEC_MAX_TIMEOUT_SECONDS", 300))     # 单次 exec 上限
+MODAL_EXEC_TIMEOUT_SECONDS = min(max(1, _env_int("MODAL_EXEC_TIMEOUT_SECONDS", 120)), MODAL_EXEC_MAX_TIMEOUT_SECONDS)
+MODAL_MAX_LIFETIME_SECONDS = max(                                                            # 沙箱最长存活
+    MODAL_EXEC_MAX_TIMEOUT_SECONDS + 60, _env_int("MODAL_MAX_LIFETIME_SECONDS", 3600)
+)
+MODAL_STARTUP_TIMEOUT_SECONDS = max(1, _env_int("MODAL_STARTUP_TIMEOUT_SECONDS", 120))       # 创建沙箱（含冷启动）的整体超时
+MODAL_MAX_SANDBOXES_PER_USER = max(1, _env_int("MODAL_MAX_SANDBOXES_PER_USER", 2))
+MODAL_MAX_SANDBOXES_TOTAL = max(MODAL_MAX_SANDBOXES_PER_USER, _env_int("MODAL_MAX_SANDBOXES_TOTAL", 8))
+MODAL_BLOCK_NETWORK = os.getenv("MODAL_BLOCK_NETWORK", "false").strip().lower() in ("1", "true", "yes")
+MODAL_AUDIT_LOG = _resolve_path(os.getenv("MODAL_AUDIT_LOG") or "storage/modal_audit.log")
+# 中止方式（/stop、卡住的命令）：soft 只杀沙箱里我们自己起的命令进程、保留 /work，失败自动回退 terminate；
+# terminate 直接终止沙箱（/work 丢失）。其余值按 soft 处理。
+MODAL_INTERRUPT_MODE = (os.getenv("MODAL_INTERRUPT_MODE") or "").strip().lower()
+if MODAL_INTERRUPT_MODE not in ("soft", "terminate"):
+    MODAL_INTERRUPT_MODE = "soft"
+
 # 宿主机命令执行（FileAgent 的 run_host_command，见 app/infra/host_shell.py）。
 # 这是在用户真实机器上跑命令，没有任何沙箱：防线只有 人工授权 + 环境变量白名单 + 提示词约束。
 HOST_SHELL_TIMEOUT_SECONDS = int(os.getenv("HOST_SHELL_TIMEOUT_SECONDS", "60"))
@@ -216,7 +269,7 @@ def _parse_id_set(raw: str) -> frozenset:
     return frozenset(p.strip() for p in (raw or "").split(",") if p.strip())
 
 
-# owner = 命中这些平台 openid 的 QQ 用户 + 本地 CLI；其余用户都是 member（没有文件 / 命令 / 桌面 / 浏览器 / 代码能力）。
+# owner = 命中这些平台 openid 的 QQ 用户 + 本地 CLI；其余用户都是 member（没有文件 / 命令 / 桌面 / 浏览器能力；代码只能在云端沙箱里跑）。
 # openid 只在当前机器人 AppID 范围内有效：先让主号私聊机器人发 /whoami 取得 ID，再写进 .env 并重启
 OWNER_USER_IDS = _parse_id_set(os.getenv("OWNER_USER_IDS", ""))
 # member 同时在跑的轮数上限（owner 不占用）。至少为 1：0 会让信号量永远阻塞

@@ -816,6 +816,37 @@ def test_s_sandbox_outputs_middleware():
     assert res_ls.content == "file.txt"
     outbox.begin()
 
+# 阶段 2 之前算出的 owner 工具描述（docstring，字节级）的 sha256：member 的云端版工具不得影响它
+_OWNER_TOOL_DESCRIPTION_SHA256 = "a4a175f5278277119cb2c22f62ce59117e600b8909585571f9725faace2c85f4"
+
+
+def test_u_owner_tool_unchanged_by_stage2():
+    """U 阶段 2 抽出了共享的 _run_code，但 owner 的 execute_python_code 与 TOOLS 必须原样：同样的名字、同样的 docstring（字节级）、
+    调用时才去取 sandbox.get_sandbox()（现有测试靠运行时 monkeypatch 它）。"""
+    import hashlib
+    from app.infra import sandbox as sandbox_module
+    description = code_tools.execute_python_code.description
+    assert hashlib.sha256(description.encode("utf-8")).hexdigest() == _OWNER_TOOL_DESCRIPTION_SHA256, "owner 工具的描述被改动了"
+    assert code_tools.TOOLS == [code_tools.execute_python_code] and code_tools.execute_python_code.name == "execute_python_code"
+    assert list(code_tools.execute_python_code.args) == ["code"]
+    assert "Docker" in description and "/workspace" in description and "无网络访问权限" in description
+
+    calls = []
+
+    class _Stub:
+        def run_python(self, code):
+            calls.append(code)
+            raise sandbox_module.SandboxUnavailable("stub")
+
+    real = sandbox_module.get_sandbox
+    sandbox_module.get_sandbox = lambda: _Stub()
+    try:
+        out = code_tools.execute_python_code.invoke({"code": "print(1)"})
+    finally:
+        sandbox_module.get_sandbox = real
+    assert calls == ["print(1)"] and "代码执行沙箱不可用" in out, "owner 工具调用时才取 sandbox.get_sandbox()"
+
+
 SCENARIOS = [
     ("A 容器创建参数安全与挂载唯一性", test_a_creation_parameters_and_isolation),
     ("B 跨调用复用与空闲 TTL 重建", test_b_lifecycle_reuse_and_idle_ttl),
@@ -837,6 +868,7 @@ SCENARIOS = [
     ("R A1-A2 CodeAgent 沙箱工作台装配", test_r_code_agent_assembly_and_routing),
     ("S A3-L4 SandboxOutputsMiddleware 多模态投递", test_s_sandbox_outputs_middleware),
     ("T interrupt 不抢沙箱锁（/stop）", test_t_interrupt_does_not_take_lock),
+    ("U owner 的 execute_python_code 描述与工具集不变", test_u_owner_tool_unchanged_by_stage2),
 ]
 
 
