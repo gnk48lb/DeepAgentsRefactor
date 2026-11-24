@@ -140,9 +140,13 @@ def build_member_main_prompt(code_enabled: bool) -> str:
         else:
             sandbox_net = "它在云端沙箱里运行，沙箱可以联网（可以下载公开数据），但访问不到用户电脑上的任何文件。"
             data_rule = "要处理的数据必须原样写进 task 的 description（数据太多就让用户缩小范围，或改为让它从公开网址下载）；"
+        upload_rule = (
+            "用户通过聊天上传的文件，系统会放进沙箱的 /work/uploads/ 目录，并在用户消息开头的 <uploaded_files> 块里给出完整路径："
+            "处理它们时把路径原样写进 task 的 description，让 CodeAgent 直接在沙箱里读取，不要把文件内容抄进 description；"
+        )
         delegate = (
             "\n- 计算、数据处理与分析、绘图、批量处理文本或数据、需要运行代码或命令才能得到结果的任务，委派给 CodeAgent。"
-            + sandbox_net + data_rule
+            + sandbox_net + data_rule + upload_rule
             + "绘图要写清图的类型、数据、标题与坐标含义，并明确要求出图。同一个任务里需要的计算与绘图合并成一次 task。"
             "\n- CodeAgent 的云端沙箱闲置一段时间后会被回收，里面的文件随之丢失：不要让它“继续处理之前生成的文件”，"
             "需要延续时把上一步的关键结果写进新的 description。"
