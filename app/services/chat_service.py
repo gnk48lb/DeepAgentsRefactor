@@ -21,7 +21,7 @@ import re
 import time
 import traceback
 from dataclasses import dataclass
-from typing import Optional, Set, Any
+from typing import Optional, Sequence, Set, Any
 import httpx
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
@@ -31,10 +31,11 @@ from langgraph.errors import GraphRecursionError
 from app import config
 from app.agents import orchestrator
 from app.memory import injector, extractor
-from app.services import startup, session_log
+from app.services import startup, session_log, file_staging
 from app.runtime import outbox, hitl, cli_logger
 from app.infra import models, session_store, checkpointer, modal_sandbox
 from app.utils.text import extract_text
+from app.utils.files import IncomingFile
 from app.utils.images import guess_mime_type
 from app.utils.context import RequestContext, set_request_context, reset_request_context
 from app.utils.identity import OWNER_USER_ID, Identity, invalid_owner_ids, validate_user_id
@@ -121,6 +122,7 @@ def _reset_runtime_state() -> None:
     _current_turns.clear()
     _member_sem = None
     _member_code_enabled = False
+    file_staging.reset_runtime_state()
 
 
 def _identity_consistent(identity: Any) -> bool:
@@ -229,6 +231,13 @@ async def init_service() -> None:
         _agents = {"owner": built.owner, "member": built.member}
         await recover_orphans()
         info = store.get_session(sid, user_id=OWNER_USER_ID)
+        if config.QQ_FILE_ENABLED:
+            try:
+                removed = await asyncio.to_thread(file_staging.cleanup_expired_inbox)
+                if removed > 0:
+                    print(f"🧹 [chat_service] 清理过期 inbox 目录 {removed} 个")
+            except Exception as e:
+                print(f"⚠️ 警告：清理过期 inbox 失败 (非致命): {type(e).__name__}")
         _initialized = True
     except Exception:
         _agents = {}
@@ -420,6 +429,10 @@ async def _cmd_reset(turn_start: float, identity: Identity) -> ChatReply:
             await asyncio.to_thread(sandbox.reset_sandbox)
         except Exception as e:
             print(f"⚠️ 警告：沙箱重置失败 (非致命): {e}")
+        try:
+            await asyncio.to_thread(file_staging.clear_session_inbox, sid)         # 该会话上传的文件一并清掉
+        except Exception as e:
+            print(f"⚠️ 警告：清理会话 inbox 失败 (非致命): {type(e).__name__}")
     else:
         # member 的云端沙箱按 (用户, 会话) 隔离：只终止当前会话的那一个（/new、/switch 不动它）
         try:
@@ -746,10 +759,12 @@ async def process_message(
     image_url: Optional[str] = None,
     *,
     identity: Identity,
+    files: Optional[Sequence[IncomingFile]] = None,
 ) -> Optional[ChatReply]:
     """处理单条用户消息。不依赖 NoneBot，纯业务逻辑层。
 
     identity 由调用方（QQ 插件 / CLI）解析；它必须自洽，否则直接拒绝（失败即关闭，绝不回落成 owner）。
+    files 是 QQ 私聊里随消息到达的文件（只有 QQ 插件在非空时才传）：落地与回执见 app/services/file_staging.py。
     返回 None 表示这一轮被 /stop 中止（调用方不应再回复）。
     """
     if not _initialized:
@@ -774,9 +789,56 @@ async def process_message(
     if user.blocked and not identity.is_owner:
         return ChatReply(_BLOCKED_TEXT, [])
 
-    reply = await _process_unblocked(text, image_url, identity)
+    reply = await _process_with_files(text, image_url, identity, files)
     if welcome and reply is not None:
         reply = ChatReply(welcome + "\n\n" + reply.text, reply.images, reply.awaiting_approval)
+    return reply
+
+
+async def _process_with_files(
+    text: str, image_url: Optional[str], identity: Identity, files: Optional[Sequence[IncomingFile]]
+) -> Optional[ChatReply]:
+    """文件接收的分流：纯文件消息在锁外落地并回确定性回执（不调 LLM、不占用户锁）；
+    其余消息先等本用户在途的文件下载（/stop 除外），之后与没有文件时完全一致。"""
+    uid = identity.user_id
+    parsed = _parse_command(text)
+    incoming = list(files or ())
+    pure_file = bool(incoming) and parsed is None and not text.strip() and not image_url
+
+    # 1) 在途闸门：QQ 里"发文件 → 紧接着发文字"只隔 1~2 秒，而下载落地可能要几秒。无在途下载时同步返回
+    if not pure_file and not (parsed is not None and parsed[0] == "/stop"):
+        await file_staging.wait_for_pending(uid)
+
+    # 2) 没有文件，或是命令（命令消息附带的文件直接忽略）：与改动前完全一致
+    if not incoming or parsed is not None:
+        return await _process_unblocked(text, image_url, identity)
+
+    # 3) 门控：功能关闭 / member 未开放 / 云端 CodeAgent 未启用时，不下载、不落盘
+    ok, why = file_staging.gate(identity, member_code_enabled=_member_code_enabled)
+    if not ok:
+        if pure_file:
+            return ChatReply(why, [])
+        reply = await _process_unblocked(text, image_url, identity)        # 带文字：忽略文件，照常回答，并在前面说明
+        return reply if reply is None else ChatReply(why + "\n\n" + reply.text, reply.images, reply.awaiting_approval)
+
+    # 4) 落地（锁外：一个慢下载不会让该用户后续消息都收到"忙"，正在跑的回合也不会让文件收不进来）
+    sid = session_store.get_store().get_active_session_id(user_id=uid)
+    outcome = await file_staging.stage_incoming(incoming, identity=identity, session_id=sid)
+
+    # 5) 纯文件：确定性回执
+    if pure_file:
+        pending = False
+        if outcome.staged:
+            try:
+                pending = await _has_pending_approval(sid, uid)
+            except Exception:
+                pending = False
+        return ChatReply(file_staging.format_receipts(outcome, is_owner=identity.is_owner, approval_pending=pending), [])
+
+    # 6) 带文字（少见）：成功的文件靠 collect / inject 自动进入本回合；失败的逐条说明放在回答前面
+    reply = await _process_unblocked(text, image_url, identity)
+    if reply is not None and outcome.errors:
+        reply = ChatReply("\n".join(outcome.errors) + "\n\n" + reply.text, reply.images, reply.awaiting_approval)
     return reply
 
 
@@ -952,6 +1014,7 @@ async def _run_user_message(session_id: str, user_id: str, ev: Any, agent: Any, 
     except Exception:
         pass
 
+    messages = await _attach_uploaded_files(messages, session_id, user_id, ev)
     await asyncio.wait_for(
         agent.ainvoke({"messages": messages}, cfg),
         timeout=config.AGENT_TURN_TIMEOUT_SECONDS,
@@ -959,6 +1022,22 @@ async def _run_user_message(session_id: str, user_id: str, ev: Any, agent: Any, 
     # 有图片的轮不提取记忆（用户原话不含图片内容）
     memory_text = None if has_image else (text.strip() or None)
     return await _finalize_round(session_id, user_id, agent, cfg, turn_start, memory_text)
+
+
+async def _attach_uploaded_files(messages: list, session_id: str, user_id: str, ev: Any) -> list:
+    """把本条消息之前上传、尚未注入过的文件清单加到最后一条 HumanMessage 前面。永不抛异常；
+    只在 build_initial_messages 之后动 messages：RAG 查询、记忆抽取和事件日志里的文本都不含清单块。"""
+    if not config.QQ_FILE_ENABLED:
+        return messages
+    try:
+        notices = await file_staging.collect_pending_notices(session_id, user_id, upto_seq=ev.seq)
+        if not notices:
+            return messages
+        block = file_staging.format_uploaded_files_block(notices, is_owner=(user_id == OWNER_USER_ID))
+        return file_staging.inject_files_block(messages, block) if block else messages
+    except Exception as e:                       # CancelledError 是 BaseException，不会被吞：/stop 照常生效
+        print(f"⚠️ [file] 注入文件清单失败（非致命）: {type(e).__name__}")
+        return messages
 
 
 async def _run_approval(session_id: str, user_id: str, ev: Any, agent: Any, cfg: dict, turn_start: float) -> ChatReply:

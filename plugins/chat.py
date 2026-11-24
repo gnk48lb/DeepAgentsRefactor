@@ -9,6 +9,7 @@ from nonebot.exception import FinishedException
 
 from app import config
 from app.services import chat_service
+from app.utils.files import incoming_files_from_attachments
 from app.utils.identity import resolve_platform_user
 from app.utils.text import URL_REGEX, defang_urls
 
@@ -104,8 +105,13 @@ async def handle_chat(matcher: Matcher, event: MessageEvent):
 
     raw_text = "".join(text_parts).strip()
 
+    # 文件：QQ 的 file 段只留下载地址（丢了文件名和大小），所以文件名 / 大小取自 event.attachments；
+    # 下载地址带签名，等同凭证，这里不打印、不记录。只有确实带文件时才传 files，其余消息的调用与改动前完全一致
+    incoming_files = incoming_files_from_attachments(getattr(event, "attachments", None), message)
+    kwargs = {"files": incoming_files} if incoming_files else {}
+
     try:
-        reply = await chat_service.process_message(text=raw_text, image_url=image_url, identity=identity)
+        reply = await chat_service.process_message(text=raw_text, image_url=image_url, identity=identity, **kwargs)
         if reply is None:
             return
 

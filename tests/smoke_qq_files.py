@@ -1447,6 +1447,504 @@ def test_17_architecture():
 
 
 # ═════════════════════════════════════════════════════════════════════
+# chat_service 集成的桩与夹具（同 smoke_chat_service：orchestrator / injector / extractor / startup 在 import 前被桩掉）
+# ═════════════════════════════════════════════════════════════════════
+import types
+
+import app
+import app.agents
+import app.memory
+import app.services
+from langgraph.types import Command
+
+
+def _stub(pkg, name, **attrs):
+    m = types.ModuleType(f"{pkg.__name__}.{name}")
+    for k, v in attrs.items():
+        setattr(m, k, v)
+    sys.modules[m.__name__] = m
+    setattr(pkg, name, m)
+    return m
+
+
+MEM_CALLS, INJECTOR_CALLS, RESET_CALLS = [], [], []
+
+
+async def _fake_extract_memory(user_text, *, user_id):
+    MEM_CALLS.append(user_text)
+
+
+def _fake_build_initial_messages(user_query, history_messages=None, *, user_id):
+    INJECTOR_CALLS.append(user_query)
+    return [HumanMessage(content=user_query, name="user")]
+
+
+_stub(app.agents, "orchestrator", build_main_agents=None)
+_stub(app.memory, "injector", build_initial_messages=_fake_build_initial_messages)
+_stub(app.memory, "extractor", extract_and_store_memory=_fake_extract_memory)
+_stub(app.services, "startup", run_global_database_init=lambda: None)
+
+from app.services import chat_service as cs
+from app.infra import sandbox as docker_sandbox
+
+docker_sandbox.reset_sandbox = lambda: RESET_CALLS.append(1)          # 不碰真正的 Docker
+
+
+class _FakeState:
+    def __init__(self, messages, interrupts=()):
+        self.values = {"messages": list(messages)}
+        self.interrupts = tuple(interrupts)
+
+
+class _FakeAgent:
+    """最小的主图替身：记录每次收到的消息；可挂一个待授权的中断。"""
+
+    def __init__(self, reply="好的"):
+        self.reply = reply
+        self.invocations: list[list] = []
+        self.resumed: list = []
+        self.threads: dict[str, list] = {}
+        self.pending: dict[str, tuple] = {}
+
+    async def aget_state(self, cfg):
+        tid = cfg["configurable"]["thread_id"]
+        return _FakeState(self.threads.get(tid, []), self.pending.get(tid, ()))
+
+    async def ainvoke(self, inp, cfg):
+        tid = cfg["configurable"]["thread_id"]
+        thread = self.threads.setdefault(tid, [])
+        if isinstance(inp, Command):
+            self.resumed.append(inp)
+            self.pending.pop(tid, None)
+            thread.append(AIMessage(content="已处理授权"))
+            return
+        self.invocations.append(list(inp["messages"]))
+        thread.extend(inp["messages"])
+        thread.append(AIMessage(content=self.reply))
+
+
+class _Svc(_Staging):
+    """_Staging + 装好假主图的 chat_service。member_code 对应编译期门控的结果（_member_code_enabled）。"""
+
+    def __init__(self, handler=None, *, member_code=True, reply="好的", **cfg):
+        super().__init__(handler, **cfg)
+        self.member_code, self.reply = member_code, reply
+
+    def __enter__(self):
+        super().__enter__()
+        self.owner_agent, self.member_agent = _FakeAgent(self.reply), _FakeAgent(self.reply)
+        self._saved_cs = (cs._initialized, cs._agents, cs._checkpointer)
+        cs._reset_runtime_state()
+        cs._agents = {"owner": self.owner_agent, "member": self.member_agent}
+        cs._initialized, cs._checkpointer = True, None
+        cs._member_code_enabled = self.member_code
+        MEM_CALLS.clear(), INJECTOR_CALLS.clear(), RESET_CALLS.clear()
+        return self
+
+    def __exit__(self, *exc):
+        cs._reset_runtime_state()
+        cs._initialized, cs._agents, cs._checkpointer = self._saved_cs
+        return super().__exit__(*exc)
+
+
+async def _say(text, *, identity=OWNER, files=None, image_url=None):
+    kwargs = {"files": files} if files else {}
+    return await cs.process_message(text, image_url, identity=identity, **kwargs)
+
+
+def _sid(uid="owner") -> str:
+    return cs.get_active_session_id(user_id=uid)
+
+
+PDF = b"%PDF-1.7\n" + b"x" * 2000
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 12 chat_service 集成
+# ═════════════════════════════════════════════════════════════════════
+def test_12a_owner_pure_file_then_text():
+    """a 纯文件回执（不调 agent、没有 user_message）；b 用户锁被占用时仍是回执；c 先文件后文字：块只在最后一条消息前面、原话不污染 RAG / 记忆 / 事件日志、只注入一次、/reset 之后不再带。"""
+    async def scenario(env):
+        sid = _sid()
+        env.handler = lambda r: httpx.Response(200, content=PDF)
+        reply = await _say("", files=[_incoming("报告.pdf", size=len(PDF))])
+        assert reply.text == f"已暂存：报告[.]pdf（{F.format_file_size(len(PDF))}）。直接告诉我怎么处理（仅当前会话临时使用，不会存入知识库）。", reply.text
+        assert reply.images == [] and not reply.awaiting_approval
+        assert env.owner_agent.invocations == [] and env.member_agent.invocations == [] and INJECTOR_CALLS == []
+        assert env.events(sid, types=("user_message", "approval", "assistant_message")) == []
+        assert len(env.events(sid)) == 1 and len(_listing(env.inbox(sid))) == 1
+        assert _listing(env.inbox(sid))[0].startswith("报告_") and _listing(env.inbox(sid))[0].endswith(".pdf")
+
+        # b 用户锁被一轮占着：文件仍然收得进来，回执而不是"忙"提示；文字消息才是"忙"
+        lock = cs._user_lock("owner")
+        await lock.acquire()
+        try:
+            reply2 = await _say("", files=[_incoming("b.txt", url="https://a.example.com/b")])
+            assert reply2.text.startswith("已暂存：b[.]txt（") and "处理中" not in reply2.text
+            assert "还在处理中" in (await _say("hello")).text
+        finally:
+            lock.release()
+        assert len(env.events(sid)) == 2
+
+        # c 先文件后文字
+        r = await _say("总结一下这个文件")
+        assert r.text == "好的"
+        last = env.owner_agent.invocations[-1][-1]
+        assert isinstance(last.content, str) and last.content.startswith("<uploaded_files>\n"), last.content[:80]
+        assert last.content.endswith("</uploaded_files>\n\n总结一下这个文件"), "用户原话在块之后，中间空一行"
+        assert f"/workspace/inbox/{sid}/" in last.content and "报告[.]pdf" in last.content and "b[.]txt" in last.content
+        assert INJECTOR_CALLS == ["总结一下这个文件"], "RAG 查询（processed_text）不含文件块"
+        user_events = env.events(sid, types=("user_message",))
+        assert len(user_events) == 1 and user_events[0].payload["text"] == "总结一下这个文件"
+        assert "<uploaded_files>" not in json.dumps(user_events[0].payload, ensure_ascii=False)
+        assert all("<uploaded_files>" not in json.dumps(e.payload, ensure_ascii=False) for e in env.events(sid, types=None))
+        await asyncio.sleep(0.05)
+        assert MEM_CALLS == ["总结一下这个文件"], "记忆抽取拿到的是原话"
+        # 第二条文字不再带块
+        await _say("继续")
+        assert env.owner_agent.invocations[-1][-1].content == "继续"
+        # /reset 之后不再带 reset 之前的文件；owner 的 inbox 目录被删
+        await _say("", files=[_incoming("c.txt", url="https://a.example.com/c")])
+        assert env.inbox(sid).exists()
+        reset = await _say("/reset")
+        assert "对话上下文已清空" in reset.text and RESET_CALLS == [1] and not env.inbox(sid).exists()
+        await _say("reset 之后")
+        assert env.owner_agent.invocations[-1][-1].content == "reset 之后"
+
+    with contextlib.redirect_stdout(io.StringIO()), _Svc() as env:
+        _run(scenario(env))
+
+
+def test_12d_race_text_waits_for_slow_download():
+    async def scenario(env):
+        release = asyncio.Event()
+
+        async def gated(request):
+            await release.wait()
+            return httpx.Response(200, content=b"a,b\n1,2\n")
+        env.handler = gated
+        t1 = asyncio.create_task(_say("", files=[_incoming("data.csv")]))
+        await asyncio.sleep(0)
+        t2 = asyncio.create_task(_say("统计一下这个 CSV"))
+        await asyncio.sleep(0.1)
+        assert not t1.done() and not t2.done() and env.owner_agent.invocations == [], "文字消息要等文件落地"
+        release.set()
+        r1, r2 = await asyncio.gather(t1, t2)
+        assert r1.text.startswith("已暂存：data[.]csv") and r2.text == "好的"
+        last = env.owner_agent.invocations[-1][-1].content
+        assert last.startswith("<uploaded_files>") and "data_" in last and last.endswith("\n\n统计一下这个 CSV")
+
+    with contextlib.redirect_stdout(io.StringIO()), _Svc() as env:
+        _run(scenario(env))
+
+
+def test_12e_member_flow():
+    csv = b"x,y\n1,2\n" * 20
+
+    # 云端 CodeAgent 未启用：固定文案，没有发起下载
+    async def disabled(env):
+        calls = []
+        real = file_staging._download
+
+        async def spy(*a, **k):
+            calls.append(1)
+            return await real(*a, **k)
+        file_staging._download = spy
+        try:
+            r = await _say("", identity=MEMBER, files=[_incoming("d.csv")])
+        finally:
+            file_staging._download = real
+        assert r.text.endswith("当前未启用云端代码环境，暂不支持处理文件附件（仅支持文本和图片）。"), r.text
+        assert calls == [] and env.requests == [] and env.member_agent.invocations == []
+        assert not env.inbox().exists()
+
+    with contextlib.redirect_stdout(io.StringIO()), _Svc(member_code=False) as env:
+        _run(disabled(env))
+
+    async def enabled(env, menv):
+        env.handler = lambda r: httpx.Response(200, content=csv)
+        sid = _sid(UID)
+        r = await _say("", identity=MEMBER, files=[_incoming("销售.csv", size=len(csv))])
+        idle = max(1, (config.MODAL_IDLE_TIMEOUT_SECONDS + 30) // 60)
+        want = (f"已收到：销售[.]csv（{F.format_file_size(len(csv))}），已放入你的云端工作区。"
+                f"直接告诉我怎么处理（仅当前会话临时使用；闲置约 {idle} 分钟或发送 /reset 后会清空，需要时请重新发送）。")
+        assert r.text == config.MEMBER_WELCOME_TEXT.strip() + "\n\n" + want, r.text           # 新 member 的第一条是文件：欢迎语 + 回执
+        fsb = menv.fake.created[0]
+        path = env.events(sid)[0].payload["path"]
+        assert path.startswith("/work/uploads/销售_") and path.endswith(".csv") and fsb.filesystem.get(path) == csv
+        assert not env.inbox().exists() and env.member_agent.invocations == []
+        r = await _say("分析一下", identity=MEMBER)
+        block_msg = env.member_agent.invocations[-1][-1].content
+        assert block_msg.startswith("<uploaded_files>\n") and block_msg.endswith("\n\n分析一下") and f"→ {path}" in block_msg
+        for banned in BANNED_FOR_MEMBER + ("http",):
+            assert banned not in block_msg, banned
+        assert INJECTOR_CALLS == ["分析一下"]
+
+    with contextlib.redirect_stdout(io.StringIO()), _Svc(member_code=True) as env, _ModalEnv() as menv:
+        _run(enabled(env, menv))
+
+
+def test_12f_commands_and_stop():
+    async def scenario(env):
+        r = await _say("/whoami", files=[_incoming("a.txt")])
+        assert "身份：管理员" in r.text and env.requests == [] and not env.inbox().exists(), "命令附带的文件被忽略、没有下载"
+        assert env.events(_sid(), types=None) == [] or all(e.type != "file_uploaded" for e in env.events(_sid(), types=None))
+
+        release = asyncio.Event()
+
+        async def gated(request):
+            await release.wait()
+            return httpx.Response(200, content=b"data")
+        env.handler = gated
+        t1 = asyncio.create_task(_say("", files=[_incoming("slow.bin")]))
+        await asyncio.sleep(0.02)
+        started = time.monotonic()
+        stop = await asyncio.wait_for(_say("/stop"), 2)
+        assert time.monotonic() - started < 1 and "没有正在运行的任务" in stop.text, "在途下载期间 /stop 立即返回"
+        t3 = asyncio.create_task(_say("hello"))
+        await asyncio.sleep(0.05)
+        assert not t3.done(), "普通文字消息要等在途下载"
+        release.set()
+        await asyncio.gather(t1, t3)
+
+    with contextlib.redirect_stdout(io.StringIO()), _Svc() as env:
+        _run(scenario(env))
+
+
+def test_12g_text_with_file_and_failures():
+    async def scenario(env):
+        env.handler = lambda r: httpx.Response(404)
+        r = await _say("看看这个文件", files=[_incoming("x.txt")])
+        assert r.text == "文件链接已失效，请重新发送\n\n好的", r.text
+        assert env.owner_agent.invocations[-1][-1].content == "看看这个文件", "失败的文件不进清单"
+        env.handler = lambda r: httpx.Response(200, content=b"ok data")
+        r = await _say("再看看这个", files=[_incoming("y.txt", url="https://a.example.com/y")])
+        assert r.text == "好的"
+        assert env.owner_agent.invocations[-1][-1].content.startswith("<uploaded_files>"), "带文字的文件消息：成功的文件进入本回合"
+
+    with contextlib.redirect_stdout(io.StringIO()), _Svc() as env:
+        _run(scenario(env))
+
+
+def test_12h_hitl_pending_with_file():
+    async def scenario(env):
+        sid = _sid()
+        env.handler = lambda r: httpx.Response(200, content=b"report data")
+        env.owner_agent.pending[sid] = (types.SimpleNamespace(
+            id="i1", value={"action_requests": [{"name": "write_file", "args": {"file_path": "a.txt", "content": "x"}}]}),)
+        r = await _say("", files=[_incoming("r.txt")])
+        assert r.text.startswith("已暂存：r[.]txt（") and r.text.endswith("\n提醒：当前还有一项待授权的操作，请先回复 Y 或 N。"), r.text
+        assert env.owner_agent.invocations == []
+        r = await _say("Y")
+        assert len(env.owner_agent.resumed) == 1 and env.owner_agent.invocations == [], "Y 走审批流程，不注入块"
+        assert "<uploaded_files>" not in r.text
+        await _say("继续吧")
+        assert env.owner_agent.invocations[-1][-1].content.startswith("<uploaded_files>"), "审批期间到达的文件留给下一条真正的文字消息"
+
+    with contextlib.redirect_stdout(io.StringIO()), _Svc() as env:
+        _run(scenario(env))
+
+
+def test_12i_blocked_cap_and_disabled():
+    # 被封禁的 member：固定回复，没有下载
+    async def blocked(env):
+        env.store.touch_user(UID)
+        env.store.set_user_blocked(UID, True)
+        r = await _say("", identity=MEMBER, files=[_incoming("a.txt")])
+        assert r.text == "你当前无法使用本机器人。" and env.requests == []
+
+    with contextlib.redirect_stdout(io.StringIO()), _Svc() as env, _ModalEnv() as menv:
+        env.handler = lambda r: httpx.Response(200, content=b"x")
+        _run(blocked(env))
+        assert menv.fake.created == []
+
+    # 会话上限与 /reset 清零
+    async def cap(env):
+        env.handler = lambda r: httpx.Response(200, content=b"c" + bytes(r.url.path, "ascii"))
+        files = [_incoming(f"f{i}.txt", url=f"https://a.example.com/{i}") for i in range(4)]
+        for i in range(2):
+            assert (await _say("", files=[files[i]])).text.startswith("已暂存：")
+        r = await _say("", files=[files[2]])
+        assert r.text == "本会话已接收的文件数达到上限（2 个），请发送 /reset 清空或 /new 开始新对话后再发。", r.text
+        await _say("/reset")
+        assert (await _say("", files=[files[3]])).text.startswith("已暂存：")
+
+    with contextlib.redirect_stdout(io.StringIO()), _Svc(QQ_FILE_MAX_PER_SESSION=2) as env:
+        _run(cap(env))
+
+    # QQ_FILE_ENABLED=false：纯文件回固定文案；带文字的消息忽略附件
+    async def disabled(env):
+        env.handler = lambda r: httpx.Response(200, content=b"x")
+        assert (await _say("", files=[_incoming("a.txt")])).text == "当前未开启文件接收功能。"
+        r = await _say("你好", files=[_incoming("a.txt")])
+        assert r.text == "当前未开启文件接收功能。\n\n好的", r.text
+        assert env.requests == [] and not env.inbox().exists()
+        assert env.owner_agent.invocations[-1][-1].content == "你好", "功能关闭时清单块也不注入"
+
+    with contextlib.redirect_stdout(io.StringIO()), _Svc(QQ_FILE_ENABLED=False) as env:
+        _run(disabled(env))
+
+
+def test_12l_rag_isolation_static():
+    import ast
+    for path in (Path(file_staging.__file__), Path(F.__file__)):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                text = ast.unparse(node)
+                for banned in ("knowledge", "memory", "milvus", "injector", "extractor"):
+                    assert banned not in text, (path.name, text)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 13 QQ 插件
+# ═════════════════════════════════════════════════════════════════════
+def _load_chat_plugin():
+    """不启动 NoneBot：把 on_message / get_driver 换成桩后按文件路径加载 plugins/chat.py，拿到真实的 handle_chat（做法同 smoke_multiuser）。"""
+    import importlib.util
+    import nonebot
+
+    class _Driver:
+        def on_startup(self, func):
+            return func
+
+        def on_shutdown(self, func):
+            return func
+
+    class _MatcherFactory:
+        def handle(self):
+            return lambda func: func
+
+    orig = (nonebot.on_message, nonebot.get_driver)
+    nonebot.on_message = lambda *a, **k: _MatcherFactory()
+    nonebot.get_driver = lambda: _Driver()
+    try:
+        spec = importlib.util.spec_from_file_location("chat_plugin_files_under_test", ROOT / "plugins" / "chat.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        nonebot.on_message, nonebot.get_driver = orig
+    return mod
+
+
+def test_13_qq_plugin_files():
+    from nonebot.adapters.qq.event import C2CMessageCreateEvent, GroupAtMessageCreateEvent
+    from nonebot.adapters.qq.message import Attachment as AttachmentSeg, Message, MessageSegment
+    from nonebot.adapters.qq.models import FriendAuthor
+    from nonebot.adapters.qq.models.qq import Attachment as AttachmentModel
+    from nonebot.exception import FinishedException
+
+    mod = _load_chat_plugin()
+    calls = []
+
+    async def fake_process(text, image_url=None, *, identity, files=None):
+        calls.append({"text": text, "image_url": image_url, "identity": identity, "files": files, "has_files_kw": True})
+        return cs.ChatReply("机器人的回复", [])
+
+    async def legacy_process(text, image_url=None, *, identity):             # 没有 files 形参（smoke_multiuser.test_23 的 fake 就是这样）
+        calls.append({"text": text, "image_url": image_url, "identity": identity, "files": None, "has_files_kw": False})
+        return cs.ChatReply("机器人的回复", [])
+
+    class FakeMatcher:
+        def __init__(self):
+            self.sent = []
+
+        async def finish(self, message=None):
+            self.sent.append(message)
+            raise FinishedException()
+
+    secret = "https://multimedia.nt.qq.com.cn/download?fileid=FID&rkey=SECRETRKEY123"
+
+    def make_event(cls, *, content="", attachments=None, segments=None, **fields):
+        extra = {}
+        if segments is not None:
+            extra["get_message"] = lambda self: Message(segments)
+        sub = type(cls.__name__, (cls,), extra)
+        return sub.model_construct(content=content, attachments=attachments, **fields)
+
+    def c2c(openid="MEMBERAAA0001", **kw):
+        return make_event(C2CMessageCreateEvent, author=FriendAuthor.model_construct(id="x", user_openid=openid), **kw)
+
+    async def run(event):
+        matcher, buf = FakeMatcher(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            try:
+                await mod.handle_chat(matcher, event)
+                finished = False
+            except FinishedException:
+                finished = True
+        return matcher, finished, buf.getvalue()
+
+    orig_process, orig_init = mod.chat_service.process_message, mod.chat_service.is_initialized
+    mod.chat_service.is_initialized = lambda: True
+    outputs = []
+    try:
+        async def scenario():
+            mod.chat_service.process_message = fake_process
+            # a 只有文件：text=""、image_url=None、files 保留文件名与大小（来自 attachments，而不是丢了信息的 file 段）
+            att = AttachmentModel(content_type="file", filename="报告.pdf", size=1234, url=secret)
+            matcher, finished, out = await run(c2c(attachments=[att]))
+            outputs.append(out)
+            assert finished and len(calls) == 1 and "机器人的回复" in str(matcher.sent[0])
+            c = calls[-1]
+            assert c["text"] == "" and c["image_url"] is None and c["identity"].user_id == "MEMBERAAA0001"
+            assert c["files"] == [IncomingFile(url=secret, filename="报告.pdf", size=1234, content_type="file")], c["files"]
+
+            # c 图片 + 文件同一事件：image_url 照旧，files 只含文件
+            img = AttachmentModel(content_type="image/png", filename="p.png", size=10, url="https://gchat.qpic.cn/img?x=1")
+            await run(c2c(attachments=[img, att]))
+            c = calls[-1]
+            assert c["image_url"] == "https://gchat.qpic.cn/img?x=1"
+            assert [f.filename for f in c["files"]] == ["报告.pdf"]
+            # 只有图片：不带 files
+            await run(c2c(attachments=[img]))
+            assert calls[-1]["files"] is None and calls[-1]["image_url"] == "https://gchat.qpic.cn/img?x=1"
+
+            # 文字 + 文件
+            await run(c2c(content="帮我看看", attachments=[att]))
+            assert calls[-1]["text"] == "帮我看看" and len(calls[-1]["files"]) == 1
+
+            # d 没有 attachments（None）：回落到消息里的 file 段（只有 url）
+            seg = AttachmentSeg("file", data={"url": secret})
+            await run(c2c(attachments=None, segments=[seg]))
+            assert calls[-1]["files"] == [IncomingFile(url=secret)], calls[-1]["files"]
+            # 事件对象干脆没有 attachments 属性
+            class Bare(C2CMessageCreateEvent):
+                def __getattribute__(self, name):
+                    if name == "attachments":
+                        raise AttributeError(name)
+                    return super().__getattribute__(name)
+
+                def get_message(self):
+                    return Message([seg])
+            bare = Bare.model_construct(content="", author=FriendAuthor.model_construct(id="x", user_openid="MEMBERAAA0001"))
+            await run(bare)
+            assert calls[-1]["files"] == [IncomingFile(url=secret)]
+
+            # b 只有文字：没有 files 形参的 process_message 照常工作（I9）
+            mod.chat_service.process_message = legacy_process
+            n = len(calls)
+            matcher, finished, out = await run(c2c(content="帮我查天气"))
+            outputs.append(out)
+            assert finished and len(calls) == n + 1 and calls[-1]["text"] == "帮我查天气" and not calls[-1]["has_files_kw"]
+            matcher, finished, out = await run(c2c(content="带图", attachments=[img]))
+            assert finished and not calls[-1]["has_files_kw"] and calls[-1]["image_url"]
+
+            # f 非 C2C 事件仍被忽略（带文件也不处理）
+            mod.chat_service.process_message = fake_process
+            n = len(calls)
+            matcher, finished, out = await run(make_event(GroupAtMessageCreateEvent, attachments=[att]))
+            assert not finished and matcher.sent == [] and len(calls) == n
+
+        _run(scenario())
+    finally:
+        mod.chat_service.process_message, mod.chat_service.is_initialized = orig_process, orig_init
+    # e 全程不打印 URL
+    for out in outputs:
+        assert "rkey" not in out and "http" not in out and "SECRETRKEY123" not in out, out
+
+
+# ═════════════════════════════════════════════════════════════════════
 # 汇总
 # ═════════════════════════════════════════════════════════════════════
 SCENARIOS = [
@@ -1462,6 +1960,15 @@ SCENARIOS = [
     ("9 modal_sandbox 新函数（upload_session_file / generation / max_bytes）", test_9_modal_sandbox_helpers),
     ("10 在途闸门", test_10_inflight_gate),
     ("11 未消费文件清单 / 块 / 注入", test_11_notices_block_and_inject),
+    ("12.1 chat_service：owner 纯文件回执 / 先文件后文字 / 只注入一次 / reset", test_12a_owner_pure_file_then_text),
+    ("12.2 chat_service：慢下载 + 紧接着的文字（在途闸门）", test_12d_race_text_waits_for_slow_download),
+    ("12.3 chat_service：member（未启用 / 云端沙箱直传 / 欢迎语）", test_12e_member_flow),
+    ("12.4 chat_service：命令附带文件被忽略，/stop 不被闸门拖慢", test_12f_commands_and_stop),
+    ("12.5 chat_service：带文字的文件消息与失败说明", test_12g_text_with_file_and_failures),
+    ("12.6 chat_service：HITL 挂起时收到文件", test_12h_hitl_pending_with_file),
+    ("12.7 chat_service：封禁 / 会话上限 / 功能关闭", test_12i_blocked_cap_and_disabled),
+    ("12.8 RAG 隔离（静态）", test_12l_rag_isolation_static),
+    ("13 QQ 插件：附件提取与向后兼容", test_13_qq_plugin_files),
     ("14 session_tools 的 file_uploaded 事件", test_14_session_tools_file_uploaded),
     ("15 清理（TTL / reset / 不碰 inbox 之外）", test_15_cleanup),
     ("17 架构", test_17_architecture),
