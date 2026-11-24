@@ -10,12 +10,17 @@ QQ 文件接收（owner + member）离线冒烟测试：不需要 API Key / Dock
   14~17 session_tools、清理、提示词与技能、架构
 """
 import asyncio
+import contextlib
+import hashlib
+import inspect
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 import uuid
 from pathlib import Path
@@ -25,13 +30,18 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
+import httpx
+from langchain_core.messages import AIMessage, HumanMessage
+
 from app import config
 from app.infra import modal_sandbox, session_store
 from app.infra.session_store import SessionStore
+from app.services import file_staging
 from app.tools import session_tools
 from app.utils import files as F
 from app.utils.files import IncomingFile
-from _fake_modal import FakeModal
+from app.utils.identity import Identity, owner_identity
+from _fake_modal import Fail, FakeModal
 from _support import member_context
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -550,6 +560,893 @@ def test_14_session_tools_file_uploaded():
 
 
 # ═════════════════════════════════════════════════════════════════════
+# file_staging 的测试夹具
+# ═════════════════════════════════════════════════════════════════════
+URL = "https://multimedia.nt.qq.com.cn/download?appid=1&fileid=FID99&rkey=SECRETRKEY123"
+URL_PIECES = ("rkey", "SECRETRKEY123", "FID99", "multimedia.nt.qq.com.cn", "download?", "http")
+MEMBER = Identity(user_id=UID, is_owner=False, raw_id=UID)
+OWNER = owner_identity()
+
+
+def _incoming(name="report.pdf", size=0, url=URL):
+    return IncomingFile(url=url, filename=name, size=size, content_type="file")
+
+
+class _Chunks(httpx.AsyncByteStream):
+    """可观察的响应体：记录有没有被读、读了几块；可在第 N 块之后抛网络错误（异常文本里故意带上 URL）。"""
+
+    def __init__(self, chunks, *, delay=0.0, fail_after=None):
+        self.chunks, self.delay, self.fail_after = list(chunks), delay, fail_after
+        self.started, self.sent = False, 0
+
+    async def __aiter__(self):
+        self.started = True
+        for i, chunk in enumerate(self.chunks):
+            if self.fail_after is not None and i >= self.fail_after:
+                raise httpx.ReadError("connection reset while reading " + URL)
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            self.sent += 1
+            yield chunk
+
+    async def aclose(self):
+        pass
+
+
+def _make_dir_link(link: Path, target: Path) -> bool:
+    """建目录符号链接；Windows 没有权限时退而求其次建 junction。都不行返回 False（调用方 skip）。"""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return True
+    except (OSError, NotImplementedError):
+        pass
+    if os.name == "nt":
+        res = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True)
+        return res.returncode == 0 and link.exists()
+    return False
+
+
+def _remove_link(link: Path) -> None:
+    try:
+        os.unlink(link)
+    except OSError:
+        try:
+            os.rmdir(link)
+        except OSError:
+            pass
+
+
+class _Staging:
+    """临时 WORKSPACE_DIR + 临时 SessionStore + MockTransport 下载客户端 + 干净的 file_staging 运行时状态；退出时全部还原。
+    env.handler 可随时替换：同步或 async 的 (httpx.Request) -> httpx.Response 都行。"""
+
+    def __init__(self, handler=None, **cfg):
+        self.handler = handler or (lambda request: httpx.Response(200, content=b"data"))
+        self.cfg = cfg
+
+    def __enter__(self):
+        self.tmp = tempfile.mkdtemp(prefix="qqf-ws-")
+        self._saved = {k: getattr(config, k) for k in ("WORKSPACE_DIR", *self.cfg)}
+        config.WORKSPACE_DIR = self.tmp
+        for key, value in self.cfg.items():
+            setattr(config, key, value)
+        self._store_cm = _StoreDir()
+        self.store = self._store_cm.__enter__()
+        self.requests, self.clients = [], []
+        self._orig_client = file_staging._make_client
+        file_staging._make_client = self._make_client
+        file_staging.reset_runtime_state()
+        return self
+
+    def __exit__(self, *exc):
+        file_staging._make_client = self._orig_client
+        file_staging.reset_runtime_state()
+        self._store_cm.__exit__(*exc)
+        for key, value in self._saved.items():
+            setattr(config, key, value)
+        inbox = Path(self.tmp) / "inbox"
+        if file_staging._is_link(inbox):
+            _remove_link(inbox)
+        elif inbox.is_dir():
+            for child in inbox.iterdir():
+                if file_staging._is_link(child):
+                    _remove_link(child)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        return False
+
+    def _make_client(self):
+        client = httpx.AsyncClient(transport=httpx.MockTransport(self._dispatch), follow_redirects=False)
+        self.clients.append(client)
+        return client
+
+    async def _dispatch(self, request):
+        self.requests.append(str(request.url))
+        result = self.handler(request)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    def session(self, user_id="owner") -> str:
+        return self.store.create_session("t", user_id=user_id).id
+
+    def inbox(self, sid=None) -> Path:
+        base = Path(self.tmp) / "inbox"
+        return base / sid if sid else base
+
+    def events(self, sid, types=(session_store.EVENT_FILE_UPLOADED,)):
+        return self.store.get_last_events(sid, limit=100, types=types)
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _stage(files, *, identity=OWNER, sid):
+    return file_staging.stage_incoming(files, identity=identity, session_id=sid)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 6 下载（httpx.MockTransport）
+# ═════════════════════════════════════════════════════════════════════
+def test_6_download():
+    out = io.StringIO()
+    errors = []                                           # 所有错误文案，最后统一检查不含 URL 片段
+
+    async def call(env, handler, *, limit=MB, url=URL):
+        env.handler = handler
+        chunks = []
+        try:
+            total = await file_staging._download(url, limit=limit, on_chunk=chunks.append)
+            return total, b"".join(chunks), None
+        except file_staging.FileStageError as e:
+            errors.append(str(e))
+            assert str(e) == e.user_message and e.__cause__ is None
+            trace = "".join(traceback.format_exception(e))
+            assert not any(p in trace for p in ("SECRETRKEY123", "FID99")), trace
+            return None, None, e
+
+    async def scenario(env):
+        # 正常（多块），客户端被关闭
+        total, data, err = await call(env, lambda r: httpx.Response(200, content=b"hello world" * 100))
+        assert err is None and total == 1100 and data == b"hello world" * 100
+        assert all(c.is_closed for c in env.clients)
+        assert env.requests == [URL]
+
+        # Content-Length 超限：body 没被读就中止
+        body = _Chunks([b"x" * 1000] * 5)
+        _, _, err = await call(env, lambda r: httpx.Response(200, headers={"content-length": str(5 * MB)}, stream=body), limit=MB)
+        assert isinstance(err, file_staging._TooLarge) and not body.started
+
+        # 没有 Content-Length 的分块流：边读边累计，超限立即中止
+        body = _Chunks([b"x" * (400 * 1024)] * 10)
+        _, _, err = await call(env, lambda r: httpx.Response(200, stream=body), limit=MB)
+        assert isinstance(err, file_staging._TooLarge) and body.sent <= 3, body.sent
+        assert all(c.is_closed for c in env.clients)
+
+        # 刚好等于上限可以
+        total, _, err = await call(env, lambda r: httpx.Response(200, content=b"a" * MB), limit=MB)
+        assert err is None and total == MB
+
+        # 总期限：连接 / 响应头阶段卡住
+        config.QQ_FILE_DOWNLOAD_TIMEOUT_SECONDS = 0.3
+        async def slow_headers(r):
+            await asyncio.sleep(5)
+            return httpx.Response(200, content=b"x")
+        started = time.monotonic()
+        _, _, err = await call(env, slow_headers)
+        assert err is not None and err.user_message == "下载超时，请重新发送" and time.monotonic() - started < 3
+        # 总期限：读流阶段慢速滴灌（每块都没超时，但总时长超了）
+        _, _, err = await call(env, lambda r: httpx.Response(200, stream=_Chunks([b"x"] * 50, delay=0.1)))
+        assert err is not None and err.user_message == "下载超时，请重新发送"
+        # httpx 自己的超时异常（异常文本带 URL）
+        def raise_timeout(r):
+            raise httpx.ReadTimeout("timed out talking to " + URL)
+        _, _, err = await call(env, raise_timeout)
+        assert err.user_message == "下载超时，请重新发送"
+        config.QQ_FILE_DOWNLOAD_TIMEOUT_SECONDS = 30
+
+        # 状态码
+        for status in (403, 404, 410):
+            _, _, err = await call(env, lambda r, s=status: httpx.Response(s))
+            assert err.user_message == "文件链接已失效，请重新发送", status
+        _, _, err = await call(env, lambda r: httpx.Response(500))
+        assert err.user_message == "下载失败（HTTP 500）"
+        _, _, err = await call(env, lambda r: httpx.Response(204))
+        assert err.user_message == "下载失败（HTTP 204）"
+
+        # 重定向：目标不合格 / 太多跳 / 3 跳以内正常 / 相对路径
+        _, _, err = await call(env, lambda r: httpx.Response(302, headers={"location": "http://127.0.0.1/secret"}))
+        assert err.user_message == "文件链接无效，请重新发送"
+        _, _, err = await call(env, lambda r: httpx.Response(302, headers={"location": "https://10.1.2.3/x"}))
+        assert err.user_message == "文件链接无效，请重新发送"
+        _, _, err = await call(env, lambda r: httpx.Response(302))
+        assert err.user_message == "文件链接无效，请重新发送"
+        env.requests.clear()
+        _, _, err = await call(env, lambda r: httpx.Response(302, headers={"location": "https://cdn.example.com/next"}))
+        assert err.user_message == "下载失败（重定向过多）" and len(env.requests) == 4, env.requests
+
+        def chain(limit_hops):
+            def handler(r):
+                n = len(env.requests)
+                if n <= limit_hops:
+                    return httpx.Response(302, headers={"location": f"/hop{n}"})
+                return httpx.Response(200, content=b"final")
+            return handler
+        env.requests.clear()
+        total, data, err = await call(env, chain(3))
+        assert err is None and data == b"final", "3 跳以内允许"
+        assert env.requests[1] == "https://multimedia.nt.qq.com.cn/hop1", env.requests
+        env.requests.clear()
+        _, _, err = await call(env, chain(4))
+        assert err.user_message == "下载失败（重定向过多）"
+        env.requests.clear()
+        total, data, err = await call(env, lambda r: httpx.Response(302, headers={"location": "http://cdn.example.com/f"}) if len(env.requests) == 1 else httpx.Response(200, content=b"ok"))
+        assert env.requests[1] == "https://cdn.example.com/f", "重定向目标的 http 也被升级为 https"
+
+        # 0 字节
+        _, _, err = await call(env, lambda r: httpx.Response(200, content=b""))
+        assert err.user_message == "文件是空的"
+
+        # 网络错误：异常文本里带 URL，文案里不能有；中途断流
+        def raise_connect(r):
+            raise httpx.ConnectError("all connection attempts failed for " + URL)
+        _, _, err = await call(env, raise_connect)
+        assert err.user_message == "下载失败（网络错误）"
+        _, _, err = await call(env, lambda r: httpx.Response(200, stream=_Chunks([b"abc"] * 4, fail_after=2)))
+        assert err.user_message == "下载失败（网络错误）"
+        _, _, err = await call(env, lambda r: (_ for _ in ()).throw(OSError("disk or socket error " + URL)))
+        assert err.user_message == "下载失败（网络错误）"
+
+        # 非法链接：不发任何请求
+        env.requests.clear()
+        for bad in ("ftp://x.example.com/a", "http://127.0.0.1/a", "", "https://user:pw@a.example.com/x", "https://a.example.com:8443/x"):
+            _, _, err = await call(env, lambda r: httpx.Response(200, content=b"x"), url=bad)
+            assert err.user_message == "文件链接无效，请重新发送", bad
+        assert env.requests == []
+
+        # on_chunk 写盘失败 -> 保存失败，不是"网络错误"
+        env.handler = lambda r: httpx.Response(200, content=b"abc")
+        def bad_sink(chunk):
+            raise OSError("No space left on device")
+        try:
+            await file_staging._download(URL, limit=MB, on_chunk=bad_sink)
+            raise AssertionError("应该抛 FileStageError")
+        except file_staging.FileStageError as e:
+            assert e.user_message == "文件保存失败，请稍后重新发送"
+            errors.append(e.user_message)
+
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+        with _Staging() as env:
+            _run(scenario(env))
+    for text in errors:
+        assert not any(p in text for p in URL_PIECES if p != "http") and "://" not in text, text      # "HTTP 500" 里的 http 不算 URL
+    log = out.getvalue()
+    assert "⚠️ [file] 下载失败" in log, "网络类失败应该留一行只含异常类型名的日志"
+    assert not any(p in log for p in URL_PIECES), log                 # 日志里没有 URL 的任何片段（主机名也不写）
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 7 owner 落地
+# ═════════════════════════════════════════════════════════════════════
+def _listing(directory: Path):
+    return sorted(p.name for p in directory.iterdir()) if directory.exists() else []
+
+
+def test_7_owner_staging():
+    out = io.StringIO()
+    pdf = b"%PDF-1.7\n" + b"x" * 5000
+
+    async def scenario(env):
+        sid = env.session()
+        sha8 = hashlib.sha256(pdf).hexdigest()[:8]
+        env.handler = lambda r: httpx.Response(200, content=pdf)
+
+        res = await _stage([_incoming("report.pdf", size=len(pdf))], sid=sid)
+        assert res.errors == () and len(res.staged) == 1, res
+        item = res.staged[0]
+        assert item.disk_name == f"report_{sha8}.pdf" and item.display_name == "report.pdf" and item.size == len(pdf)
+        assert item.path == f"/workspace/inbox/{sid}/report_{sha8}.pdf" and item.gen == ""
+        assert (env.inbox(sid) / item.disk_name).read_bytes() == pdf
+        assert _listing(env.inbox(sid)) == [item.disk_name], "没有 .tmp_ 残留"
+        evs = env.events(sid)
+        assert len(evs) == 1 and evs[0].payload == {
+            "name": "report.pdf", "path": item.path, "size": len(pdf), "role": "owner", "gen": "",
+        }, evs
+        assert "http" not in json.dumps(evs[0].payload) and "rkey" not in json.dumps(evs[0].payload)
+        assert not any(e.type == "user_message" for e in env.events(sid, types=None)), "不产生入站事件"
+
+        # 同内容重发：不新增文件，但有新事件；同名不同内容：两个文件共存
+        res = await _stage([_incoming("report.pdf")], sid=sid)
+        assert res.staged[0].disk_name == item.disk_name and _listing(env.inbox(sid)) == [item.disk_name]
+        assert len(env.events(sid)) == 2
+        env.handler = lambda r: httpx.Response(200, content=pdf + b"changed")
+        res = await _stage([_incoming("report.pdf")], sid=sid)
+        assert res.staged[0].disk_name != item.disk_name and len(_listing(env.inbox(sid))) == 2
+
+        # 清洗：路径穿越文件名只取 basename；无后缀按魔数补；特殊字符进不了磁盘名
+        env.handler = lambda r: httpx.Response(200, content=pdf)
+        res = await _stage([_incoming("../../etc/passwd"), _incoming("noext"), _incoming("my report (1)$.CSV")], sid=sid)
+        names = [x.disk_name for x in res.staged]
+        assert names == [f"passwd_{sha8}.pdf", f"noext_{sha8}.pdf", f"my_report__1___{sha8}.csv"], names
+        assert res.staged[2].display_name == "my report (1)$.csv"
+        assert not (Path(env.tmp) / "etc").exists() and not (Path(env.tmp).parent / "etc").exists()
+
+        # 下载中途失败：没有 .tmp_ 残留，没有事件
+        before_files, before_events = _listing(env.inbox(sid)), len(env.events(sid))
+        env.handler = lambda r: httpx.Response(200, stream=_Chunks([b"abc"] * 4, fail_after=2))
+        res = await _stage([_incoming("broken.bin")], sid=sid)
+        assert res.staged == () and res.errors == ("下载失败（网络错误）",), res
+        assert _listing(env.inbox(sid)) == before_files and len(env.events(sid)) == before_events
+
+        # 超限：声明的大小超限不发请求；响应头 / 流超限都不落盘
+        env.requests.clear()
+        limit_mb = config.QQ_FILE_MAX_MB_OWNER
+        res = await _stage([_incoming("big.zip", size=limit_mb * MB + 1)], sid=sid)
+        assert res.errors == (f"文件「big[.]zip」超过 {limit_mb} MB 的上限，没有接收。",) and env.requests == [], res
+        env.handler = lambda r: httpx.Response(200, stream=_Chunks([b"x" * 1000]), headers={"content-length": str((limit_mb + 1) * MB)})
+        res = await _stage([_incoming("big2.zip")], sid=sid)
+        assert res.errors == (f"文件「big2[.]zip」超过 {limit_mb} MB 的上限，没有接收。",)
+        assert _listing(env.inbox(sid)) == before_files
+
+        # 单条消息最多 N 个；会话上限与 /reset 清零
+        config.QQ_FILE_MAX_PER_MESSAGE = 2
+        env.handler = lambda r: httpx.Response(200, content=b"tiny" + bytes(r.url.path, "ascii"))
+        sid2 = env.session()
+        res = await _stage([_incoming(f"f{i}.txt", url=f"https://a.example.com/{i}") for i in range(4)], sid=sid2)
+        assert len(res.staged) == 2 and res.errors == ("一次最多接收 2 个文件，多出的 2 个没有接收。",), res
+        config.QQ_FILE_MAX_PER_MESSAGE = 5
+        config.QQ_FILE_MAX_PER_SESSION = 3
+        res = await _stage([_incoming("a.txt", url="https://a.example.com/a"), _incoming("b.txt", url="https://a.example.com/b")], sid=sid2)
+        assert len(res.staged) == 1 and len(res.errors) == 1, res
+        cap_msg = "本会话已接收的文件数达到上限（3 个），请发送 /reset 清空或 /new 开始新对话后再发。"
+        assert res.errors == (cap_msg,), res
+        res = await _stage([_incoming("c.txt", url="https://a.example.com/c")], sid=sid2)
+        assert res.staged == () and res.errors == (cap_msg,)
+        env.store.emit_event(sid2, "session_reset", {})
+        res = await _stage([_incoming("c.txt", url="https://a.example.com/c")], sid=sid2)
+        assert len(res.staged) == 1 and res.errors == (), "/reset 之后计数清零"
+
+        # 全局并发信号量：QQ_FILE_MAX_CONCURRENT=1 时同一时刻最多一个在下载
+        config.QQ_FILE_MAX_CONCURRENT = 1
+        file_staging.reset_runtime_state()
+        active = {"now": 0, "max": 0}
+
+        async def slow(request):
+            active["now"] += 1
+            active["max"] = max(active["max"], active["now"])
+            await asyncio.sleep(0.05)
+            active["now"] -= 1
+            return httpx.Response(200, content=b"c" + bytes(request.url.path, "ascii"))
+        env.handler = slow
+        sid3 = env.session()
+        results = await asyncio.gather(*[
+            _stage([_incoming(f"p{i}.txt", url=f"https://a.example.com/p{i}")], sid=sid3) for i in range(3)
+        ])
+        assert all(len(r.staged) == 1 for r in results) and active["max"] == 1, active
+        config.QQ_FILE_MAX_CONCURRENT = 3
+
+        # 非法会话 id：拒绝且不写
+        env.handler = lambda r: httpx.Response(200, content=b"x")
+        res = await _stage([_incoming("a.txt")], sid="../../outside")
+        assert res.staged == () and len(res.errors) == 1 and "/new" in res.errors[0], res
+        assert not (Path(env.tmp).parent / "outside").exists()
+
+    with contextlib.redirect_stdout(out):
+        with _Staging(QQ_FILE_MAX_PER_MESSAGE=5, QQ_FILE_MAX_PER_SESSION=20, QQ_FILE_MAX_CONCURRENT=3) as env:
+            _run(scenario(env))
+    log = out.getvalue()
+    assert "📎 [file] user=owner role=owner staged=1 failed=0" in log, log
+    assert not any(p in log for p in URL_PIECES) and ".pdf" not in log and "report" not in log, "日志不含 URL 与文件名"
+
+
+def test_7b_owner_symlink_rejected():
+    async def scenario(env):
+        sid = env.session()
+        outside = Path(tempfile.mkdtemp(prefix="qqf-outside-"))
+        try:
+            env.handler = lambda r: httpx.Response(200, content=b"payload")
+            # inbox 本身是链接
+            if not _make_dir_link(Path(env.tmp) / "inbox", outside):
+                print("    [skip] 当前环境无法创建符号链接 / junction，跳过链接用例")
+                return
+            res = await _stage([_incoming("a.txt")], sid=sid)
+            assert res.staged == () and len(res.errors) == 1, res
+            assert os.listdir(outside) == [], "inbox 是链接：不能写出去"
+            _remove_link(Path(env.tmp) / "inbox")
+            # <sid> 本身是链接
+            env.inbox().mkdir()
+            assert _make_dir_link(env.inbox(sid), outside)
+            res = await _stage([_incoming("a.txt")], sid=sid)
+            assert res.staged == () and len(res.errors) == 1 and os.listdir(outside) == [], res
+            assert env.events(sid) == [], "失败不写事件"
+        finally:
+            _remove_link(Path(env.tmp) / "inbox")
+            _remove_link(env.inbox() / sid) if (env.inbox() / sid).exists() else None
+            shutil.rmtree(outside, ignore_errors=True)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with _Staging() as env:
+            _run(scenario(env))
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 8 member 落地
+# ═════════════════════════════════════════════════════════════════════
+def test_8_member_staging():
+    out = io.StringIO()
+    csv = b"a,b\n1,2\n" * 50
+
+    async def scenario(env, menv):
+        sid = env.session(UID)
+        sha8 = hashlib.sha256(csv).hexdigest()[:8]
+        env.handler = lambda r: httpx.Response(200, content=csv)
+        sandbox_tmp = tempfile.mkdtemp(prefix="qqf-tmpcheck-")
+        old_tempdir, tempfile.tempdir = tempfile.tempdir, sandbox_tmp
+        try:
+            res = await _stage([_incoming("数据 表.csv", size=len(csv))], identity=MEMBER, sid=sid)
+        finally:
+            tempfile.tempdir = old_tempdir
+        assert res.errors == () and len(res.staged) == 1, res
+        item = res.staged[0]
+        assert item.disk_name == f"数据_表_{sha8}.csv" and item.path == f"/work/uploads/数据_表_{sha8}.csv"
+        fsb = menv.fake.created[0]
+        assert fsb.filesystem.get(item.path) == csv
+        assert item.gen == fsb.object_id and item.gen
+        assert not env.inbox().exists(), "宿主机上没有 inbox"
+        assert os.listdir(sandbox_tmp) == [], "宿主机临时目录里没有新文件"
+        shutil.rmtree(sandbox_tmp, ignore_errors=True)
+        ev = env.events(sid)[0].payload
+        assert ev == {"name": "数据 表.csv", "path": item.path, "size": len(csv), "role": "member", "gen": fsb.object_id}, ev
+        assert not any(Path(env.tmp).rglob("*.csv")), "工作区下没有任何落盘文件"
+
+        # QQ_FILE_MAX_MB_MEMBER 生效；上限之内即使超过 5 MiB 也能上传（经 max_bytes），agent 侧上传仍是 5 MiB
+        config.QQ_FILE_MAX_MB_MEMBER = 1
+        env.handler = lambda r: httpx.Response(200, content=b"a" * (MB + 1))
+        res = await _stage([_incoming("x.bin")], identity=MEMBER, sid=sid)
+        assert res.staged == () and res.errors == ("文件「x[.]bin」超过 1 MB 的上限，没有接收。",), res
+        config.QQ_FILE_MAX_MB_MEMBER = 10
+        big = b"b" * (6 * MB)
+        env.handler = lambda r: httpx.Response(200, content=big)
+        res = await _stage([_incoming("big.bin")], identity=MEMBER, sid=sid)
+        assert len(res.staged) == 1 and fsb.filesystem.get(res.staged[0].path) == big
+        with menv.pool.lease(UID, sid) as sb:
+            assert sb.upload_files([("/work/z.bin", big)])[0].error == "file_too_large"
+
+        # 沙箱不可用：友好文案、不发事件、不落盘
+        n_events = len(env.events(sid))
+        menv.fake.create_default = Fail(menv.fake.exception.NotFoundError("no image"))
+        env.handler = lambda r: httpx.Response(200, content=b"new content")
+        sid_b = env.session(UID2)
+        res = await _stage([_incoming("a.txt")], identity=Identity(UID2, False, UID2), sid=sid_b)
+        assert res.staged == () and res.errors == ("文件放入云端工作区失败，请稍后重新发送",), res
+        assert env.events(sid_b) == [] and not env.inbox().exists()
+        assert not any(p in e for e in res.errors for p in ("no image", "Image", "modal"))
+
+    with contextlib.redirect_stdout(out):
+        with _Staging() as env, _ModalEnv() as menv:
+            _run(scenario(env, menv))
+    # 总容量满：另一个用户的沙箱占着唯一名额
+    with contextlib.redirect_stdout(out):
+        with _Staging() as env, _ModalEnv(MODAL_MAX_SANDBOXES_PER_USER=1, MODAL_MAX_SANDBOXES_TOTAL=1) as menv:
+            async def busy():
+                sid = env.session(UID)
+                env.handler = lambda r: httpx.Response(200, content=b"zzz")
+                with menv.pool.lease(UID2, "other-session"):             # 占着唯一的名额，且不可驱逐
+                    res = await _stage([_incoming("a.txt")], identity=MEMBER, sid=sid)
+                assert res.staged == () and res.errors == ("云端代码沙箱现在比较繁忙，请稍后再试",), res
+                assert env.events(sid) == []
+            _run(busy())
+
+    # 静态检查：_stage_member 里没有任何宿主机文件操作（I2）
+    src = inspect.getsource(file_staging._stage_member)
+    for banned in ("open(", "tempfile", "Path(", "os.replace", "shutil"):
+        assert banned not in src, f"_stage_member 不得出现 {banned!r}"
+    # file_staging 不 import 宿主机相关模块（I2 / I11）
+    import ast
+    tree = ast.parse(Path(file_staging.__file__).read_text(encoding="utf-8"))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+            imported.update(f"{node.module}.{a.name}" for a in node.names)
+    for banned in ("app.tools", "app.agents", "app.memory", "app.knowledge", "app.infra.models", "app.infra.milvus_client",
+                   "app.infra.sandbox", "app.infra.host_shell", "app.tools.markitdown_tool", "langchain", "modal", "tempfile"):
+        assert not any(m == banned or m.startswith(banned + ".") for m in imported), (banned, sorted(imported))
+
+    # 门控
+    def gate(identity, enabled=True, **cfg):
+        old = {k: getattr(config, k) for k in cfg}
+        for k, v in cfg.items():
+            setattr(config, k, v)
+        try:
+            return file_staging.gate(identity, member_code_enabled=enabled)
+        finally:
+            for k, v in old.items():
+                setattr(config, k, v)
+
+    assert gate(OWNER) == (True, "") and gate(MEMBER) == (True, "")
+    assert gate(OWNER, QQ_FILE_ENABLED=False) == (False, "当前未开启文件接收功能。")
+    assert gate(MEMBER, QQ_FILE_ENABLED=False) == (False, "当前未开启文件接收功能。")
+    assert gate(MEMBER, QQ_FILE_MEMBER_ENABLED=False) == (False, "文件接收功能目前仅对管理员开放。")
+    assert gate(OWNER, QQ_FILE_MEMBER_ENABLED=False) == (True, ""), "owner 不受 member 开关影响"
+    assert gate(MEMBER, enabled=False) == (False, "当前未启用云端代码环境，暂不支持处理文件附件（仅支持文本和图片）。")
+    assert gate(OWNER, enabled=False) == (True, ""), "owner 不依赖云端 CodeAgent"
+    assert gate(MEMBER, QQ_FILE_ENABLED=False, QQ_FILE_MEMBER_ENABLED=False)[1] == "当前未开启文件接收功能。", "总开关优先"
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 10 在途闸门
+# ═════════════════════════════════════════════════════════════════════
+def test_10_inflight_gate():
+    async def scenario(env):
+        sid = env.session()
+        release = asyncio.Event()
+
+        async def gated(request):
+            await release.wait()
+            return httpx.Response(200, content=b"late data")
+        env.handler = gated
+
+        # 慢下载期间 wait_for_pending 被挂起，落地之后才返回
+        task = asyncio.create_task(_stage([_incoming("a.txt")], sid=sid))
+        await asyncio.sleep(0)                                   # 让 stage_incoming 跑到第一个挂起点（此时已登记）
+        assert file_staging._inflight == {"owner": 1}
+        waiter = asyncio.create_task(file_staging.wait_for_pending("owner"))
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+        other = asyncio.create_task(file_staging.wait_for_pending("member001"))
+        await asyncio.sleep(0)
+        assert other.done(), "别的用户不受影响"
+        release.set()
+        await waiter
+        assert task.done(), "waiter 返回时落地已完成"
+        res = await task
+        assert len(res.staged) == 1 and len(env.events(sid)) == 1 and file_staging._inflight == {}
+        assert file_staging._idle_events == {}
+
+        # 没有在途下载：同步返回，不让出事件循环
+        order = []
+
+        async def probe():
+            order.append("probe")
+
+        t = asyncio.create_task(probe())
+        await file_staging.wait_for_pending("owner")
+        order.append("after-wait")
+        await t
+        assert order == ["after-wait", "probe"], order
+
+        # 下载抛错 / 被取消：登记仍被注销，等待者被放行
+        env.handler = lambda r: httpx.Response(500)
+        res = await _stage([_incoming("a.txt")], sid=sid)
+        assert res.staged == () and file_staging._inflight == {}
+        release.clear()
+        env.handler = gated
+        task = asyncio.create_task(_stage([_incoming("b.txt", url="https://a.example.com/b")], sid=sid))
+        await asyncio.sleep(0.02)
+        waiter = asyncio.create_task(file_staging.wait_for_pending("owner"))
+        await asyncio.sleep(0.02)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        await asyncio.wait_for(waiter, 2)
+        assert file_staging._inflight == {} and file_staging._idle_events == {}
+
+        # 等待上限生效（QQ_FILE_DOWNLOAD_TIMEOUT_SECONDS + 20 秒；这里把它调成 -19.9 秒，上限就是 0.1 秒）
+        config.QQ_FILE_DOWNLOAD_TIMEOUT_SECONDS = -19.9
+        file_staging._register("stuck-user")
+        started = time.monotonic()
+        await file_staging.wait_for_pending("stuck-user")
+        assert 0.05 < time.monotonic() - started < 2
+        file_staging._unregister("stuck-user")
+        config.QQ_FILE_DOWNLOAD_TIMEOUT_SECONDS = 30
+
+        # 纯文件之间不互相等待：两个同用户的下载必须能同时在途
+        file_staging.reset_runtime_state()
+        both = {"n": 0}
+        started_both = asyncio.Event()
+
+        async def rendezvous(request):
+            both["n"] += 1
+            if both["n"] >= 2:
+                started_both.set()
+            await asyncio.wait_for(started_both.wait(), 3)         # 串行的话第二个永远来不了，这里会超时
+            return httpx.Response(200, content=b"r" + bytes(request.url.path, "ascii"))
+        env.handler = rendezvous
+        res = await asyncio.gather(
+            _stage([_incoming("x.txt", url="https://a.example.com/x")], sid=sid),
+            _stage([_incoming("y.txt", url="https://a.example.com/y")], sid=sid),
+        )
+        assert all(len(r.staged) == 1 for r in res), res
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with _Staging() as env:
+            _run(scenario(env))
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 11 collect_pending_notices / 清单块 / 注入
+# ═════════════════════════════════════════════════════════════════════
+BANNED_FOR_MEMBER = ("workspace", "Docker", "宿主机", "FileAgent", "DesktopAgent", "BrowserAgent")
+
+
+def _emit_file(store, sid, name, path, *, gen="", size=1234, role="owner"):
+    return store.emit_event(sid, session_store.EVENT_FILE_UPLOADED, {"name": name, "path": path, "size": size, "role": role, "gen": gen})
+
+
+def _touch_owner_file(env, sid, disk_name):
+    d = env.inbox(sid)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / disk_name).write_bytes(b"x")
+    return f"/workspace/inbox/{sid}/{disk_name}"
+
+
+def test_11_notices_block_and_inject():
+    with contextlib.redirect_stdout(io.StringIO()), _Staging() as env:
+        s = env.store
+        sid = env.session()
+        collect = lambda upto, uid="owner": _run(file_staging.collect_pending_notices(sid, uid, upto_seq=upto))
+
+        pa = _touch_owner_file(env, sid, "a_11111111.txt")
+        pb = _touch_owner_file(env, sid, "b_22222222.txt")
+        _emit_file(s, sid, "a.txt", pa)                                   # seq 1
+        _emit_file(s, sid, "b.txt", pb)                                   # seq 2
+        n1 = s.emit_event(sid, "user_message", {"text": "q1"})            # seq 3
+        assert [n.name for n in collect(n1)] == ["a.txt", "b.txt"] and all(n.available for n in collect(n1))
+        pc = _touch_owner_file(env, sid, "c_33333333.txt")
+        _emit_file(s, sid, "c.txt", pc)                                   # seq 4
+        n2 = s.emit_event(sid, "user_message", {"text": "q2"})            # seq 5
+        assert [n.name for n in collect(n2)] == ["c.txt"], "上一条文字消息之前的文件不重复注入"
+        late = _emit_file(s, sid, "late.txt", _touch_owner_file(env, sid, "late_44444444.txt"))   # seq 6：晚于注入时刻
+        assert [n.name for n in collect(n2)] == ["c.txt"], "seq >= upto_seq 的不注入"
+        n3 = s.emit_event(sid, "user_message", {"text": "q3"})
+        assert [n.name for n in collect(n3)] == ["late.txt"], "晚到的文件留给下一条消息"
+        assert collect(s.emit_event(sid, "user_message", {"text": "q4"})) == []
+
+        # /reset 之前的文件不注入
+        _emit_file(s, sid, "pre.txt", _touch_owner_file(env, sid, "pre_55555555.txt"))
+        s.emit_event(sid, "session_reset", {})
+        n5 = s.emit_event(sid, "user_message", {"text": "after reset"})
+        assert collect(n5) == []
+        # reset 之后的文件注入；同一路径重发按 path 去重；owner 文件被删 -> available=False
+        pd = _touch_owner_file(env, sid, "d_66666666.txt")
+        _emit_file(s, sid, "d.txt", pd)
+        _emit_file(s, sid, "d-again.txt", pd)
+        pe = _touch_owner_file(env, sid, "e_77777777.txt")
+        _emit_file(s, sid, "e.txt", pe)
+        (env.inbox(sid) / "e_77777777.txt").unlink()
+        n6 = s.emit_event(sid, "user_message", {"text": "q6"})
+        got = collect(n6)
+        assert [(n.name, n.available) for n in got] == [("d-again.txt", True), ("e.txt", False)], got
+        assert got[0].size == 1234 and got[0].path == pd and got[0].ts > 0
+
+        # 条数上限：取最近的
+        sid2 = env.session()
+        for i in range(4):
+            _emit_file(s, sid2, f"f{i}.txt", _touch_owner_file(env, sid2, f"f{i}_0000000{i}.txt"))
+        n = s.emit_event(sid2, "user_message", {"text": "q"})
+        old = config.QQ_FILE_INJECT_MAX_ITEMS
+        config.QQ_FILE_INJECT_MAX_ITEMS = 2
+        try:
+            assert [x.name for x in _run(file_staging.collect_pending_notices(sid2, "owner", upto_seq=n))] == ["f2.txt", "f3.txt"]
+        finally:
+            config.QQ_FILE_INJECT_MAX_ITEMS = old
+        # 路径跑出 inbox 之外 / 不是 /workspace/inbox 开头 -> 不可用
+        sid3 = env.session()
+        (Path(env.tmp) / "secret.txt").write_text("s")
+        _emit_file(s, sid3, "evil.txt", f"/workspace/inbox/{sid3}/../../secret.txt")
+        _emit_file(s, sid3, "evil2.txt", "/etc/passwd")
+        n = s.emit_event(sid3, "user_message", {"text": "q"})
+        assert [x.available for x in _run(file_staging.collect_pending_notices(sid3, "owner", upto_seq=n))] == [False, False]
+
+    # member：代标识
+    with contextlib.redirect_stdout(io.StringIO()), _Staging() as env, _ModalEnv() as menv:
+        s = env.store
+        sid = env.session(UID)
+        up = modal_sandbox.upload_session_file
+        ok, gen1 = up(UID, sid, "/work/uploads/old_aaaaaaaa.csv", b"1")
+        assert ok
+        _emit_file(s, sid, "old.csv", "/work/uploads/old_aaaaaaaa.csv", gen=gen1, role="member")
+        n1 = s.emit_event(sid, "user_message", {"text": "q1"})
+        got = _run(file_staging.collect_pending_notices(sid, UID, upto_seq=n1))
+        assert [(x.name, x.available) for x in got] == [("old.csv", True)]
+        menv.fake.advance(10 ** 5)                                         # 沙箱被回收
+        ok, gen2 = up(UID, sid, "/work/uploads/new_bbbbbbbb.csv", b"2")    # 重新上传 -> 新沙箱、新一代
+        assert ok and gen2 != gen1
+        _emit_file(s, sid, "new.csv", "/work/uploads/new_bbbbbbbb.csv", gen=gen2, role="member")
+        n2 = s.emit_event(sid, "user_message", {"text": "q2"})
+        # 构造"上一轮之前上传、这一轮还没消费"的旧文件：把 old 放在新边界之后
+        _emit_file(s, sid, "old2.csv", "/work/uploads/old_aaaaaaaa.csv", gen=gen1, role="member")
+        _emit_file(s, sid, "new2.csv", "/work/uploads/new_bbbbbbbb.csv", gen=gen2, role="member")
+        n3 = s.emit_event(sid, "user_message", {"text": "q3"})
+        got = _run(file_staging.collect_pending_notices(sid, UID, upto_seq=n3))
+        assert [(x.name, x.available) for x in got] == [("old2.csv", False), ("new2.csv", True)], got
+        # 沙箱再被回收：全部不可用
+        menv.fake.advance(10 ** 5)
+        got = _run(file_staging.collect_pending_notices(sid, UID, upto_seq=n3))
+        assert [x.available for x in got] == [False, False]
+        # 事件里没有代标识（异常数据）-> 不可用
+        sid_x = env.session(UID2)
+        _emit_file(s, sid_x, "x.csv", "/work/uploads/x_cccccccc.csv", gen="", role="member")
+        nx = s.emit_event(sid_x, "user_message", {"text": "q"})
+        assert [x.available for x in _run(file_staging.collect_pending_notices(sid_x, UID2, upto_seq=nx))] == [False]
+
+    # 清单块
+    ts = time.mktime((2026, 1, 2, 9, 5, 0, 0, 0, -1))
+    ok_n = file_staging.FileNotice("a.py", 35 * 1024, "/workspace/inbox/s1234567/a_deadbeef.py", ts, True)
+    bad_n = file_staging.FileNotice("b.csv", 100, "/workspace/inbox/s1234567/b_deadbeef.csv", ts, False)
+    block = file_staging.format_uploaded_files_block([ok_n, bad_n], is_owner=True)
+    assert block.startswith("<uploaded_files>\n用户在发这条消息之前，通过 QQ 上传了下面这些文件（仅本次会话临时使用，不会进入知识库；用户的原话在本块之后）：\n")
+    assert "- a[.]py（35.0 KB，09:05 上传）→ /workspace/inbox/s1234567/a_deadbeef.py\n" in block
+    assert "以下文件已失效（已被清理），不要委派，请告诉用户重新发送：\n- b[.]csv（100 B，09:05 上传）\n\n处理规则：\n1. " in block
+    assert "FileAgent" in block and "/workspace/inbox/" in block and "http" not in block and block.endswith("\n</uploaded_files>")
+    assert "7. 更早上传的文件不在这个清单里" in block and "b_deadbeef.csv" not in block, "失效文件不带路径"
+    assert file_staging.format_uploaded_files_block([ok_n], is_owner=True).count("以下文件已失效") == 0
+    m_ok = file_staging.FileNotice("a.py", 35 * 1024, "/work/uploads/a_deadbeef.py", ts, True)
+    m_bad = file_staging.FileNotice("b.csv", 100, "/work/uploads/b_deadbeef.csv", ts, False)
+    mblock = file_staging.format_uploaded_files_block([m_ok, m_bad], is_owner=False)
+    for banned in BANNED_FOR_MEMBER + ("http",):
+        assert banned not in mblock, banned
+    assert "→ /work/uploads/a_deadbeef.py" in mblock and "已放进用户的云端工作区" in mblock and "以下文件已失效（云端工作区已被回收），不要委派" in mblock and "CodeAgent" in mblock
+    assert "6. 更早上传的文件不在这个清单里" in mblock and "7." not in mblock.split("处理规则：")[1]
+    # 全部失效的变体
+    allbad = file_staging.format_uploaded_files_block([bad_n], is_owner=True)
+    assert allbad == (
+        "<uploaded_files>\n用户在发这条消息之前上传过下面这些文件，但它们已经失效（已被清理），无法再读取：\n"
+        "- b[.]csv（100 B，09:05 上传）\n"
+        "如果用户的问题需要这些文件：不要委派，直接告诉用户文件已失效、请重新发送；与文件无关的问题照常回答。\n</uploaded_files>"
+    ), allbad
+    assert "（云端工作区已被回收）" in file_staging.format_uploaded_files_block([bad_n], is_owner=False)
+    assert file_staging.format_uploaded_files_block([], is_owner=True) == ""
+    config_safe = config.QQ_FILE_SAFE_NAMES
+    config.QQ_FILE_SAFE_NAMES = False
+    try:
+        assert "- a.py（35.0 KB" in file_staging.format_uploaded_files_block([ok_n], is_owner=True)
+    finally:
+        config.QQ_FILE_SAFE_NAMES = config_safe
+
+    # inject_files_block
+    h = HumanMessage(content="你好")
+    msgs = [AIMessage(content="earlier"), h]
+    res = file_staging.inject_files_block(msgs, "BLOCK")
+    assert res is not msgs and res[0] is msgs[0] and res[1] is not h
+    assert res[1].content == "BLOCK\n\n你好" and h.content == "你好" and len(msgs) == 2 and msgs[1] is h, "不原地修改"
+    lst = [{"type": "text", "text": "看图"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]
+    h2 = HumanMessage(content=list(lst))
+    res = file_staging.inject_files_block([h2], "BLOCK")
+    assert res[0].content == [{"type": "text", "text": "BLOCK"}, *lst] and h2.content == lst
+    same = [HumanMessage(content="x"), "not a message"]
+    assert file_staging.inject_files_block(same, "BLOCK") is same
+    assert file_staging.inject_files_block([], "BLOCK") == [] and file_staging.inject_files_block(msgs, "") is msgs
+    weird = [HumanMessage(content="x")]
+    weird[0] = type("M", (), {"content": 5, "model_copy": lambda self, update: self})()
+    assert file_staging.inject_files_block(weird, "BLOCK") is weird
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 15 清理
+# ═════════════════════════════════════════════════════════════════════
+def _age(path: Path, days: float):
+    t = time.time() - days * 86400
+    os.utime(path, (t, t))
+
+
+def test_15_cleanup():
+    with contextlib.redirect_stdout(io.StringIO()), _Staging(QQ_INBOX_TTL_DAYS=7) as env:
+        inbox = env.inbox()
+        inbox.mkdir()
+        sentinel_dir = Path(env.tmp) / "sentinel-dir"
+        sentinel_dir.mkdir()
+        (sentinel_dir / "keep.txt").write_text("keep")
+        (Path(env.tmp) / "sentinel.txt").write_text("keep")
+
+        def make(name, file_ages, dir_age):
+            d = inbox / name
+            d.mkdir()
+            for i, age in enumerate(file_ages):
+                f = d / f"f{i}.txt"
+                f.write_text("x")
+                _age(f, age)
+            _age(d, dir_age)                                              # 目录的 mtime 最后设，免得被写文件冲掉
+            return d
+
+        old = make("a" * 32, [9, 10], 9)
+        new = make("b" * 32, [1], 1)
+        mixed = make("c" * 32, [20, 2], 20)                                # 目录本身很旧，但有一个新文件 -> 保留
+        empty_old = make("d" * 32, [], 30)                                 # 空目录用目录自己的 mtime -> 删除
+        empty_new = make("e" * 32, [], 1)
+        bad_name = inbox / "not a valid id!"
+        bad_name.mkdir()
+        (bad_name / "f.txt").write_text("x")
+        _age(bad_name / "f.txt", 30)
+        _age(bad_name, 30)
+        stray = inbox / "stray.txt"
+        stray.write_text("x")
+        _age(stray, 30)
+        linked = None
+        if _make_dir_link(inbox / ("f" * 32), sentinel_dir):
+            linked = inbox / ("f" * 32)
+            _age(sentinel_dir / "keep.txt", 30)
+
+        removed = file_staging.cleanup_expired_inbox()
+        assert removed == 2, removed
+        assert not old.exists() and not empty_old.exists()
+        assert new.exists() and mixed.exists() and empty_new.exists() and bad_name.exists() and stray.exists()
+        assert (sentinel_dir / "keep.txt").read_text() == "keep" and (Path(env.tmp) / "sentinel.txt").exists()
+        if linked is not None:
+            assert linked.exists() and (sentinel_dir / "keep.txt").exists(), "链接目录既不被处理，也不被跟随"
+            _remove_link(linked)
+        else:
+            print("    [skip] 当前环境无法创建符号链接 / junction，跳过链接用例")
+
+        # now 参数：把"现在"推到 30 天之后，合法目录全部过期
+        assert file_staging.cleanup_expired_inbox(now=time.time() + 30 * 86400) == 3          # new / mixed / empty_new
+        assert bad_name.exists() and stray.exists() and sentinel_dir.exists()
+
+        # TTL=0：什么都不删
+        a2 = make("a2" * 16, [30], 30)
+        config.QQ_INBOX_TTL_DAYS = 0
+        assert file_staging.cleanup_expired_inbox(now=time.time() + 999 * 86400) == 0 and a2.exists()
+        config.QQ_INBOX_TTL_DAYS = 7
+        # inbox 不存在 -> 0
+        shutil.rmtree(inbox)
+        assert file_staging.cleanup_expired_inbox() == 0
+
+        # clear_session_inbox：只删该会话目录
+        inbox.mkdir()
+        sid_a, sid_b = "1" * 32, "2" * 32
+        for sid in (sid_a, sid_b):
+            (inbox / sid).mkdir()
+            (inbox / sid / "x.txt").write_text("x")
+        file_staging.clear_session_inbox(sid_a)
+        assert not (inbox / sid_a).exists() and (inbox / sid_b / "x.txt").exists()
+        file_staging.clear_session_inbox("../" + "x" * 10)                    # 非法 id：直接返回
+        file_staging.clear_session_inbox("n" * 32)                            # 不存在：什么都不发生
+        assert (Path(env.tmp) / "sentinel.txt").exists() and (sentinel_dir / "keep.txt").exists() and (inbox / sid_b).exists()
+        # rmtree 抛 PermissionError：被吞掉
+        real = file_staging.shutil.rmtree
+        file_staging.shutil.rmtree = lambda *a, **k: (_ for _ in ()).throw(PermissionError("in use"))
+        try:
+            file_staging.clear_session_inbox(sid_b)
+        finally:
+            file_staging.shutil.rmtree = real
+        assert (inbox / sid_b / "x.txt").exists()
+        # inbox 本身是链接：不删
+        shutil.rmtree(inbox)
+        if _make_dir_link(inbox, sentinel_dir):
+            (sentinel_dir / sid_a).mkdir()
+            file_staging.clear_session_inbox(sid_a)
+            assert (sentinel_dir / sid_a).exists(), "inbox 是链接时 clear_session_inbox 不删除任何东西"
+            assert file_staging.cleanup_expired_inbox(now=time.time() + 999 * 86400) == 0 and (sentinel_dir / sid_a).exists()
+            _remove_link(inbox)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 17 架构
+# ═════════════════════════════════════════════════════════════════════
+def test_17_architecture():
+    res = subprocess.run([sys.executable, "tests/smoke_architecture.py"], cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
+    assert res.returncode == 0, (res.stdout + res.stderr)[-1500:]
+    src = Path(ROOT / "tests" / "smoke_architecture.py").read_text(encoding="utf-8")
+    assert "import app.utils.files" in src and "import app.services.file_staging" in src, "F 的导入列表里要有新模块"
+    # L0 的 files.py 只依赖标准库
+    import ast
+    tree = ast.parse(Path(F.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        mods = [a.name for a in node.names] if isinstance(node, ast.Import) else ([node.module] if isinstance(node, ast.ImportFrom) and node.module else [])
+        for m in mods:
+            top = m.split(".")[0]
+            assert top in sys.stdlib_module_names, f"app/utils/files.py 不应依赖非标准库模块：{m}"
+    # 新增日志与文案不出现签名参数名
+    for rel in ("app/utils/files.py", "app/services/file_staging.py"):
+        assert "rkey" not in (ROOT / rel).read_text(encoding="utf-8"), rel
+
+
+# ═════════════════════════════════════════════════════════════════════
 # 汇总
 # ═════════════════════════════════════════════════════════════════════
 SCENARIOS = [
@@ -558,8 +1455,16 @@ SCENARIOS = [
     ("3 其余 L0 纯函数", test_3_other_pure_functions),
     ("4 normalize_download_url", test_4_normalize_download_url),
     ("5 incoming_files_from_attachments", test_5_incoming_files_from_attachments),
+    ("6 下载（MockTransport）", test_6_download),
+    ("7.1 owner 落地", test_7_owner_staging),
+    ("7.2 owner 落地：符号链接 / junction 被拒绝", test_7b_owner_symlink_rejected),
+    ("8 member 落地（只在内存、直传 Modal）与门控", test_8_member_staging),
     ("9 modal_sandbox 新函数（upload_session_file / generation / max_bytes）", test_9_modal_sandbox_helpers),
+    ("10 在途闸门", test_10_inflight_gate),
+    ("11 未消费文件清单 / 块 / 注入", test_11_notices_block_and_inject),
     ("14 session_tools 的 file_uploaded 事件", test_14_session_tools_file_uploaded),
+    ("15 清理（TTL / reset / 不碰 inbox 之外）", test_15_cleanup),
+    ("17 架构", test_17_architecture),
 ]
 
 
