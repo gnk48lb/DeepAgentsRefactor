@@ -24,6 +24,7 @@ from app.utils.identity import OWNER_USER_ID, validate_user_id
 
 # 这两类事件是“入站”：它们会驱动一次 wake，处理完后由 mark_processed 推进游标
 INBOUND_EVENT_TYPES = ("user_message", "approval")
+EVENT_FILE_UPLOADED = "file_uploaded"   # 用户上传文件的记录：不是入站事件（不触发 wake、不进 pending），只给回溯与"未消费文件"判断用
 
 _SCHEMA_VERSION = 2
 # v1 的单一指针键；v2 起每个用户一个键：f"{_ACTIVE_KEY}:{user_id}"

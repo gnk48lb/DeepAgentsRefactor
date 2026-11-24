@@ -48,7 +48,7 @@ from app.infra.sandbox import (
     StreamingBuffer,
 )
 from app.utils.context import get_request_context
-from app.utils.identity import validate_user_id
+from app.utils.identity import OWNER_USER_ID, validate_user_id
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -512,6 +512,20 @@ class ModalSandbox:
     def dead(self) -> bool:
         return self._closed or self._dead
 
+    def generation(self, *, check_remote: bool = True) -> Optional[str]:
+        """当前这一代云端沙箱的标识（modal 沙箱的 object_id）：沙箱被回收 / 重建 / 重置后标识就变了，
+        /work 里的文件也随之消失，所以它可以用来判断“之前上传的文件还在不在”。
+        只读：不创建沙箱、不取 _lock（别被长命令堵住）、不调用 _mark_dead、永不抛异常。"""
+        try:
+            sb = self._sb
+            if sb is None or self._dead or self._closed:
+                return None
+            if check_remote and not self._is_alive(sb):
+                return None
+            return str(sb.object_id)
+        except Exception:
+            return None
+
     def _effective_timeout(self, timeout: Any) -> int:
         """None / ≤0 / 非数字取默认，否则夹到上限。"""
         try:
@@ -912,8 +926,10 @@ class ModalSandbox:
             return norm, None
         return None, "invalid_path：只能写入 /work/ 或 /tmp/"
 
-    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
-        """上传文件到沙箱：逐个文件分别捕获异常，绝不向外抛异常。"""
+    def upload_files(self, files: list[tuple[str, bytes]], *, max_bytes: Optional[int] = None) -> list[FileUploadResponse]:
+        """上传文件到沙箱：逐个文件分别捕获异常，绝不向外抛异常。
+        max_bytes 只给宿主机自己的上传入口（QQ 文件接收）用；agent 侧（ModalRoutedSandbox）不传，仍是 _MAX_UPLOAD_BYTES。"""
+        limit = _MAX_UPLOAD_BYTES if max_bytes is None else max(1, int(max_bytes))
         responses: list[Optional[FileUploadResponse]] = [None] * len(files)
         todo: list[tuple[int, str, str, bytes]] = []
         for i, item in enumerate(files):
@@ -927,7 +943,7 @@ class ModalSandbox:
                 responses[i] = FileUploadResponse(path=path, error=err)
             elif not isinstance(data, (bytes, bytearray, memoryview)):
                 responses[i] = FileUploadResponse(path=path, error="invalid_path：文件内容必须是字节")
-            elif len(data) > _MAX_UPLOAD_BYTES:
+            elif len(data) > limit:
                 responses[i] = FileUploadResponse(path=path, error="file_too_large")
             else:
                 todo.append((i, path, norm, bytes(data)))
@@ -1512,6 +1528,54 @@ def reset_user(user_id: str) -> int:
         return pool.reset_user(user_id) if pool is not None else 0
     except Exception:
         return 0
+
+
+_UPLOAD_ROOT = "/work/uploads/"
+_MSG_UPLOAD_FAILED = "文件放入云端工作区失败，请稍后重新发送"
+_MSG_UPLOAD_TOO_LARGE = "文件超过云端工作区允许的大小上限"
+
+
+def upload_session_file(user_id: str, session_id: str, remote_path: str, data: bytes,
+                        *, max_bytes: Optional[int] = None) -> tuple[bool, str]:
+    """把一个用户上传的文件写进这个 (用户, 会话) 的沙箱（member 专用，owner 绝不能走到这里）。
+    成功 -> (True, 沙箱代标识)；失败 -> (False, 给用户看的中文短句)。永不抛异常，返回的文案不含内部细节。
+    阻塞调用：调用方用 asyncio.to_thread。"""
+    try:
+        try:
+            validate_user_id(user_id)
+        except ValueError:
+            return False, _MSG_UPLOAD_FAILED
+        if user_id == OWNER_USER_ID or not isinstance(session_id, str) or not session_id:
+            return False, _MSG_UPLOAD_FAILED
+        if (not isinstance(remote_path, str) or not remote_path.startswith(_UPLOAD_ROOT)
+                or posixpath.normpath(remote_path) != remote_path):
+            return False, _MSG_UPLOAD_FAILED
+        pool = get_pool()
+        with pool.lease(user_id, session_id, create=True) as sb:
+            resp = sb.upload_files([(remote_path, data)], max_bytes=max_bytes)[0]
+            if resp.error is None:
+                gen = sb.generation(check_remote=False)
+                return (True, gen) if gen is not None else (False, _MSG_UPLOAD_FAILED)
+            if resp.error == "file_too_large":
+                return False, _MSG_UPLOAD_TOO_LARGE
+            return False, _MSG_UPLOAD_FAILED
+    except SandboxUnavailable as e:
+        return False, str(e)
+    except Exception:
+        return False, _MSG_UPLOAD_FAILED
+
+
+def session_sandbox_generation(user_id: str, session_id: str, *, check_remote: bool = True) -> Optional[str]:
+    """该会话当前那一代沙箱的标识；池没创建 / 没有这个会话的沙箱 / 已死 -> None。
+    绝不创建沙箱、绝不 import modal（不调用 get_pool），永不抛异常。"""
+    try:
+        pool = _pool
+        if pool is None:
+            return None
+        with pool.lease(user_id, session_id, create=False) as sb:
+            return sb.generation(check_remote=check_remote) if sb is not None else None
+    except Exception:
+        return None
 
 
 def interrupt_session(user_id: str, session_id: str) -> bool:

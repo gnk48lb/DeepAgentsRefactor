@@ -12,8 +12,10 @@ QQ 文件接收（owner + member）离线冒烟测试：不需要 API Key / Dock
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import traceback
 import uuid
 from pathlib import Path
@@ -24,10 +26,18 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 from app import config
+from app.infra import modal_sandbox, session_store
+from app.infra.session_store import SessionStore
+from app.tools import session_tools
 from app.utils import files as F
 from app.utils.files import IncomingFile
+from _fake_modal import FakeModal
+from _support import member_context
 
 ROOT = Path(__file__).resolve().parents[1]
+MB = 1024 * 1024
+UID = "member001"                      # 合法的 openid 形状
+UID2 = "member002"
 
 
 def _raises(exc, fn, *args, **kwargs):
@@ -343,6 +353,203 @@ def test_5_incoming_files_from_attachments():
 
 
 # ═════════════════════════════════════════════════════════════════════
+# 公用夹具：FakeModal 池、临时 SessionStore
+# ═════════════════════════════════════════════════════════════════════
+class _ModalEnv:
+    """注入 FakeModal、审计日志写到临时目录、池用 fake.clock；让模块级函数与 ModalRoutedSandbox 走这个池。退出时全部还原。"""
+
+    def __init__(self, **cfg):
+        self.cfg = cfg
+
+    def __enter__(self):
+        self.tmp = tempfile.mkdtemp(prefix="qqf-modal-")
+        self._saved = {}
+        for key, value in {"MODAL_AUDIT_LOG": os.path.join(self.tmp, "audit", "modal_audit.log"), **self.cfg}.items():
+            self._saved[key] = getattr(config, key)
+            setattr(config, key, value)
+        self.fake = FakeModal()
+        self.fake.publish_default_image()
+        modal_sandbox.set_modal_module(self.fake)
+        self.pool = modal_sandbox.ModalSandboxPool(self.fake, clock=self.fake.clock)
+        modal_sandbox._pool = self.pool
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.pool.shutdown(deadline_s=2.0)
+        finally:
+            modal_sandbox.set_modal_module(None)             # 同时清空池单例、关闭审计 handler（Windows 上不关就删不掉临时目录）
+            for key, value in self._saved.items():
+                setattr(config, key, value)
+            shutil.rmtree(self.tmp, ignore_errors=True)
+        return False
+
+
+class _StoreDir:
+    """临时 SessionStore（并设为全局 store）；退出时关闭并删除。"""
+
+    def __enter__(self):
+        self.path = tempfile.mkdtemp(prefix="qqf-store-")
+        self.store = SessionStore(os.path.join(self.path, "sessions.db"))
+        session_store.set_store(self.store)
+        return self.store
+
+    def __exit__(self, *exc):
+        try:
+            self.store.close()
+        finally:
+            session_store.set_store(None)
+            shutil.rmtree(self.path, ignore_errors=True)
+        return False
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 9 modal_sandbox 新函数
+# ═════════════════════════════════════════════════════════════════════
+def test_9_modal_sandbox_helpers():
+    # 池还没创建：不 import modal，也不创建池
+    code = (
+        "import sys\n"
+        "from app.infra import modal_sandbox as m\n"
+        "assert m._pool is None\n"
+        "assert m.session_sandbox_generation('member001', 's1') is None\n"
+        "assert m.session_sandbox_generation('member001', 's1', check_remote=False) is None\n"
+        "ok, msg = m.upload_session_file('owner', 's1', '/work/uploads/a.txt', b'x')\n"
+        "assert ok is False and msg\n"
+        "assert m._pool is None\n"
+        "leaked = [x for x in sys.modules if x == 'modal' or x.startswith('modal.')]\n"
+        "assert not leaked, f'modal 被提前导入: {leaked[:5]}'\n"
+    )
+    res = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
+    assert res.returncode == 0, res.stderr[-600:]
+
+    up = modal_sandbox.upload_session_file
+    gen_of = modal_sandbox.session_sandbox_generation
+    with _ModalEnv() as e:
+        fake = e.fake
+        # 池存在但没有沙箱：None，并且不会因此创建沙箱
+        assert gen_of(UID, "s1") is None and gen_of(UID, "s1", check_remote=False) is None
+        assert fake.created == [] and fake.create_attempts == []
+
+        # 拒绝：owner / 非法 id / 路径不在 /work/uploads/ / 含 .. 与重复斜杠 / 空会话；不创建沙箱，文案是短句且不含内部细节
+        for who, sid, path in [
+            ("owner", "s1", "/work/uploads/a.txt"), ("x", "s1", "/work/uploads/a.txt"), ("", "s1", "/work/uploads/a.txt"),
+            (UID, "s1", "/work/a.txt"), (UID, "s1", "/tmp/uploads/a.txt"), (UID, "s1", "/workspace/uploads/a.txt"),
+            (UID, "s1", "/work/uploads/../a.txt"), (UID, "s1", "/work/uploads//a.txt"), (UID, "s1", "/work/uploads/./a.txt"),
+            (UID, "s1", "/work/uploads/"), (UID, "s1", "/work/uploads"), (UID, "s1", "work/uploads/a.txt"),
+            (UID, "s1", ""), (UID, "s1", None), (UID, "", "/work/uploads/a.txt"), (UID, None, "/work/uploads/a.txt"),
+        ]:
+            ok, msg = up(who, sid, path, b"x")
+            assert ok is False and isinstance(msg, str) and 0 < len(msg) < 60, (who, sid, path, ok, msg)
+            assert "/work" not in msg and "invalid_path" not in msg, msg
+        assert fake.created == [], "拒绝时不创建沙箱"
+        assert modal_sandbox.upload_session_file(UID, "s1", "/work/uploads/a.txt", "not-bytes")[0] is False   # 内容必须是字节
+
+        # 成功：返回代标识 = 沙箱 object_id；字节出现在沙箱里
+        path = "/work/uploads/a_1234abcd.txt"
+        ok, gen = up(UID, "s1", path, b"hello")
+        assert ok is True and len(fake.created) == 1 and gen == fake.created[0].object_id, (ok, gen)
+        assert fake.created[0].filesystem.get(path) == b"hello"
+        assert gen_of(UID, "s1") == gen == gen_of(UID, "s1", check_remote=False), "同一代沙箱的标识稳定"
+        assert gen_of(UID, "s2") is None and gen_of(UID2, "s1") is None
+        n_created, n_attempts = len(fake.created), len(fake.create_attempts)
+        for _ in range(3):
+            gen_of(UID, "s2"), gen_of(UID2, "s1"), gen_of(UID, "s1")
+        assert (len(fake.created), len(fake.create_attempts)) == (n_created, n_attempts), "查询代标识绝不创建沙箱"
+
+        # max_bytes：放宽的是这条上传入口；默认仍是 5 MiB
+        ok, _ = up(UID, "s1", "/work/uploads/big.bin", b"a" * (6 * MB), max_bytes=10 * MB)
+        assert ok is True and fake.created[0].filesystem.has("/work/uploads/big.bin")
+        ok, msg = up(UID, "s1", "/work/uploads/huge.bin", b"a" * (10 * MB + 1), max_bytes=10 * MB)
+        assert (ok, msg) == (False, "文件超过云端工作区允许的大小上限"), (ok, msg)
+        assert not fake.created[0].filesystem.has("/work/uploads/huge.bin")
+        ok, msg = up(UID, "s1", "/work/uploads/five.bin", b"a" * (5 * MB + 1))
+        assert (ok, msg) == (False, "文件超过云端工作区允许的大小上限"), "不带 max_bytes 时仍是 5 MiB"
+        assert up(UID, "s1", "/work/uploads/five.bin", b"a" * (5 * MB))[0] is True
+        with e.pool.lease(UID, "s1") as sb:                                              # 沙箱对象本身：不带 max_bytes 仍是 5 MiB
+            assert sb.upload_files([("/work/x.bin", b"a" * (5 * MB + 1))])[0].error == "file_too_large"
+            assert sb.upload_files([("/work/x.bin", b"a" * (5 * MB + 1))], max_bytes=6 * MB)[0].error is None
+        routed = modal_sandbox.get_routed_sandbox()                                       # agent 侧上传仍受 5 MiB 限制
+        with member_context(UID, "s1"):
+            assert routed.upload_files([("/work/y.bin", b"a" * (5 * MB + 1))])[0].error == "file_too_large"
+            assert routed.upload_files([("/work/y.bin", b"a" * (5 * MB))])[0].error is None
+
+        # 内部错误原文不外泄
+        e.fake.inject("fs.write_bytes", RuntimeError("INTERNAL-DETAIL-XYZ disk exploded"))
+        ok, msg = up(UID, "s1", "/work/uploads/boom.txt", b"x")
+        assert (ok, msg) == (False, "文件放入云端工作区失败，请稍后重新发送"), (ok, msg)
+        assert "INTERNAL" not in msg
+
+        # 沙箱代际：空闲回收后没有活着的沙箱 -> None；重新上传重建出来的是新的一代
+        e.fake.advance(10 ** 5)
+        assert gen_of(UID, "s1") is None, "沙箱被回收后不再算有代标识"
+        assert gen_of(UID, "s1", check_remote=False) == gen, "不查远端时只看本地记录"
+        assert len(fake.created) == n_created, "查询不重建"
+        ok, gen2 = up(UID, "s1", path, b"hello")
+        assert ok is True and gen2 != gen and gen2 == fake.created[-1].object_id and gen_of(UID, "s1") == gen2
+        fake.created[-1].terminate()
+        assert gen_of(UID, "s1") is None, "terminate() 之后"
+
+    # 池容量满 / 创建失败：友好文案
+    with _ModalEnv(MODAL_MAX_SANDBOXES_PER_USER=1, MODAL_MAX_SANDBOXES_TOTAL=1) as e:
+        ok, _ = up(UID, "s1", "/work/uploads/a.txt", b"x")
+        assert ok is True
+        with e.pool.lease(UID, "s1"):                       # 占着不放：同用户第二个会话没有可驱逐的条目
+            ok, msg = up(UID, "s2", "/work/uploads/a.txt", b"x")
+            assert ok is False and "上限" in msg, msg
+            ok, msg = up(UID2, "s1", "/work/uploads/a.txt", b"x")
+            assert ok is False and "繁忙" in msg, msg
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 14 session_tools：file_uploaded 事件
+# ═════════════════════════════════════════════════════════════════════
+def _cfg(user_id=None, thread_id=None):
+    configurable = {}
+    if user_id is not None:
+        configurable["user_id"] = user_id
+    if thread_id is not None:
+        configurable["thread_id"] = thread_id
+    return {"configurable": configurable}
+
+
+def test_14_session_tools_file_uploaded():
+    with _StoreDir() as s:
+        a = s.create_session("A的会话", user_id=UID)
+        b = s.create_session("B的会话", user_id=UID2)
+        payload = {"name": "销售报表.xlsx", "path": "/work/uploads/销售报表_1a2b3c4d.xlsx", "size": 36045, "role": "member", "gen": "sb-1"}
+        seq = s.emit_event(a.id, session_store.EVENT_FILE_UPLOADED, payload)
+        assert seq is not None
+        s.emit_event(b.id, session_store.EVENT_FILE_UPLOADED, {**payload, "name": "B的秘密.csv", "path": "/work/uploads/B的秘密_ffffffff.csv"})
+
+        g, f = session_tools.get_session_events, session_tools.search_session_history
+        out = g.invoke({"session_id": a.id}, config=_cfg(UID))
+        assert "file_uploaded" in out and "用户上传了文件：销售报表.xlsx（35.2 KB）→ /work/uploads/销售报表_1a2b3c4d.xlsx" in out, out
+        assert "{" not in out and "'name'" not in out, "不是原始 payload 字典"
+        out = g.invoke({"session_id": a.id, "types": "file_uploaded"}, config=_cfg(UID))
+        assert "销售报表.xlsx" in out
+        out = g.invoke({"session_id": a.id, "types": "user_message"}, config=_cfg(UID))
+        assert "销售报表" not in out
+
+        # 能按文件名搜到；用户隔离不被破坏
+        assert "销售报表" in f.invoke({"query": "销售报表"}, config=_cfg(UID))
+        out = f.invoke({"query": "B的秘密"}, config=_cfg(UID))
+        assert "没有找到" in out and "ffffffff" not in out, out                      # 提示里会回显查询词，所以看路径有没有泄漏
+        out = f.invoke({"query": "销售报表"}, config=_cfg(UID2))
+        assert "1a2b3c4d" not in out, out
+        out = g.invoke({"session_id": a.id}, config=_cfg(UID2))
+        assert "1a2b3c4d" not in out and "找不到" in out, out
+
+        # 不是入站事件：不进 pending、不触发 wake
+        assert session_store.EVENT_FILE_UPLOADED not in session_store.INBOUND_EVENT_TYPES
+        assert s.get_pending_events(a.id) == [] and s.sessions_with_pending() == []
+
+        # 同一个文件重发（不带幂等键）会产生新事件
+        assert s.emit_event(a.id, session_store.EVENT_FILE_UPLOADED, payload) is not None
+        assert s.count_events(a.id, types=(session_store.EVENT_FILE_UPLOADED,)) == 2
+
+
+# ═════════════════════════════════════════════════════════════════════
 # 汇总
 # ═════════════════════════════════════════════════════════════════════
 SCENARIOS = [
@@ -351,6 +558,8 @@ SCENARIOS = [
     ("3 其余 L0 纯函数", test_3_other_pure_functions),
     ("4 normalize_download_url", test_4_normalize_download_url),
     ("5 incoming_files_from_attachments", test_5_incoming_files_from_attachments),
+    ("9 modal_sandbox 新函数（upload_session_file / generation / max_bytes）", test_9_modal_sandbox_helpers),
+    ("14 session_tools 的 file_uploaded 事件", test_14_session_tools_file_uploaded),
 ]
 
 
