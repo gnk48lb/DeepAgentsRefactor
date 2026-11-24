@@ -262,6 +262,21 @@ REFRESH_BM25 = False
 # QQ 回复最大字符数限制
 QQ_MAX_REPLY_CHARS = 10000
 
+# ── QQ 文件接收（见 app/services/file_staging.py 与 README「QQ 文件接收」）──
+# 非法值回落默认，越界值夹紧；bool 写法同其他开关。
+QQ_FILE_ENABLED = os.getenv("QQ_FILE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+QQ_FILE_MEMBER_ENABLED = os.getenv("QQ_FILE_MEMBER_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+QQ_FILE_MAX_MB_OWNER = min(max(1, _env_int("QQ_FILE_MAX_MB_OWNER", 20)), 100)                 # owner 单文件上限（MiB）
+QQ_FILE_MAX_MB_MEMBER = min(max(1, _env_int("QQ_FILE_MAX_MB_MEMBER", 10)), 50)                # member 单文件上限（MiB）
+QQ_FILE_DOWNLOAD_TIMEOUT_SECONDS = min(max(5, _env_int("QQ_FILE_DOWNLOAD_TIMEOUT_SECONDS", 30)), 300)  # 单个文件下载的总期限
+QQ_FILE_MAX_PER_MESSAGE = min(max(1, _env_int("QQ_FILE_MAX_PER_MESSAGE", 5)), 20)             # 单条事件最多处理几个文件
+QQ_FILE_MAX_PER_SESSION = min(max(1, _env_int("QQ_FILE_MAX_PER_SESSION", 20)), 200)           # 每会话（自上次 /reset 起）最多接收几个文件
+QQ_FILE_MAX_CONCURRENT = min(max(1, _env_int("QQ_FILE_MAX_CONCURRENT", 3)), 10)               # 全局并发落地数
+QQ_INBOX_TTL_DAYS = max(0, _env_int("QQ_INBOX_TTL_DAYS", 7))                                  # owner inbox 保留天数，0 = 不自动清理
+QQ_FILE_INJECT_MAX_ITEMS = min(max(1, _env_int("QQ_FILE_INJECT_MAX_ITEMS", 10)), 50)          # 单次注入的清单最多列几个文件
+# 回执 / 清单里把文件名中的 "." 显示成 "[.]"，防止 QQ 把 a.py、README.md 之类当域名拒收（未经真机验证的防御假设）
+QQ_FILE_SAFE_NAMES = os.getenv("QQ_FILE_SAFE_NAMES", "true").strip().lower() in ("1", "true", "yes")
+
 
 # ── 多用户（见 README「多用户模式」）──
 def _parse_id_set(raw: str) -> frozenset:
