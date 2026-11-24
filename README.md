@@ -115,6 +115,15 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 
 > **警告**：`FileAgent` 的 `run_host_command` 会以机器人进程所属用户的权限在宿主机上执行命令，任何能以 owner 身份给机器人发消息并回复 `Y` 的人都等同于拥有这台机器的该用户权限。务必只把你自己的 openid 写进 `OWNER_USER_IDS`，并保管好 `.env`。
 
+**QQ 文件接收（owner / member）**
+QQ 私聊里可以先发文件、再用文字提问（QQ 会把每个文件作为单独一条消息推送，文字内容为空）。只发文件时机器人立刻回一条确定性回执（不调用模型、不占用户锁）；之后第一条文字消息会自动带上一个 `<uploaded_files>` 清单块（文件名、大小、路径、该委派给谁），主管据此把路径写进委派任务。图片仍走原来的图片流程，语音 / 视频不处理。
+- **owner**：文件落到 `WORKSPACE_DIR/inbox/<会话 id>/<名字>_<内容哈希前 8 位><后缀>`，由 FileAgent（读取 / 转 Markdown）与本机 Docker CodeAgent（`/workspace` 只读挂载，实时可见）处理；owner 的 `/reset` 会删掉该会话的目录，其余目录超过 `QQ_INBOX_TTL_DAYS`（默认 7 天）没有更新就会被清理（启动时一次，之后每小时最多一次，在收到文件时顺带做）。
+- **member**：文件字节直接上传到该用户该会话的 Modal 云端沙箱 `/work/uploads/`，由云端 CodeAgent 处理；**宿主机不落盘、不解析**。需要云端 CodeAgent 已启用。沙箱闲置回收、`/reset` 或重建后文件随之消失，清单块会把失效的文件单独列出，并要求主管请用户重新发送。
+- **限制**（默认值，均可在 `.env` 里调整，见 `.env.example`）：owner 单文件 20 MB、member 10 MB（member 经 `max_bytes` 放宽，agent 自己写文件仍是 5 MiB 上限）；单个文件下载总期限 30 秒；每个会话（自上次 `/reset` 起）最多 20 个；全局同时落地 3 个；清单块最多列 10 个文件。
+- **只是待处理的数据**：文件不进入知识库、长期记忆与检索，也不写进事件日志的文本字段（日志里只有一条 `file_uploaded`：清洗后的文件名、路径、大小，不含下载地址）；提示词明确要求不照做文件里的任何指令。
+- **下载地址带签名，等同凭证**：只在下载的那一刻使用，不进入本功能的日志、异常、事件与回执；下载的每一跳重定向都会重新校验（拒绝内网 / IP 地址、带用户名密码或非默认端口的地址，`http` 一律升级为 `https`），最多 3 跳。回执和清单里的文件名默认把 `.` 显示成 `[.]`（`QQ_FILE_SAFE_NAMES`），防止 QQ 把 `a.py` 之类当域名拒收。
+- **在途闸门**：先发文件、1~2 秒内紧接着发文字时，文字消息会等该用户在途的下载落地再进入回合（最多 `QQ_FILE_DOWNLOAD_TIMEOUT_SECONDS + 20` 秒；`/stop` 不等）。纯文件消息之间不互相等待。
+
 ### 2.5 MCP 常驻会话与容错机制
 系统通过 Model Context Protocol (MCP) 集成外部能力（如文档转换 `markitdown`、桌面控制 `desktop`）。
 各 MCP 服务进程在机器人启动时由专属后台 Runner 统一拉起并常驻运行，退出时自动回收，大幅降低工具调用开销。
@@ -388,6 +397,7 @@ uv sync
 - `SESSIONS_DB_PATH` / `CHECKPOINT_DB_PATH` / `CHECKPOINT_PRUNE_NESTED`（可选）：会话库、checkpoint 库路径与嵌套 checkpoint 清理开关，默认 `storage/sessions.db`、`storage/checkpoints.db`、开启，见 2.11。
 - `OWNER_USER_IDS`（多用户）：逗号分隔的平台 openid，命中的 QQ 用户与本地 CLI 是 owner（管理员），其余是 member。先用主号私聊机器人发 `/whoami` 取得平台 ID，再写进来并重启；openid 与机器人 AppID 绑定，见 2.4。
 - `MAX_CONCURRENT_MEMBER_TURNS`（可选，默认 3）：member 同时处理的轮数上限，owner 不占用；`MEMBER_WELCOME_TEXT`（可选）：新 member 的第一条回复前附带一次的欢迎语。
+- `QQ_FILE_*` / `QQ_INBOX_TTL_DAYS`（可选）：QQ 文件接收的总开关、member 开关、单文件大小、下载期限、数量与并发限制、inbox 保留天数、清单长度与文件名显示方式，全部有默认值，见 2.4「QQ 文件接收」与 `.env.example`。
 - `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`（可选）：Modal 云端沙箱令牌（member 的 CodeAgent 用）。**不配置则 member 没有代码能力，行为与阶段 1 一致**；令牌只放在 `.env` 里，绝不会传进沙箱。另有一组 `MODAL_*` 旁路可调项（总开关 `MODAL_DISABLED`、镜像名、CPU / 内存、空闲超时、每用户 / 全局沙箱上限、是否断网、中止方式 `MODAL_INTERRUPT_MODE`、审计日志路径……），默认值与说明见 `.env.example` 与 2.4；费用上限要在 Modal 控制台设。
 
 #### LLM 角色与 Magpie 网关
@@ -580,7 +590,7 @@ uv run python tests/live_modal.py --live
 uv run python tests/run_smoke.py
 ```
 
-测试包含以下 17 个离线测试套件（Modal 相关的全部靠 `tests/_fake_modal.py` 的 FakeModal 离线运行：不联网、不读 `.env`、不调用真实 Modal；用户机器上 `.env` 里即使有真实令牌，结果也一致，因为测试自己控制 `config.MODAL_*`）：
+测试包含以下 18 个离线测试套件（Modal 相关的全部靠 `tests/_fake_modal.py` 的 FakeModal 离线运行：不联网、不读 `.env`、不调用真实 Modal；用户机器上 `.env` 里即使有真实令牌，结果也一致，因为测试自己控制 `config.MODAL_*`）：
 1. `tests/smoke_architecture.py`：分层单向依赖、语法禁令、空 `__init__`、提示词单例、专家规格、轻量隔离导入、无 Key 安全导入与 MCP 路径校验（8 个场景）。
 2. `tests/smoke_file_agent.py`：FileAgent 离线冒烟测试（含 MarkItDown 路径安全拦截、越界隔离、HITL 恢复映射以及 `run_host_command` 的工具白名单、免授权、批准/拒绝、绕过变体与授权提示内容等 23 个场景；`run_host_command` / `convert_to_markdown` 现在有 `require_owner()` 门控，场景运行器里统一套 `owner_context()`，断言不变）。
 3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试；阶段 2 新增 member 的 `skills_member/` 规范与禁用词检查、`ReadOnlyFilesystemBackend`（写 / 改 / 删 / 上传全部返回只读错误且磁盘上没有任何变化、读类方法仍可用）与经 `CompositeBackend` 的路径穿越检查。
@@ -599,6 +609,8 @@ uv run python tests/run_smoke.py
 16. `tests/smoke_multiuser.py`：多用户改造离线冒烟测试（23 个场景）：身份与请求上下文（平台 id 格式 / 末尾换行 / 冒充 `owner`、`cli-`，`require_*` 失败即关闭）、会话库 v1→v2 迁移（数据归 owner、指针迁移、幂等、中途失败整体回滚）与用户隔离、users 表、回溯工具只读自己的会话、请求上下文穿过 `task` 子专家 / 线程池 / `asyncio.to_thread` 且并发互不串、`run_host_command` / `convert_to_markdown` / `execute_complex_browser_action` / DesktopAgent 工具节点在 member 与无上下文时一律拒绝、LLM 指标记录带 `user` 字段、QQ 插件只放行好友私聊（群 @ / 频道 / 频道私信忽略且日志限频，openid 格式不合法忽略，owner 的 openid 归一为 owner）。
 
 17. `tests/smoke_modal.py`：Modal 云端沙箱离线冒烟测试（24 个场景）：S FakeModal 自检（`returncode` 在 `wait()` 之前访问抛错、兜底到点返回 -1 且静默、没有 `kill`、未知参数 `TypeError`、同名异常不继承内建……）、A 真实 SDK 表面（已安装 `modal` 时核对签名，没装就 SKIP；反方向检查 FakeModal 不接受真实 SDK 不认识的参数）、B 配置夹紧与 `member_code_status` 各分支与惰性导入、C 创建参数与环境白名单、D 池 / 租约 / 驱逐 / 上限、E 退出码与超时判定 / 不重试 / 重建、F 注入各类异常都不抛、G 路径规则、H 产物收集、I 软杀逻辑（伪造 `/proc`）与中止 / 关闭、J 熔断 / 创建超时 / 脱敏、K 路由与 `BaseSandbox` 契约（异步与线程池两条路径都拿得到上下文，没带上下文的线程 fail-closed）、L 审计日志、M 镜像定义与两个脚本、N 静态扫描（AST）、O member 的 `execute_python_code` 工具、P 提示词与描述的事实核对、K2 驱动真实编译的 member CodeAgent 做越权尝试、Q 真机验收脚本不带 `--live` 时完全离线。
+
+18. `tests/smoke_qq_files.py`：QQ 文件接收（owner + member）离线冒烟测试（25 个场景）：配置夹紧、文件名清洗与下载地址校验、`httpx.MockTransport` 下载（超限 / 超时 / 重定向 / 错误文案与日志不含下载地址）、owner 落盘（符号链接与路径穿越被拒、无临时文件残留）、member 直传 FakeModal（宿主机无痕）、在途闸门、未消费文件清单与注入边界、`chat_service` 集成（RAG / 记忆 / 事件日志不受清单块污染）、QQ 插件向后兼容、提示词与技能、清理与架构。
 
 此外还提供 `tests/live_modal.py` 真机验收脚本（**不在一键运行里**，需要真实 Modal 令牌与已发布的镜像，会产生少量 Modal 费用；不带 `--live` 只打印用法；`uv run python tests/live_modal.py --live [--slow]`，把终端里 `=== MEASUREMENTS ===` 那一整块复制出来用来决定 `MODAL_INTERRUPT_MODE` 等默认值）与 `tests/live_sandbox.py` 真机验收测试套件（包含 18 项端到端用例，需在已启动 Docker 守护进程的环境下执行 `uv run python tests/live_sandbox.py --live` 运行；慢测试需追加 `--slow` 参数）。
 
@@ -641,3 +653,9 @@ uv run python tests/run_smoke.py
 31. **云端沙箱的 `/work` 会丢**: 闲置超过 `MODAL_IDLE_TIMEOUT_SECONDS` 被 Modal 回收、`/reset`、以及软杀失败回退为终止沙箱时，`/work` 里的文件都会丢失；下一次命令会惰性重建并提示。第一条代码请求有冷启动延迟。
 32. **中止方式的实测结论（2026-11-22，`tests/live_modal.py --live`）**: `MODAL_INTERRUPT_MODE` 保持默认 `soft`。软杀耗时约 2 秒，**沙箱与 `/work` 都保留，之后的 exec 通道连续三轮都正常**；`terminate` 更快（约 0.34 秒）但沙箱没了、`/work` 丢失、重建还要约 4.5 秒，所以默认不改成 `terminate`。另外实测确认：`terminate` 之后读流是**静默结束**，但 `wait()` 会抛 `NotFoundError`（代码已按“沙箱被回收”处理）；exec 超时到点时 `wait()` 返回 `-1` 且不抛异常；**内存超限杀掉进程之后，Modal 很快会把整个沙箱一起回收**，`/work` 随之丢失（不只是杀进程）。冷启动约 5.6 秒、热调用约 2.3 秒。
 33. **云端沙箱镜像更新需手动重建并升 tag**: 镜像内容变了就升 tag（如 `:v2`）、改 `MODAL_IMAGE_NAME`，不要原地覆盖；运行时代码从不构建镜像。
+34. **失败 / 中止的回合会“消费”掉文件清单**: 清单块在回合开始时注入并随后算作已消费；回合失败、超时或被 `/stop` 中止后，下一条文字消息不会重复带上它（checkpoint 里那条 HumanMessage 仍带着清单，需要时主管会在对话历史里找到文件路径，找不到再用 `search_session_history` 按文件名搜索）。
+35. **`/new` 与文件几乎同时到达可能落在旧会话**: 文件落在它到达时的活动会话里；在途闸门只覆盖“下载耗时”这一已知竞态，不是严格同步保证。
+36. **member 的文件随云端沙箱回收而失效**: 闲置超过 `MODAL_IDLE_TIMEOUT_SECONDS`、`/reset` 或沙箱重建后 `/work/uploads/` 里的文件就没了；清单块会标出失效的文件，让主管请用户重新发送。
+37. **QQ 的文件下载地址有时效**: 签名地址过一阵就失效（回执会提示“文件链接已失效，请重新发送”），所以文件必须在发出后很快被下载；机器人离线期间收到的文件无法补收。
+38. **未验证 QQ 是否拒收含扩展名的文本**: `QQ_FILE_SAFE_NAMES=true` 把文件名里的 `.` 显示成 `[.]` 只是防御性假设；真机确认回执不被拒收后可以设为 `false`。另外 QQ 对单条入站消息的被动回复次数上限、`http` 地址升级为 `https` 后对 QQ 下载域是否有效，也都没有真机验证。
+39. **NoneBot 自带的事件日志会打印附件的完整下载地址**: 收到带附件的私聊时，框架在进入插件之前就会记一行 `Message ... [Attachment(type='file', data={'url': 'https://…?rkey=…'})]`（图片附件同理，这是框架行为，不是本功能的日志）。地址带签名，所以不要把控制台输出原样贴给别人；需要脱敏时可在 `bot.py` 里给 loguru 加一个过滤器。
