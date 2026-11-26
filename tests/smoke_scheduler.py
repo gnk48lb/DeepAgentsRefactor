@@ -7,6 +7,7 @@ tests/smoke_scheduler.py
   B6 认领（原子性 / 错过窗口 / cli 分流）   B7 收尾   B8 重启恢复   B9 变更监听器   B10 杂项
   C 调度循环（reminder 端到端 / 错过 / 唤醒 / 停机 / 并发 / 节流 / CLI 分流 / agent 成功）
   D 失败策略与错误分类   E 事件写入（幂等、不是入站事件、日志卫生）
+  F 工具（身份门控、参数校验、限额、重复创建保护、首个任务提示、跨用户隔离、签名里没有 target / user）
 所有时间断言都基于固定的 NOW（2026-11-26 08:30:00 +08:00，周四），不依赖真实的今天。
 """
 import asyncio
@@ -40,6 +41,8 @@ from app.infra import session_store
 from app.infra.session_store import SessionStore
 from app.services import scheduler_service
 from app.services.scheduler_service import AgentRunResult, PushError
+from app.tools import schedule_tools
+from app.utils.context import RequestContext, request_context
 from app.utils import schedule_time
 from app.utils.schedule_time import ScheduleError
 
@@ -1554,6 +1557,244 @@ def test_e2_log_hygiene_and_layering():
         assert job.id[:8] in log and U1[:8] in log
 
 
+# ════════════════════════ F 工具 ════════════════════════
+
+def _rc(user_id, raw_id, scheduled=False):
+    return request_context(RequestContext(user_id, "sid", user_id == OWNER, raw_id, scheduled))
+
+
+def _raiser(exc):
+    def fn(*args, **kwargs):
+        raise exc
+    return fn
+
+
+def create(**kw):
+    args = {"title": "喝水", "mode": "reminder", "prompt": "该喝水了", "in_minutes": 30}
+    args.update(kw)
+    return schedule_tools.create_scheduled_task.invoke(args)
+
+
+def lst():
+    return schedule_tools.list_scheduled_tasks.invoke({})
+
+
+def cancel(ref):
+    return schedule_tools.cancel_scheduled_task.invoke({"task_ref": ref})
+
+
+class _ToolEnv(_SchedEnv):
+    def __enter__(self):
+        super().__enter__()
+        self._patch = patched(DEFAULT_TIMEZONE=SH, SCHEDULER_MAX_JOBS_OWNER=30, SCHEDULER_MAX_JOBS_MEMBER=5,
+                              SCHEDULER_MIN_INTERVAL_MINUTES=30, OWNER_USER_IDS=frozenset({OPENID_OWNER}))
+        self._patch.__enter__()
+        schedule_time.clear_tz_cache()
+        return self
+
+    def __exit__(self, *exc):
+        self._patch.__exit__(*exc)
+        schedule_time.clear_tz_cache()
+        return super().__exit__(*exc)
+
+
+def test_f1_identity_and_target_gate():
+    with _ToolEnv() as env:
+        s = env.store
+        # 没有上下文：失败即关闭
+        for out in (create(), lst(), cancel("1")):
+            assert "无法确定当前用户" in out, out
+        # 无人值守的定时任务里一律拒绝（owner 的任务也一样）：不能再创建、查看或取消定时任务
+        for user, raw in ((U1, U1), (OWNER, OPENID_OWNER), (OWNER, "cli")):
+            with _rc(user, raw, scheduled=True):
+                for out in (create(), lst(), cancel("1")):
+                    assert "无人值守" in out and "已创建" not in out, out
+        assert s.list_jobs() == []
+        # 命令行里的测试成员
+        with _rc("cli-tester", "cli"):
+            for out in (create(), lst(), cancel("1")):
+                assert "命令行里的测试成员" in out, out
+        # 推送目标取自上下文：缺失 / 不合法 / 映射不回当前用户，一律拒绝，什么都不会写进库
+        bad_contexts = [(U1, ""), (U1, "bad id"), (U1, "x" * 65), (U1, U2), (U1, OPENID_OWNER), (OWNER, U1), (OWNER, ""),
+                        (OWNER, "cli ")]
+        for user, raw in bad_contexts:
+            with _rc(user, raw):
+                out = create()
+                assert out.startswith("创建失败：") and "推送目标" in out, (user, raw, out)
+        assert s.list_jobs() == []
+        # 正常：member 用自己的 openid，owner 用 OWNER_USER_IDS 里的 openid，命令行 owner 的目标是 cli
+        with _rc(U1, U1):
+            out = create()
+            assert out.startswith("已创建定时任务「喝水」") and "QQ 主动发给你" in out and "只有 main.py --run-scheduler" not in out, out
+        with _rc(OWNER, OPENID_OWNER):
+            assert create().startswith("已创建")
+        with _rc(OWNER, "cli"):
+            out = create(title="命令行任务")
+            assert out.startswith("已创建") and "只有 main.py --run-scheduler 运行时才会触发" in out, out
+        by_title = {j.title: j for j in s.list_jobs()}
+        assert by_title["喝水"].target_openid in (U1, OPENID_OWNER)
+        assert {(j.user_id, j.target_openid) for j in s.list_jobs()} == {(U1, U1), (OWNER, OPENID_OWNER), (OWNER, "cli")}
+        # 签名里没有任何 target / user / openid 类参数：模型指定不了、改不了推送目标
+        assert set(schedule_tools.create_scheduled_task.args_schema.model_fields) == {"title", "mode", "prompt", "in_minutes", "run_at", "cron"}
+        assert set(schedule_tools.list_scheduled_tasks.args_schema.model_fields) == {"placeholder"}
+        assert set(schedule_tools.cancel_scheduled_task.args_schema.model_fields) == {"task_ref"}
+        for tool_ in schedule_tools.TOOLS:
+            for field in tool_.args_schema.model_fields:
+                assert not any(w in field.lower() for w in ("target", "user", "openid", "owner", "recipient")), field
+        assert [t.name for t in schedule_tools.TOOLS] == ["create_scheduled_task", "list_scheduled_tasks", "cancel_scheduled_task"]
+        # 工具在 LangChain 的线程池里跑：请求上下文靠 contextvars 传进去
+        async def threaded():
+            with _rc(U2, U2):
+                return await asyncio.to_thread(create, title="线程里创建")
+        assert asyncio.run(threaded()).startswith("已创建")
+        assert s.list_jobs(U2)[0].target_openid == U2
+
+
+def test_f2_validation_limits_dedupe_hint():
+    with _ToolEnv() as env:
+        s = env.store
+        with _rc(U1, U1):
+            # 标题 / mode / prompt
+            assert "任务名不能为空" in create(title="  \n ")
+            assert "任务名太长" in create(title="长" * 41) and create(title="长" * 40).startswith("已创建")
+            assert "mode 只能是" in create(title="m1", mode="shell")
+            assert "mode 只能是" in create(title="m2", mode="")
+            assert create(title="m3", mode=" Reminder ").startswith("已创建"), "mode 不区分大小写、两端空白无所谓"
+            assert "prompt 不能为空" in create(title="p1", prompt=" \n ")
+            assert "最多 200 字" in create(title="p2", prompt="长" * 201) and create(title="p3", prompt="长" * 200).startswith("已创建")
+            assert "最多 800 字" in create(title="p4", mode="agent", prompt="长" * 801)
+            assert create(title="p5", mode="agent", prompt="查" * 800).startswith("已创建")
+            # 控制字符与零宽字符被去掉，空白折叠，标题里的换行变空格
+            out = create(title="带\u0000控​制\n字符", prompt="第一行\u0007\r\n第二行")
+            assert out.startswith("已创建定时任务「带控制 字符」"), out
+            job = next(j for j in s.list_jobs(U1) if j.title == "带控制 字符")
+            assert job.prompt == "第一行\n第二行", repr(job.prompt)
+            assert s.count_user_jobs(U1) == 5
+        # 时间参数：错误信息带当前业务时间，且不会写库
+        with patched(SCHEDULER_MAX_JOBS_MEMBER=20), _rc(U2, U2):
+            before = s.count_user_jobs(U2)
+            for kw, word in (({"in_minutes": 0}, "三选一"), ({"in_minutes": 5, "cron": "30 8 * * *"}, "只能填一个"), ({"in_minutes": -3}, "in_minutes"),
+                             ({"in_minutes": 0, "cron": "*/5 * * * *"}, "30 分钟"), ({"in_minutes": 0, "cron": "@daily"}, "别名"),
+                             ({"in_minutes": 0, "cron": "0 0 30 2 *"}, "日"), ({"in_minutes": 0, "run_at": "2001-01-01 08:00"}, "已经过去"),
+                             ({"in_minutes": 0, "run_at": "明天早上八点"}, "YYYY-MM-DD HH:MM")):
+                out = create(title="t", **kw)
+                assert out.startswith("创建失败：") and word in out and "当前业务时间" in out, (kw, out)
+            assert s.count_user_jobs(U2) == before
+            # 三种时间参数各自成功
+            tomorrow = datetime.fromtimestamp(time.time() + 2 * DAY, ZoneInfo(SH)).strftime("%Y-%m-%d 08:30")
+            for title, kw, want in (("t1", {"in_minutes": 30}, "仅一次"), ("t2", {"in_minutes": 0, "cron": "30 8 * * *"}, "每天 08:30，下次"),
+                                    ("t3", {"in_minutes": 0, "run_at": tomorrow}, "仅一次")):
+                out = create(title=title, **kw)
+                assert out.startswith("已创建") and want in out, (kw, out)
+            assert re.search(r"每天 08:30，下次 \d\d-\d\d 08:30。", create(title="t4", in_minutes=0, cron="30 8 * * *", prompt="x"))
+            assert "到点会发送「该喝水了」" in create(title="t5", in_minutes=45)
+            out = create(title="t6", mode="agent", in_minutes=0, cron="0 9 * * 1,3,5", prompt="查询北京今天的天气，用一两句话提醒用户出门要不要带伞")
+            assert "每周一、三、五 09:00" in out and "到点会按这条指令执行，并把结果发给你：「查询北京今天的天气" in out, out
+        # 限额：member 与 owner 各按各的，active 与 paused 一起算
+        with patched(SCHEDULER_MAX_JOBS_MEMBER=2, SCHEDULER_MAX_JOBS_OWNER=3):
+            with _rc(U1, U1):
+                assert s.count_user_jobs(U1) > 2
+                out = create(title="超额")
+                assert out.startswith("创建失败：") and "上限" in out and "已创建" not in out, out
+            with _rc("B1B2C3D4E5F6A7C9", "B1B2C3D4E5F6A7C9"):
+                assert create(title="a").startswith("已创建") and create(title="b", in_minutes=31).startswith("已创建")
+                assert "上限是 2 个" in create(title="c", in_minutes=32)
+                s.pause_user_jobs("B1B2C3D4E5F6A7C9", "admin")
+                assert "上限是 2 个" in create(title="d", in_minutes=33), "paused 也占名额"
+            with _rc(OWNER, OPENID_OWNER):
+                assert [create(title=f"o{i}", in_minutes=40 + i)[:3] for i in range(3)] == ["已创建"] * 3
+                assert "上限是 3 个" in create(title="o4", in_minutes=50)
+        # 重复创建保护 + 首个任务提示
+        with _rc("C9B2C3D4E5F6A7B8", "C9B2C3D4E5F6A7B8"):
+            first = create(title="吃药", prompt="吃药", in_minutes=0, cron="0 9 * * *")
+            assert first.startswith("已创建") and "首次创建提示：" in first and "允许主动发送消息" in first and "/tasks" in first, first
+            again = create(title="吃药", prompt="吃药", in_minutes=0, cron="0 9 * * *")
+            assert "刚刚已经创建过了" in again and "没有重复创建" in again and "首次创建提示" not in again, again
+            assert s.count_user_jobs("C9B2C3D4E5F6A7B8") == 1
+            other = create(title="吃药2", prompt="吃药", in_minutes=0, cron="0 9 * * *")
+            assert other.startswith("已创建") and "首次创建提示" not in other, "只有该用户的第一个任务带提示"
+        with _rc("D9B2C3D4E5F6A7B8", "D9B2C3D4E5F6A7B8"):
+            assert "首次创建提示：" in create(title="另一个用户的第一个"), "每个用户各自的第一个"
+        # 存储出错：返回文本，不抛给模型
+        with _rc("E9B2C3D4E5F6A7B8", "E9B2C3D4E5F6A7B8"):
+            real = s.create_job
+            s.create_job = _raiser(RuntimeError("disk full"))
+            try:
+                out = create(title="崩")
+            finally:
+                s.create_job = real
+            assert "存储暂时不可用" in out and "disk full" not in out, out
+        # 工具的说明（模型看到的）：三个时间参数、两种 mode、自包含、一个任务只做一件事
+        doc = schedule_tools.create_scheduled_task.description
+        for word in ("三选一", "in_minutes", "run_at", "cron", "reminder", "agent", "自包含", "一个任务只做一件事", "YYYY-MM-DD HH:MM",
+                     "30 8 * * *", "0 9 * * 1-5", "资料库、媒体、地图", "不能指定"):
+            assert word in doc, word
+
+
+def test_f3_list_and_cancel():
+    with _ToolEnv() as env:
+        s = env.store
+        with _rc(U1, U1):
+            assert lst() == "你现在没有定时任务。"
+            create(title="喝水", in_minutes=0, cron="30 8 * * *")
+            create(title="开会", in_minutes=30)
+            create(title="查天气", mode="agent", in_minutes=0, cron="0 9 * * 1,3,5", prompt="查询北京天气")
+            out = lst()
+            lines = out.split("\n")
+            assert len(lines) == 3 and lines[0].startswith("1. 「喝水」（固定提醒）编号 "), out
+            assert "｜进行中｜每天 08:30｜下次 " in lines[0] and lines[0].endswith("上次：还没执行过"), lines[0]
+            assert "仅一次 " in lines[1] and "（固定提醒）" in lines[1] and "（到点执行）" in lines[2] and "每周一、三、五 09:00" in lines[2]
+            ids = [j.short_id for j in s.list_jobs(U1)]
+            assert all(i in l for i, l in zip(ids, lines)), (ids, lines)
+        with _rc(U2, U2):
+            assert lst() == "你现在没有定时任务。", "别人的任务看不到"
+            create(title="别人的")
+            assert "喝水" not in lst() and "别人的" in lst()
+        # 状态展示：暂停原因、已完成、上次结果
+        jobs = s.list_jobs(U1)
+        s.pause_job(jobs[0].id, "admin")
+        s.pause_job(jobs[2].id, "push_refused")
+        claims, _ = s.claim_due(jobs[1].next_run_at, cli=False)
+        s.finish_run(claims[0].run_id, "failed", error="x", now=jobs[1].next_run_at)
+        with _rc(U1, U1):
+            lines = lst().split("\n")
+            assert "已暂停（被管理员暂停）" in lines[0] and "下次" not in lines[0]
+            assert "已暂停（推送被拒收" in lines[1] and "/tasks resume" in lines[1]
+            assert "已完成" in lines[2] and "上次：失败" in lines[2], "已完成的排在最后"
+        # 取消：按序号、按 id 前缀；只能取消自己的；owner 在工具里也只管自己的
+        with _rc(U1, U1):
+            assert "没有第 9 个任务" in cancel("9") and "取消失败" in cancel("9")
+            assert "请给出任务的序号" in cancel("   ")
+            assert "编号要写列表里的序号" in cancel("zzzz")
+            victim = s.list_jobs(U1)[0]
+            assert cancel("1") == f"已取消定时任务「{victim.title}」（编号 {victim.short_id}）。"
+            assert s.get_job(victim.id) is None
+            target = s.list_jobs(U1)[0]
+            assert cancel(target.id[:6].upper()).startswith("已取消")
+            assert "没有找到" in cancel(target.id[:6]), "同一个任务不能取消两次"
+        other = s.list_jobs(U2)[0]
+        with _rc(U1, U1):
+            assert "没有找到编号" in cancel(other.id[:8])
+        with _rc(OWNER, OPENID_OWNER):
+            assert "没有找到编号" in cancel(other.id[:8]), "owner 在工具里也只能取消自己的任务（跨用户管理走 /tasks）"
+            assert "没有第 1 个任务" in cancel("1")
+        assert s.get_job(other.id) is not None
+        # 超过 20 条：只显示前 20 条并说明
+        with patched(SCHEDULER_MAX_JOBS_OWNER=30), _rc(OWNER, OPENID_OWNER):
+            for i in range(22):
+                assert create(title=f"批量{i}", in_minutes=100 + i).startswith("已创建")
+            lines = lst().split("\n")
+            assert len(lines) == 21 and lines[-1] == "（另有 2 个任务没有显示）" and lines[19].startswith("20. "), lines[-2:]
+        # 存储出错
+        with _rc(U1, U1):
+            real = s.list_jobs
+            s.list_jobs = _raiser(RuntimeError("boom"))
+            try:
+                assert "存储暂时不可用" in lst()
+            finally:
+                s.list_jobs = real
+
+
 SCENARIOS = [
     ("A1 时区 / 解析 / cron 校验 / next_fire / describe", test_a1_time),
     ("A2 配置块的夹紧回退与 import 卫生", test_a2_config_and_import_hygiene),
@@ -1583,6 +1824,9 @@ SCENARIOS = [
     ("D6 PushError / AgentRunResult", test_d6_push_error_and_result_types),
     ("E1 推送事件写入、隔离、幂等、不影响推送结果", test_e1_push_event_is_written_and_idempotent),
     ("E2 日志卫生与分层", test_e2_log_hygiene_and_layering),
+    ("F1 工具：身份与推送目标门控、签名里没有 target / user", test_f1_identity_and_target_gate),
+    ("F2 工具：参数校验 / 限额 / 重复创建保护 / 首个任务提示", test_f2_validation_limits_dedupe_hint),
+    ("F3 工具：列表与取消（跨用户隔离、状态展示、20 条上限）", test_f3_list_and_cancel),
 ]
 
 

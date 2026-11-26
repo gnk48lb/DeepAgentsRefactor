@@ -23,8 +23,15 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from app import config
 from app.infra import models, mcp_service, modal_sandbox
-from app.tools import amap, knowledge_tools, markitdown_tool, session_tools
-from app.agents.prompts import MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT_CODE
+from app.tools import amap, knowledge_tools, markitdown_tool, schedule_tools, session_tools
+from app.agents.prompts import (
+    MAIN_AGENT_PROMPT,
+    MAIN_AGENT_PROMPT_SCHED,
+    MEMBER_MAIN_AGENT_PROMPT,
+    MEMBER_MAIN_AGENT_PROMPT_CODE,
+    MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED,
+    MEMBER_MAIN_AGENT_PROMPT_SCHED,
+)
 from app.agents.skills import (
     SKILLS_MEMBER_DIR,
     ReadOnlyFilesystemBackend,
@@ -239,12 +246,16 @@ def _build_member_agent(checkpointer: BaseCheckpointSaver):
         )
     subagents = _member_subagents(code)
     supervisor_tools = [knowledge_tools.get_current_time, *session_tools.TOOLS]
+    system_prompt = MEMBER_MAIN_AGENT_PROMPT_CODE if code is not None else MEMBER_MAIN_AGENT_PROMPT
+    if config.SCHEDULER_ENABLED:            # 开关在调用时现读：打开才追加调度说明与三个 schedule 工具，关闭时与原来完全一致
+        supervisor_tools = [*supervisor_tools, *schedule_tools.TOOLS]
+        system_prompt = MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED if code is not None else MEMBER_MAIN_AGENT_PROMPT_SCHED
     _assert_member_graph_safe(supervisor_tools, subagents, vetted_code=code)
 
     agent = create_deep_agent(
         model=models.orchestrator_llm,
         tools=supervisor_tools,
-        system_prompt=MEMBER_MAIN_AGENT_PROMPT_CODE if code is not None else MEMBER_MAIN_AGENT_PROMPT,
+        system_prompt=system_prompt,
         subagents=subagents,
         middleware=[ToolCallLimitMiddleware(tool_name="task", run_limit=12, exit_behavior="continue")],
         backend=build_member_skills_backend(),
@@ -293,10 +304,16 @@ async def _build_owner_agent(checkpointer: BaseCheckpointSaver):
                     f"子 Agent '{sa.get('name')}' 违规持有 convert_to_markdown 工具！"
                 )
 
+    supervisor_tools = [knowledge_tools.get_current_time, *session_tools.TOOLS]
+    system_prompt = MAIN_AGENT_PROMPT
+    if config.SCHEDULER_ENABLED:            # 开关在调用时现读：打开才追加调度说明与三个 schedule 工具，关闭时与原来完全一致
+        supervisor_tools = [*supervisor_tools, *schedule_tools.TOOLS]
+        system_prompt = MAIN_AGENT_PROMPT_SCHED
+
     agent = create_deep_agent(
         model=models.orchestrator_llm,
-        tools=[knowledge_tools.get_current_time, *session_tools.TOOLS],
-        system_prompt=MAIN_AGENT_PROMPT,
+        tools=supervisor_tools,
+        system_prompt=system_prompt,
         subagents=subagents,
         middleware=middleware,
         backend=build_skills_backend(),

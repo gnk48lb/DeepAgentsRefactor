@@ -13,6 +13,7 @@ tests/smoke_orchestrator.py
   F 启动期断言:黑名单工具（13 个）逐个注入主管 / 声明式子专家、非法专家名、预编译子专家都会 RuntimeError
   G member 构建从不读取 desktop / markitdown 的 MCP 工具,也不构造 CodeAgent / FileAgent / DesktopAgent
   H MEMBER_MAIN_AGENT_PROMPT:含识别短语、能力边界,不含任何宿主机相关词
+  J / K 定时任务开关打开时：owner / member 的主管追加调度说明与三个 schedule 工具，原常量不变，member 的能力边界不被破坏
 不需要真实 API Key / 网络:模型客户端用占位 key 构造,构造时不会发请求。
 """
 import asyncio
@@ -28,6 +29,9 @@ for _k in ("GEMINI_API_KEY", "SILICON_FLOW_API_KEY", "HUGGINGFACEHUB_API_TOKEN",
 # 本机 .env 里可能有真实的 Modal 令牌：load_dotenv 不覆盖已有的环境变量，所以这一行能压过它。
 # 否则 member 图会多出 CodeAgent，A–H 全红。启用 CodeAgent 的场景（I / F2 / G2）自己用 monkeypatch + FakeModal。
 os.environ["MODAL_DISABLED"] = "true"
+# 定时任务开关同理：本机 .env 里可能是 true，那样主管会多三个 schedule 工具、提示词也不是原常量，A–I 全红。
+# 开关打开时的断言放在 J / K 里（自己用上下文管理器临时打开）。
+os.environ["SCHEDULER_ENABLED"] = "false"
 for _role in ("WORKER_LLM", "ORCHESTRATOR_LLM", "KNOWLEDGE_LLM", "INGESTION_VLM", "BROWSER_VLM", "DESKTOP_VLM"):
     os.environ[f"{_role}_PROVIDER"] = "magpie"
     os.environ.pop(f"{_role}_MODEL", None)
@@ -42,7 +46,14 @@ from app.agents import orchestrator  # noqa: E402
 from app.agents.experts import code_agent  # noqa: E402
 from app.agents.skills import SKILLS_DIR, SKILLS_MEMBER_DIR, ReadOnlyFilesystemBackend  # noqa: E402
 from _fake_modal import FakeModal  # noqa: E402
-from app.agents.prompts import MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT_CODE  # noqa: E402
+from app.agents.prompts import (  # noqa: E402
+    MAIN_AGENT_PROMPT,
+    MAIN_AGENT_PROMPT_SCHED,
+    MEMBER_MAIN_AGENT_PROMPT,
+    MEMBER_MAIN_AGENT_PROMPT_CODE,
+    MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED,
+    MEMBER_MAIN_AGENT_PROMPT_SCHED,
+)
 
 EXPECTED_ORDER = ["KnowledgeAgent", "MediaAgent", "MapAgent", "CodeAgent",
                   "BrowserAgent", "FileAgent", "DesktopAgent"]
@@ -63,6 +74,7 @@ BANNED = {"write_file", "edit_file", "delete", "execute", "ls", "glob", "grep"}
 
 _captured = {}              # owner 图的 create_deep_agent 参数（A–D 针对它）
 _captured_member = {}       # member 图的 create_deep_agent 参数
+_captured_sched = {}        # 开关打开时各张图的 create_deep_agent 参数（键：owner / member / member_code）
 _mcp_requests = []          # get_tools_by_server 被问过哪些服务
 _agents = None
 _real_create = orchestrator.create_deep_agent
@@ -87,6 +99,12 @@ def _build():
             _captured.update(kwargs)
         elif prompt is MEMBER_MAIN_AGENT_PROMPT or prompt is MEMBER_MAIN_AGENT_PROMPT_CODE:
             _captured_member.update(kwargs)
+        elif prompt is MAIN_AGENT_PROMPT_SCHED:
+            _captured_sched["owner"] = dict(kwargs)
+        elif prompt is MEMBER_MAIN_AGENT_PROMPT_SCHED:
+            _captured_sched["member"] = dict(kwargs)
+        elif prompt is MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED:
+            _captured_sched["member_code"] = dict(kwargs)
         else:
             raise AssertionError("未知的主图 system_prompt")
         return _real_create(*args, **kwargs)
@@ -556,6 +574,122 @@ def test_g2_code_enabled_build_never_touches_docker_or_host():
         assert name not in used, f"member 的 CodeAgent 构建函数不得引用 {name}"
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 定时任务：SCHEDULER_ENABLED 打开时 owner / member 的主管追加调度说明与三个 schedule 工具（A–I 针对关闭状态）
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SCHEDULE_TOOL_NAMES = ["create_scheduled_task", "list_scheduled_tasks", "cancel_scheduled_task"]
+_SUPERVISOR_BASE_TOOLS = ["get_current_time", "get_session_events", "search_session_history"]
+# 追加的调度说明里不得出现的词：member 的能力边界不能被它破坏（能力描述词也一并禁用）
+_SCHED_BANNED_WORDS = ("FileAgent", "CodeAgent", "DesktopAgent", "BrowserAgent", "SQLAgent", "workspace", "宿主机", "Docker", "沙箱",
+                       "文件", "电脑", "代码")
+
+
+@contextlib.contextmanager
+def _scheduler_enabled():
+    saved = config.SCHEDULER_ENABLED
+    config.SCHEDULER_ENABLED = True
+    try:
+        yield
+    finally:
+        config.SCHEDULER_ENABLED = saved
+
+
+def _tool_names_of(subagent) -> set:
+    return {getattr(t, "name", str(t)) for t in (subagent.get("tools") or [])}
+
+
+def _assert_sched_prompt(sched_prompt, base_prompt):
+    """调度版提示词 = 原提示词 rstrip 后 + 两个换行 + 调度说明；追加的部分没有禁用词，前面的原文一字不变。"""
+    from app.agents.prompts import SCHEDULER_PROMPT_SECTION, with_scheduler_section
+    assert sched_prompt is not base_prompt and sched_prompt != base_prompt
+    assert sched_prompt == base_prompt.rstrip() + "\n\n" + SCHEDULER_PROMPT_SECTION == with_scheduler_section(base_prompt)
+    assert sched_prompt.startswith(base_prompt.rstrip()), "追加在末尾，保住前缀缓存"
+    appended = sched_prompt[len(base_prompt.rstrip()):]
+    assert appended.strip() == SCHEDULER_PROMPT_SECTION.strip()
+    for word in _SCHED_BANNED_WORDS:
+        assert word not in appended, f"追加的调度说明不应出现 {word!r}"
+    for word in ("create_scheduled_task", "list_scheduled_tasks", "cancel_scheduled_task", "get_current_time", "reminder", "agent",
+                 "in_minutes", "run_at", "cron", "自包含", "不要委派给任何专家", "首次创建", "资料库、媒体、地图"):
+        assert word in appended, f"调度说明应含 {word!r}"
+
+
+def test_j_owner_graph_with_scheduler():
+    """J 开关打开：owner 图的主管用 MAIN_AGENT_PROMPT_SCHED、工具 = 原三件 + 三个 schedule 工具；专家不变；原常量不变。"""
+    _captured_sched.clear()
+    with _scheduler_enabled():
+        agent, experts = asyncio.run(orchestrator._build_owner_agent(MemorySaver()))
+    assert hasattr(agent, "ainvoke") and experts == tuple(EXPECTED_ORDER), experts
+    cap = _captured_sched["owner"]
+    assert cap["system_prompt"] is MAIN_AGENT_PROMPT_SCHED
+    _assert_sched_prompt(cap["system_prompt"], MAIN_AGENT_PROMPT)
+    assert [t.name for t in cap["tools"]] == _SUPERVISOR_BASE_TOOLS + _SCHEDULE_TOOL_NAMES, [t.name for t in cap["tools"]]
+    assert [_name(s) for s in cap["subagents"]] == EXPECTED_ORDER
+    for s in cap["subagents"]:
+        assert not (_tool_names_of(s) & set(_SCHEDULE_TOOL_NAMES)), f"{_name(s)} 不应持有 schedule 工具：它们只挂在主管上"
+    # 关闭状态下传给 create_deep_agent 的仍是原常量对象本身，工具列表不变（A–E 已经在默认关闭的 _build 里断言过，这里再编译一次对照）
+    asyncio.run(orchestrator._build_owner_agent(MemorySaver()))
+    assert _captured["system_prompt"] is MAIN_AGENT_PROMPT
+    assert [t.name for t in _captured["tools"]] == _SUPERVISOR_BASE_TOOLS
+
+
+def test_k_member_graph_with_scheduler():
+    """K 开关打开：member 图（含云端 CodeAgent 变体）的主管用对应的 *_SCHED、工具 = 原三件 + 三个 schedule 工具，能力边界不变。"""
+    import hashlib
+    sha = lambda text: hashlib.sha256(text.encode("utf-8")).hexdigest()
+    with _scheduler_enabled():
+        # 1. 没有 CodeAgent
+        agent, experts, cap, build = _build_member_capturing()
+        assert hasattr(agent, "ainvoke") and build is None and experts == tuple(MEMBER_ORDER), experts
+        assert cap["system_prompt"] is MEMBER_MAIN_AGENT_PROMPT_SCHED
+        _assert_sched_prompt(cap["system_prompt"], MEMBER_MAIN_AGENT_PROMPT)
+        for word in ("FileAgent", "CodeAgent", "DesktopAgent", "BrowserAgent", "workspace", "宿主机", "Docker", "沙箱"):
+            assert word not in cap["system_prompt"], f"member 的调度版提示词整体都不应出现 {word!r}"
+        assert [t.name for t in cap["tools"]] == _SUPERVISOR_BASE_TOOLS + _SCHEDULE_TOOL_NAMES, [t.name for t in cap["tools"]]
+        assert [_name(s) for s in cap["subagents"]] == MEMBER_ORDER
+        assert all("runnable" not in s for s in cap["subagents"])
+        names = {t.name for t in cap["tools"]}
+        for s in cap["subagents"]:
+            assert not (_tool_names_of(s) & set(_SCHEDULE_TOOL_NAMES)), _name(s)
+            names |= _tool_names_of(s)
+        assert not (names & FORBIDDEN_TOOLS), names & FORBIDDEN_TOOLS
+        assert not (set(_SCHEDULE_TOOL_NAMES) & orchestrator._MEMBER_FORBIDDEN_TOOL_NAMES), "schedule 工具不是宿主机相关工具"
+        # 2. 带云端 CodeAgent
+        with _code_enabled():
+            agent, experts, cap, build = _build_member_capturing()
+            assert build is not None and experts == (*MEMBER_ORDER, "CodeAgent"), experts
+            assert cap["system_prompt"] is MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED
+            _assert_sched_prompt(cap["system_prompt"], MEMBER_MAIN_AGENT_PROMPT_CODE)
+            for word in _CODE_FORBIDDEN_WORDS:
+                assert word not in cap["system_prompt"], f"member(CodeAgent) 的调度版提示词整体都不应出现 {word!r}"
+            assert [t.name for t in cap["tools"]] == _SUPERVISOR_BASE_TOOLS + _SCHEDULE_TOOL_NAMES
+            pre = [s for s in cap["subagents"] if "runnable" in s]
+            assert len(pre) == 1 and pre[0]["name"] == "CodeAgent" and pre[0]["runnable"] is build.runnable
+            assert build.tool_names == _CODE_TOOL_NAMES, "云端 CodeAgent 的工具集不受影响"
+    # 3. 被 H3 钉死的原常量一个字节都没变；开关关闭时仍然传原常量对象本身
+    assert sha(MAIN_AGENT_PROMPT) == _MAIN_PROMPT_SHA256
+    assert sha(MEMBER_MAIN_AGENT_PROMPT.replace(_NEUTRAL_ADDRESS, _TAIPEI_ADDRESS)) == _STAGE1_MEMBER_PROMPT_SHA256
+    _agent, _experts, cap, _build = _build_member_capturing()
+    assert cap["system_prompt"] is MEMBER_MAIN_AGENT_PROMPT and [t.name for t in cap["tools"]] == _SUPERVISOR_BASE_TOOLS
+    with _code_enabled():
+        _agent, _experts, cap, _build = _build_member_capturing()
+        assert cap["system_prompt"] is MEMBER_MAIN_AGENT_PROMPT_CODE and [t.name for t in cap["tools"]] == _SUPERVISOR_BASE_TOOLS
+
+
+def test_k2_scheduler_prompt_constants():
+    """K2 三个 *_SCHED 常量是 import 时的快照：with_scheduler_section 的结果；原常量与它们对象不同。"""
+    from app.agents import prompts
+    assert prompts.MAIN_AGENT_PROMPT_SCHED == prompts.with_scheduler_section(prompts.MAIN_AGENT_PROMPT)
+    assert prompts.MEMBER_MAIN_AGENT_PROMPT_SCHED == prompts.with_scheduler_section(prompts.MEMBER_MAIN_AGENT_PROMPT)
+    assert prompts.MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED == prompts.with_scheduler_section(prompts.MEMBER_MAIN_AGENT_PROMPT_CODE)
+    assert orchestrator.MAIN_AGENT_PROMPT_SCHED is prompts.MAIN_AGENT_PROMPT_SCHED
+    assert orchestrator.MEMBER_MAIN_AGENT_PROMPT_SCHED is prompts.MEMBER_MAIN_AGENT_PROMPT_SCHED
+    assert orchestrator.MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED is prompts.MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED
+    assert orchestrator.MAIN_AGENT_PROMPT is prompts.MAIN_AGENT_PROMPT and orchestrator.MEMBER_MAIN_AGENT_PROMPT_CODE is prompts.MEMBER_MAIN_AGENT_PROMPT_CODE
+    for word in _SCHED_BANNED_WORDS:
+        assert word not in prompts.SCHEDULER_PROMPT_SECTION, word
+
+
 def main():
     print("=" * 70)
     print("开始运行编排层装配离线冒烟测试...")
@@ -577,7 +711,10 @@ def main():
                  ("H3 提示词基线哈希", test_h3_prompt_baselines_are_pinned),
                  ("I 启用 CodeAgent 的 member 图", test_i_member_graph_with_code),
                  ("F2 预编译子专家的严格例外", test_f2_strict_exception_for_vetted_code),
-                 ("G2 启用 CodeAgent 时不碰 Docker 与宿主机", test_g2_code_enabled_build_never_touches_docker_or_host)]
+                 ("G2 启用 CodeAgent 时不碰 Docker 与宿主机", test_g2_code_enabled_build_never_touches_docker_or_host),
+                 ("J 开关打开：owner 图追加调度说明与 schedule 工具", test_j_owner_graph_with_scheduler),
+                 ("K 开关打开：member 图（含云端 CodeAgent 变体）", test_k_member_graph_with_scheduler),
+                 ("K2 *_SCHED 提示词常量", test_k2_scheduler_prompt_constants)]
     passed = failed = 0
     for name, fn in scenarios:
         try:

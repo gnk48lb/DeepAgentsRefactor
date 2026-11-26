@@ -179,6 +179,35 @@ def build_member_main_prompt(code_enabled: bool) -> str:
 MEMBER_MAIN_AGENT_PROMPT = build_member_main_prompt(False)
 MEMBER_MAIN_AGENT_PROMPT_CODE = build_member_main_prompt(True)
 
+
+# ── 定时任务（SCHEDULER_ENABLED 打开时才会编进 owner / member 的主管）──
+# 上面三个原提示词常量一个字不动（它们的 sha256 被 tests/smoke_orchestrator.py 的 H3 钉死，对象身份被 spy 与 D/E/I 依赖）：
+# 调度说明在编译期追加到末尾，既保住前缀缓存，开关关闭时传给 create_deep_agent 的仍是原常量对象本身。
+# 这段文字不得出现 FileAgent / CodeAgent / DesktopAgent / BrowserAgent / SQLAgent / workspace / 宿主机 / Docker / 沙箱，
+# 也不要用“文件 / 电脑 / 代码”这类能力描述词：member 的能力边界不能被它破坏（smoke_orchestrator 的 K 场景会断言）。
+SCHEDULER_PROMPT_SECTION = """【定时任务】
+你可以替用户创建、查看、取消定时任务：到点后系统会通过 QQ 私聊主动给用户发消息。create_scheduled_task、list_scheduled_tasks、cancel_scheduled_task 这三个工具由你亲自调用，不要委派给任何专家。
+- 只在用户明确要求“提醒我 / 每天……告诉我 / N 分钟后叫我 / 定时……”时才创建；普通的问天气、问时间不要创建。
+- 时间信息不全就先问，一次把缺的问全（通常是几点、哪个城市、一次还是每天），不要猜。要换算“明天 / 下周一”之前，先调用 get_current_time；时间一律按用户所在的本地时区理解。
+- mode 有两种：reminder = 到点原样发一句固定的话（喝水、开会、吃药）；agent = 到点由系统执行一次指令，再把结果发给用户（例如“查天气再提醒我带不带伞”）。
+- agent 的 prompt 必须自包含：到点执行时没有当前对话，看不到上下文和长期记忆，城市、对象、要求、语气都要写进去。示例：“查询北京今天的天气，用一两句话提醒用户出门要不要带伞、穿什么，语气简短”。到点执行时只能用资料库、媒体、地图（含天气）这几类能力，超出这个范围的需求不要创建 agent 任务，直接告诉用户做不到。一个任务只做一件事。
+- 时间参数三选一：in_minutes（几分钟后，一次性）、run_at（本地时间 YYYY-MM-DD HH:MM，一次性）、cron（5 段：分 时 日 月 周，重复）。每天 8:30 是 30 8 * * *，工作日 9 点是 0 9 * * 1-5，每周一三五 9 点是 0 9 * * 1,3,5。
+- 创建成功后用一两句话确认：任务名、何时（是否重复）、会发什么。工具返回里若带有“首次创建”的提示，原样转述给用户。创建失败就把原因用人话讲给用户，不要用同样的参数重试。
+- 查看用 list_scheduled_tasks；取消前先 list 确认编号，再用 cancel_scheduled_task 按序号或编号前几位取消。只能操作用户自己的任务。
+- 会话里可能出现你没写过的“定时推送”记录，那是系统到点发给用户的消息，用户接着聊它时当作背景。"""
+
+
+def with_scheduler_section(prompt: str) -> str:
+    """原提示词 rstrip 后加两个换行再接调度说明：追加在末尾，前面的文字一字不变（前缀缓存仍然命中）。"""
+    return prompt.rstrip() + "\n\n" + SCHEDULER_PROMPT_SECTION
+
+
+# 编译进图的用这三个常量（import 时的快照）：与上面三个原常量一样，身份比较（is）才成立
+MAIN_AGENT_PROMPT_SCHED = with_scheduler_section(MAIN_AGENT_PROMPT)
+MEMBER_MAIN_AGENT_PROMPT_SCHED = with_scheduler_section(MEMBER_MAIN_AGENT_PROMPT)
+MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED = with_scheduler_section(MEMBER_MAIN_AGENT_PROMPT_CODE)
+
+
 WORKER_BASE_PROMPT = (
     "你是一个底层领域专家。你的汇报对象是主管（Orchestrator）。你的任务是严格执行主管交代的明确指令。\n"
     "【执行规范 - 强制】：**严禁在调用工具前输出任何\"计划\"、\"思考过程\"或\"闲聊\"文字！** 如果你需要使用工具，请直接输出 tool_calls。只有当工具执行完毕且你拿到了最终结果后，你才进行数据总结和汇报。\n"

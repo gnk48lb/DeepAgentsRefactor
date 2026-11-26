@@ -227,7 +227,14 @@ def test_d_prompt_uniqueness_and_identity():
     # 2. 验证 _identify_agent 准确性
     from langchain_core.messages import SystemMessage
     from app.runtime.cli_logger import _identify_agent
-    from app.agents.prompts import MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT_CODE
+    from app.agents.prompts import (
+        MAIN_AGENT_PROMPT,
+        MAIN_AGENT_PROMPT_SCHED,
+        MEMBER_MAIN_AGENT_PROMPT,
+        MEMBER_MAIN_AGENT_PROMPT_CODE,
+        MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED,
+        MEMBER_MAIN_AGENT_PROMPT_SCHED,
+    )
     from app.memory.extractor import MEMORY_EXTRACTOR_PROMPT, MEMORY_RECONCILER_PROMPT
     from app.agents.experts import (
         knowledge_agent,
@@ -255,6 +262,8 @@ def test_d_prompt_uniqueness_and_identity():
     assert ident(file_agent.PROMPT + file_agent.PROMPT_MARKITDOWN) == "FileAgent"
     assert ident(code_agent.MEMBER_PROMPT) == "CodeAgent", "member 的云端 CodeAgent 提示词要能被 cli_logger 识别"
     assert ident(MEMBER_MAIN_AGENT_PROMPT_CODE) == "MainAgent (Orchestrator)"
+    for _sched in (MAIN_AGENT_PROMPT_SCHED, MEMBER_MAIN_AGENT_PROMPT_SCHED, MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED):
+        assert ident(_sched) == "MainAgent (Orchestrator)", "追加了调度说明的主管提示词仍要被识别为主管"
     for _p in (media_agent.PROMPT, media_agent.DESCRIPTION, MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT,
                MEMBER_MAIN_AGENT_PROMPT_CODE, code_agent.MEMBER_PROMPT, code_agent.MEMBER_DESCRIPTION):
         assert "SQLAgent" not in _p, "合并后不应再出现 SQLAgent"
@@ -347,6 +356,7 @@ import app.services.file_staging
 import app.utils.schedule_time
 import app.infra.schedule_store
 import app.services.scheduler_service
+import app.tools.schedule_tools
 
 forbidden = ["app.infra.models", "app.infra.milvus_client", "app.knowledge", "app.memory", "modal"]
 loaded = [m for m in forbidden if any(name == m or name.startswith(m + ".") for name in sys.modules)]
