@@ -8,6 +8,7 @@ tests/smoke_scheduler.py
   C 调度循环（reminder 端到端 / 错过 / 唤醒 / 停机 / 并发 / 节流 / CLI 分流 / agent 成功）
   D 失败策略与错误分类   E 事件写入（幂等、不是入站事件、日志卫生）
   F 工具（身份门控、参数校验、限额、重复创建保护、首个任务提示、跨用户隔离、签名里没有 target / user）
+  G /tasks 命令的单元测试与 main.py --run-scheduler（命令与背景注入的集成场景在 smoke_chat_service 的 R9 / R10）
 所有时间断言都基于固定的 NOW（2026-11-26 08:30:00 +08:00，周四），不依赖真实的今天。
 """
 import asyncio
@@ -1795,6 +1796,166 @@ def test_f3_list_and_cancel():
                 s.list_jobs = real
 
 
+# ════════════════════════ G /tasks 与 CLI ════════════════════════
+
+from app.services import task_commands
+from app.utils.identity import Identity
+
+
+def _member(uid=U1):
+    return Identity(user_id=uid, is_owner=False, raw_id=uid)
+
+
+def _owner():
+    return Identity(user_id=OWNER, is_owner=True, raw_id=OPENID_OWNER)
+
+
+def test_g1_task_commands_unit():
+    # 开关关闭：任何子命令都是同一句固定回复，且不会去打开任务库
+    real_get = schedule_store.get_schedule_store
+
+    def boom():
+        raise AssertionError("开关关闭时不应打开任务库")
+    schedule_store.get_schedule_store = boom
+    try:
+        with patched(SCHEDULER_ENABLED=False):
+            for who in (_member(), _owner()):
+                for arg in ("", "all", "rm 1", "pause 1", "resume 1", "bogus", "  ALL  "):
+                    assert task_commands.handle(arg, who) == "定时任务功能未启用。", arg
+    finally:
+        schedule_store.get_schedule_store = real_get
+
+    with _SchedEnv() as env, patched(SCHEDULER_ENABLED=True):
+        s = env.store
+        h = task_commands.handle
+        # 空列表 / 用法
+        assert "你现在没有定时任务" in h("", _member())
+        for who, has_all in ((_member(), False), (_owner(), True)):
+            for arg in ("bogus", "rmm 1", "list"):
+                out = h(arg, who)
+                assert out.startswith("用法：") and ("/tasks all" in out) == has_all, (arg, out)
+            for sub in ("rm", "pause", "resume", "del"):
+                name = "rm" if sub == "del" else sub
+                assert h(sub, who) == f"用法：/tasks {name} <序号|编号前缀>。", sub
+        assert h("all", _member()) == "该命令仅管理员可用"
+        assert h("all", _owner()) == "现在没有任何定时任务。"
+        # 子命令不区分大小写，del 是 rm 的别名
+        j1 = mk(s, user=U1, title="一", cron="30 8 * * *")
+        j2 = mk(s, user=U1, title="二", cron="0 9 * * *")
+        assert h("PAUSE 1", _member()).startswith("已暂停定时任务「一」") and h("Resume 1", _member()).startswith("已恢复")
+        assert h("DEL 2", _member()).startswith("已取消定时任务「二」") and s.get_job(j2.id) is None
+        # 恢复的各种失败：没暂停 / 已完成 / 一次性任务已过期 / 被管理员暂停（member 不行，owner 行）
+        assert h("resume 1", _member()) == "这个任务没有处于暂停状态"
+        once = mk(s, user=U1, title="一次", kind="once", next_run_at=time.time() + 1, spec_key="o1")
+        s.claim_due(time.time() + 5, cli=False)
+        assert h("rm 2", _member()).startswith("已取消定时任务「一次」"), "已完成的任务排在最后，也能取消"
+        once2 = mk(s, user=U1, title="快过期", kind="once", next_run_at=time.time() + 60, spec_key="o2")
+        h("pause 2", _member())
+        s._conn.execute("UPDATE jobs SET next_run_at = ? WHERE id = ?", (time.time() - 10, once2.id))
+        assert "时间已经过了" in h("resume 2", _member()) and "重新创建" in h("resume 2", _member())
+        done_job = mk(s, user=U2, title="完成的", kind="once", next_run_at=time.time() + 1, spec_key="d1")
+        s.claim_due(time.time() + 5, cli=False)
+        assert "已经执行完了" in h("pause 1", _member(U2)) and "已经执行完了" in h("resume 1", _member(U2))
+        assert h("pause 1", _member(U2)).startswith("这个任务已经执行完了")
+        # owner 看到所有人的任务（>50 条时截断并说明），每行带用户显示名（没有备注就是前缀）与编号
+        for i in range(52):
+            mk(s, user=U2, title=f"批量{i}", cron=f"{i % 60} 7 * * *", spec_key=f"b{i}", max_jobs=100)
+        out = h("all", _owner())
+        assert out.startswith("所有用户的定时任务（共 ") and "（另有 " in out and "没有显示）" in out, out[:80]
+        assert U2[:8] in out and "编号 " in out
+        # 存储里的预期错误原样给用户；意外异常固定文案
+        assert "没有找到编号以 ffffffff 开头的任务" in h("rm ffffffff", _owner())
+        real_list = s.list_jobs
+        s.list_jobs = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk gone"))
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                assert h("", _member()) == "定时任务功能暂时出错，请稍后再试。"
+            assert "disk gone" not in buf.getvalue() and "RuntimeError" in buf.getvalue()
+        finally:
+            s.list_jobs = real_list
+
+
+def _load_main():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("cli_main_under_test", ROOT / "main.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_g2_cli_scheduler_flag():
+    """main.py --run-scheduler：开关打开才启动（cli=True，push 打印到控制台），关闭时警告并忽略；退出前先停调度器再关服务；不带参数不启动。"""
+    from app.services import chat_service
+    main_mod = _load_main()
+    events: list = []
+    saved = (chat_service.init_service, chat_service.shutdown_service, scheduler_service.start, scheduler_service.stop,
+             main_mod._start_stdin_reader, sys.argv)
+
+    async def fake_init():
+        events.append("init")
+
+    async def fake_shutdown():
+        events.append("shutdown")
+
+    def fake_start(**kwargs):
+        events.append(("start", kwargs))
+
+    async def fake_stop():
+        events.append("stop")
+
+    def fake_reader(loop, queue):                  # 标准输入立刻 EOF：主循环退出
+        loop.call_soon(queue.put_nowait, None)
+
+    def run(argv, enabled):
+        events.clear()
+        sys.argv = ["main.py", *argv]
+        buf = io.StringIO()
+        with patched(SCHEDULER_ENABLED=enabled), contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            asyncio.run(main_mod.main())
+        return buf.getvalue()
+
+    try:
+        chat_service.init_service, chat_service.shutdown_service = fake_init, fake_shutdown
+        scheduler_service.start, scheduler_service.stop = fake_start, fake_stop
+        main_mod._start_stdin_reader = fake_reader
+        # 1. 开关打开 + --run-scheduler：init 之后启动，cli=True，push 是控制台打印；退出时先 stop 再 shutdown
+        out = run(["--run-scheduler"], True)
+        assert events[0] == "init" and events[1][0] == "start", events
+        kwargs = events[1][1]
+        assert kwargs["cli"] is True and kwargs["run_turn"] is chat_service.run_scheduled_turn and kwargs["push"] is main_mod._cli_push, kwargs
+        assert events[2:] == ["stop", "shutdown"], events
+        assert "CLI 定时任务调度器已启动" in out
+        # 2. 开关关闭却传了 --run-scheduler：警告并忽略（stop 仍然会被调用，它对没启动过的调度器是空操作）
+        out = run(["--run-scheduler"], False)
+        assert [e for e in events if isinstance(e, tuple)] == [] and "SCHEDULER_ENABLED" in out and "已忽略" in out, (events, out)
+        # 3. 不带参数：默认关闭，哪怕开关是打开的
+        out = run([], True)
+        assert [e for e in events if isinstance(e, tuple)] == [] and "已忽略" not in out
+        # 4. --member 的测试身份也能带这个参数；参数不合法照常报错
+        raises(SystemExit, run, ["--run-scheduler", "--member", "bad name!"], True)
+    finally:
+        (chat_service.init_service, chat_service.shutdown_service, scheduler_service.start, scheduler_service.stop,
+         main_mod._start_stdin_reader, sys.argv) = saved
+
+    # CLI 调度器端到端：只领 owner 在命令行里创建的（目标是 cli）任务，到点把文字打印到控制台
+    with _SchedEnv() as env, patched(**FAST):
+        s = env.store
+        cli_job = mk(s, user=OWNER, title="命令行提醒", kind="once", next_run_at=soon(0.1), prompt="该休息了", spec_key="c", target=schedule_store.CLI_TARGET)
+        qq_job = mk(s, user=U1, title="QQ 的提醒", kind="once", next_run_at=soon(0.1), prompt="别被偷走", spec_key="q")
+        buf = io.StringIO()
+
+        async def scenario():
+            with contextlib.redirect_stdout(buf):
+                scheduler_service.start(run_turn=FakeRun(), push=main_mod._cli_push, cli=True)
+                assert await wait_until(lambda: "该休息了" in buf.getvalue(), timeout=3.0)
+                await asyncio.sleep(0.3)
+                await scheduler_service.stop()
+        run_scenario(scenario)
+        assert "⏰ [定时推送]" in buf.getvalue() and "⏰ 该休息了" in buf.getvalue() and "别被偷走" not in buf.getvalue()
+        assert s.get_job(cli_job.id).status == "done" and s.get_job(qq_job.id).status == "active", "CLI 调度器不会领走 QQ 用户的提醒"
+
+
 SCENARIOS = [
     ("A1 时区 / 解析 / cron 校验 / next_fire / describe", test_a1_time),
     ("A2 配置块的夹紧回退与 import 卫生", test_a2_config_and_import_hygiene),
@@ -1827,6 +1988,8 @@ SCENARIOS = [
     ("F1 工具：身份与推送目标门控、签名里没有 target / user", test_f1_identity_and_target_gate),
     ("F2 工具：参数校验 / 限额 / 重复创建保护 / 首个任务提示", test_f2_validation_limits_dedupe_hint),
     ("F3 工具：列表与取消（跨用户隔离、状态展示、20 条上限）", test_f3_list_and_cancel),
+    ("G1 /tasks 命令：开关关闭、用法、状态流转的各种失败、owner 的 all", test_g1_task_commands_unit),
+    ("G2 main.py --run-scheduler 与 CLI 调度器只领 CLI 的任务", test_g2_cli_scheduler_flag),
 ]
 
 

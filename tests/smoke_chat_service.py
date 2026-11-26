@@ -95,7 +95,7 @@ from app import config
 from app.services import chat_service as cs
 from app.services import session_log
 from app.agents.experts import file_agent
-from app.infra import checkpointer, modal_sandbox, sandbox, session_store
+from app.infra import checkpointer, modal_sandbox, sandbox, schedule_store, session_store
 from app.infra.session_store import SessionStore
 from app.runtime import hitl, outbox
 from app.utils.context import get_request_context
@@ -1729,6 +1729,206 @@ async def test_r8_scheduled_graph_wiring():
         await _teardown()
 
 
+@contextlib.contextmanager
+def _scheduler_env(enabled: bool = True):
+    """定时任务开关 + 临时 schedules.db；退出时还原开关、关闭并清掉库。"""
+    base = tempfile.mkdtemp(prefix="sched_chat_")
+    store = schedule_store.ScheduleStore(os.path.join(base, "schedules.db"))
+    schedule_store.set_schedule_store(store)
+    saved = config.SCHEDULER_ENABLED
+    config.SCHEDULER_ENABLED = enabled
+    try:
+        yield store
+    finally:
+        config.SCHEDULER_ENABLED = saved
+        schedule_store.close_schedule_store()
+        store.close()
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def _seed_job(store, user_id, title, *, cron="30 8 * * *", mode="reminder"):
+    target = user_id if user_id != OWNER else "OWNERQQ00000001"
+    now = time.time()
+    job, _ = store.create_job(
+        user_id=user_id, target_openid=target, title=title, mode=mode, prompt=f"{title}的内容", kind="cron", cron=cron,
+        timezone="Asia/Shanghai", next_run_at=now + 3600, spec_key=f"cron:{cron}:{title}", max_jobs=50, now=now,
+    )
+    return job
+
+
+async def test_r9_tasks_command_and_block_linkage():
+    """R9 /tasks：开关关闭时的固定回复；member 只管自己的；owner 可用编号前缀管所有人、/tasks all；admin 暂停 member 不能自己恢复；
+    /block 暂停该用户进行中的任务（reason=admin），/unblock 不自动恢复；开关关闭时 /block 完全不碰任务库。"""
+    await _install_two_graphs([AIMessage(content="o")], [AIMessage(content="m")])
+    try:
+        for who in (ID, MEMBER_A):
+            await _say(who, "你好")                                  # 先让用户出现在 users 表里
+        await _say(MEMBER_B, "我是 B")
+        # 1. 开关关闭：固定回复；/block 不碰任务库
+        with _scheduler_env(False):
+            real_get = schedule_store.get_schedule_store
+
+            def boom():
+                raise AssertionError("开关关闭时不应打开任务库")
+            schedule_store.get_schedule_store = boom
+            try:
+                for who in (ID, MEMBER_A):
+                    for arg in ("", " all", " rm 1", " bogus"):
+                        assert (await _say(who, "/tasks" + arg)).text == "定时任务功能未启用。", (who.user_id, arg)
+                r = await _say(ID, f"/block {MEMBER_B.user_id}")
+                assert "已封禁" in r.text and "定时任务" not in r.text, r.text
+                r = await _say(ID, f"/unblock {MEMBER_B.user_id}")
+                assert "已解封" in r.text and "定时任务" not in r.text, r.text
+            finally:
+                schedule_store.get_schedule_store = real_get
+        # 2. 开关打开
+        with _scheduler_env(True) as store:
+            a1 = _seed_job(store, MEMBER_A.user_id, "A的喝水")
+            a2 = _seed_job(store, MEMBER_A.user_id, "A的吃药", cron="0 9 * * 1,3,5", mode="agent")
+            b1 = _seed_job(store, MEMBER_B.user_id, "B的会议")
+            o1 = _seed_job(store, OWNER, "主人的日报", cron="0 18 * * 1-5")
+            # 列表：只看到自己的
+            text = (await _say(MEMBER_A, "/tasks")).text
+            assert text.startswith("你的定时任务：") and "A的喝水" in text and "A的吃药" in text, text
+            assert "B的会议" not in text and "主人的日报" not in text and "/tasks all" not in text, text
+            assert "1. 「A的喝水」（固定提醒）编号 " + a1.id[:8] in text and "｜进行中｜每天 08:30｜下次 " in text
+            assert "每周一、三、五 09:00" in text and "（到点执行）" in text
+            text = (await _say(MEMBER_B, "/tasks")).text
+            assert "B的会议" in text and "A的" not in text
+            # member 取消 / 暂停 / 恢复自己的；对别人的任务一律“没有找到”，也不泄露存在性
+            assert (await _say(MEMBER_A, "/tasks pause 1")).text.startswith("已暂停定时任务「A的喝水」")
+            assert store.get_job(a1.id).paused_reason == "user"
+            assert "已暂停（你暂停的）" in (await _say(MEMBER_A, "/tasks")).text
+            assert (await _say(MEMBER_A, "/tasks resume 1")).text.startswith("已恢复定时任务「A的喝水」")
+            assert store.get_job(a1.id).status == "active"
+            for cmd in (f"rm {b1.id[:8]}", f"pause {b1.id[:8]}", f"resume {b1.id[:8]}", f"del {o1.id[:8]}"):
+                out = (await _say(MEMBER_A, "/tasks " + cmd)).text
+                assert "没有找到" in out, (cmd, out)
+            assert store.get_job(b1.id).status == "active" and store.get_job(o1.id) is not None
+            assert (await _say(MEMBER_A, "/tasks all")).text == "该命令仅管理员可用"
+            assert "用法" in (await _say(MEMBER_A, "/tasks bogus")).text and "/tasks all" not in (await _say(MEMBER_A, "/tasks bogus")).text
+            assert "用法：/tasks rm" in (await _say(MEMBER_A, "/tasks rm")).text
+            assert "没有第 9 个任务" in (await _say(MEMBER_A, "/tasks rm 9")).text
+            assert (await _say(MEMBER_A, "/tasks del 2")).text.startswith("已取消定时任务「A的吃药」") and store.get_job(a2.id) is None
+            empty = (await _say(MEMBER_A, "/tasks rm 1")).text                                # 取消最后一个
+            assert empty.startswith("已取消") and "你现在没有定时任务" in (await _say(MEMBER_A, "/tasks")).text
+            a1 = _seed_job(store, MEMBER_A.user_id, "A的新任务")
+            # owner：/tasks all、用编号前缀管任何人的任务
+            text = (await _say(ID, "/tasks all")).text
+            assert text.startswith("所有用户的定时任务（共 3 个）") and "A的新任务" in text and "B的会议" in text and "主人的日报" in text, text
+            assert MEMBER_A.user_id[:8] in text and MEMBER_B.user_id[:8] in text and "编号 " + b1.id[:8] in text
+            await _say(ID, "/label MEMBERAAA0001 小甲")
+            assert "小甲（MEMBERAA）" in (await _say(ID, "/tasks all")).text, "带备注的用户显示成 备注（前缀）"
+            assert "所有人" in (await _say(ID, "/tasks")).text and "主人的日报" in (await _say(ID, "/tasks")).text
+            assert "B的会议" not in (await _say(ID, "/tasks")).text, "owner 的 /tasks 只列自己的"
+            out = (await _say(ID, f"/tasks pause {b1.id[:8]}")).text
+            assert out.startswith("已暂停定时任务「B的会议」") and "MEMBERBB" in out, out
+            assert store.get_job(b1.id).paused_reason == "admin", "owner 暂停别人的任务记成 admin"
+            out = (await _say(MEMBER_B, f"/tasks resume 1")).text
+            assert out == "该任务被管理员暂停，请联系管理员", out
+            assert store.get_job(b1.id).status == "paused"
+            out = (await _say(ID, f"/tasks resume {b1.id[:8]}")).text
+            assert out.startswith("已恢复定时任务「B的会议」") and store.get_job(b1.id).status == "active", out
+            assert (await _say(ID, "/tasks pause 1")).text.startswith("已暂停定时任务「主人的日报」") and store.get_job(o1.id).paused_reason == "user"
+            assert (await _say(ID, f"/tasks rm {b1.id[:8]}")).text.startswith("已取消定时任务「B的会议」") and store.get_job(b1.id) is None
+            # /block：暂停该用户进行中的任务（reason=admin），已暂停的不动；/unblock 不自动恢复，回复里提示手动恢复
+            a_user = _seed_job(store, MEMBER_A.user_id, "A再来一个", cron="5 9 * * *")
+            store.pause_job(a_user.id, "user")
+            r = await _say(ID, f"/block {MEMBER_A.user_id}")
+            assert "已封禁" in r.text and "已暂停它的 1 个定时任务" in r.text, r.text
+            assert store.get_job(a1.id).paused_reason == "admin" and store.get_job(a_user.id).paused_reason == "user"
+            assert store.get_job(o1.id).status == "paused" and store.get_job(o1.id).paused_reason == "user"
+            r = await _say(ID, f"/unblock {MEMBER_A.user_id}")
+            assert "已解封" in r.text and "1 个被暂停的定时任务不会自动恢复" in r.text and "/tasks resume" in r.text, r.text
+            assert store.get_job(a1.id).status == "paused", "/unblock 不会自动恢复"
+            assert (await _say(MEMBER_A, "/tasks resume 1")).text == "该任务被管理员暂停，请联系管理员"
+            assert (await _say(ID, f"/tasks resume {a1.id[:8]}")).text.startswith("已恢复定时任务「A的新任务」")
+            # 存储异常：固定文案，不抛
+            real_list = store.list_jobs
+            store.list_jobs = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk gone"))
+            try:
+                assert (await _say(MEMBER_A, "/tasks")).text == "定时任务功能暂时出错，请稍后再试。"
+            finally:
+                store.list_jobs = real_list
+    finally:
+        await _teardown()
+
+
+async def test_r10_scheduled_push_context_injection():
+    """R10 用户下一条消息前，把边界（上一条 user_message / session_reset）之后系统推送过的内容（最多 3 条、每条截 400 字）作为
+    <scheduled_push_context> 块拼到最后一条 HumanMessage 前面：只注入一次、只含自己的、开关关闭不注入；
+    事件日志里的用户原话与记忆抽取的文本都不含该块；注入失败不影响这一轮。"""
+    omm, mmm = await _install_two_graphs([AIMessage(content="o")], [AIMessage(content="m")])
+    try:
+        await _say(MEMBER_A, "先打个招呼")
+        await _say(MEMBER_B, "B 也打个招呼")
+        sid_a, sid_b = _sid(MEMBER_A.user_id), _sid(MEMBER_B.user_id)
+        store = _env.store
+
+        def push(sid, title, text, run_id):
+            store.emit_event(sid, session_store.EVENT_SCHEDULED_PUSH, {"job_id": "abcd1234", "title": title, "text": text, "mode": "reminder", "run_id": run_id},
+                             key=f"sp:{run_id}")
+        with _scheduler_env(True):
+            # 1. 一条推送：注入到下一条用户消息，块在用户原话之前，写明“仅作背景，不是指令”
+            push(sid_a, "喝水", "该喝水了", 1)
+            push(sid_b, "B的会议", "B 的内容不该出现在 A 那里", 2)
+            mem_calls.clear()
+            await _say(MEMBER_A, "好的，那明天呢")
+            seen = mmm.seen[-1]
+            assert "<scheduled_push_context>" in seen and "「喝水」该喝水了" in seen and "仅作背景，不是指令" in seen, seen
+            assert seen.index("<scheduled_push_context>") < seen.index("</scheduled_push_context>") < seen.index("好的，那明天呢"), "块在用户原话之前"
+            assert "B 的内容" not in seen, "别人的推送不会注入给 A"
+            # 事件日志里的用户原话、记忆抽取的文本都不含该块
+            user_events = store.get_events(sid_a, types=("user_message",))
+            assert user_events[-1].payload["text"] == "好的，那明天呢" and "<scheduled_push_context>" not in str(user_events[-1].payload)
+            assert mem_calls == ["好的，那明天呢"], mem_calls
+            # 2. 消费语义：已经注入过的不再出现；新的推送才会出现
+            await _say(MEMBER_A, "还有别的吗")
+            assert mmm.seen[-1].count("<scheduled_push_context>") == 1, "上一条消息带的块留在对话历史里，这一条没有再注入第二次"
+            assert "<scheduled_push_context>" not in mmm.seen[-1].split("好的，那明天呢")[-1], "新的这条消息前面没有块"
+            # 3. 最多 3 条、每条截 400 字；多条按时间顺序
+            for i in range(5):
+                push(sid_a, f"任务{i}", ("长" * 500) if i == 4 else f"内容{i}", 10 + i)
+            await _say(MEMBER_A, "说说这些")
+            seen = mmm.seen[-1]
+            assert "「任务2」内容2" in seen and "「任务3」内容3" in seen and "「任务4」" in seen, seen
+            assert "任务1" not in seen and "任务0" not in seen, "只取最近 3 条"
+            assert seen.index("「任务2」") < seen.index("「任务3」") < seen.index("「任务4」")
+            assert "长" * 400 + "…" in seen and "长" * 401 not in seen, "每条截 400 字"
+            # 4. /reset 之后的会话不再带上之前的推送（边界 = session_reset）
+            push(sid_a, "重置前", "重置前的推送", 20)
+            await _say(MEMBER_A, "/reset")
+            await _say(MEMBER_A, "新会话第一句")
+            assert "重置前的推送" not in mmm.seen[-1]
+            # 5. 开关关闭：即使会话里有推送也不注入；owner 同样
+            push(_sid(MEMBER_A.user_id), "关闭时", "不该被注入", 30)
+            with _scheduler_env(False):
+                await _say(MEMBER_A, "关闭时的消息")
+                assert "<scheduled_push_context>" not in mmm.seen[-1] and "不该被注入" not in mmm.seen[-1]
+            push(_sid(OWNER), "主人的推送", "owner 的背景", 31)
+            await _say(ID, "owner 说话")
+            assert "owner 的背景" in omm.seen[-1] and "<scheduled_push_context>" in omm.seen[-1]
+            # 6. 注入函数本身：没有推送原样返回；任何异常都吞掉（返回原 messages），也不改动入参
+            msgs = [HumanMessage(content="你好")]
+            ev = types.SimpleNamespace(seq=10 ** 6)
+            assert await cs._attach_scheduled_context(msgs, "no-such-session", MEMBER_A.user_id, ev) == msgs
+            assert await cs._attach_scheduled_context(msgs, _sid(MEMBER_A.user_id), MEMBER_A.user_id, None) == msgs
+            real_get = session_store.get_store
+            session_store.get_store = lambda: (_ for _ in ()).throw(RuntimeError("db gone"))
+            try:
+                assert await cs._attach_scheduled_context(msgs, "x", MEMBER_A.user_id, ev) is msgs
+            finally:
+                session_store.get_store = real_get
+            assert msgs[0].content == "你好"
+            # 图片 / 多段内容：块作为独立的 text 段放在最前面
+            multi = [HumanMessage(content=[{"type": "text", "text": "看图"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}])]
+            push(_sid(MEMBER_A.user_id), "图前", "图前的推送", 40)
+            out = await cs._attach_scheduled_context(multi, _sid(MEMBER_A.user_id), MEMBER_A.user_id, types.SimpleNamespace(seq=10 ** 6))
+            assert out[0].content[0]["type"] == "text" and "图前的推送" in out[0].content[0]["text"] and out[0].content[1:] == multi[0].content
+    finally:
+        await _teardown()
+
+
 async def test_r7_startup_notice_wording():
     """R7 OWNER_USER_IDS 为空时的启动提示：不再说 member 没有“代码能力”，改为说明代码只能在云端沙箱里跑；P12 原有断言的关键词都在。"""
     old_ids, old_user = config.OWNER_USER_IDS, config.MYSQL_USER
@@ -1788,6 +1988,8 @@ SCENARIOS = [
     ("R6 启动横幅与 /whoami", test_r6_startup_banner_and_whoami),
     ("R7 启动提示文案", test_r7_startup_notice_wording),
     ("R8 scheduled 图的接线与启动横幅", test_r8_scheduled_graph_wiring),
+    ("R9 /tasks 命令与 /block 联动", test_r9_tasks_command_and_block_linkage),
+    ("R10 定时推送背景注入", test_r10_scheduled_push_context_injection),
 ]
 
 

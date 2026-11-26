@@ -360,6 +360,40 @@ def _describe_cron(cron: str) -> str:
     return cron
 
 
+_JOB_STATUS_TEXT = {"active": "进行中", "done": "已完成"}
+_JOB_PAUSE_TEXT = {
+    "user": "你暂停的",
+    "admin": "被管理员暂停",
+    "push_refused": "推送被拒收，请确认没有关闭“允许主动发送消息”，再发 /tasks resume 恢复",
+    "failures": "连续失败，问题解决后发 /tasks resume 恢复",
+}
+_JOB_LAST_TEXT = {"ok": "成功", "failed": "失败", "skipped": "已跳过", "missed": "错过了"}
+_JOB_MODE_TEXT = {"reminder": "固定提醒", "agent": "到点执行"}
+
+
+def job_status_text(job) -> str:
+    """任务状态的一句话：进行中 / 已完成 / 已暂停（原因）。job 是任何带 status / paused_reason 属性的对象。"""
+    if job.status == "paused":
+        return "已暂停（" + _JOB_PAUSE_TEXT.get(job.paused_reason or "", "已暂停") + "）"
+    return _JOB_STATUS_TEXT.get(job.status, job.status)
+
+
+def format_job_line(index: int, job, *, who: str = "") -> str:
+    """一行任务描述：序号、（谁）、标题、模式、编号前 8 位、状态（含暂停原因）、周期、下次时间、上次结果。
+    job 是 schedule_store.Job 或任何带同名属性的对象（这里是 L0，不 import 存储层）。"""
+    when = describe(job.kind, job.cron, job.next_run_at, job.timezone)
+    owner = f"{who} " if who else ""
+    parts = [
+        f"{index}. {owner}「{job.title}」（{_JOB_MODE_TEXT.get(job.mode, job.mode)}）编号 {job.id[:8]}",
+        job_status_text(job),
+        when,
+    ]
+    if job.status == "active":
+        parts.append(f"下次 {fmt_local(job.next_run_at, job.timezone)}")
+    parts.append("上次：" + (_JOB_LAST_TEXT.get(job.last_status, job.last_status) if job.last_status else "还没执行过"))
+    return "｜".join(parts)
+
+
 def describe(kind: str, cron: Optional[str], next_run_at: Optional[float], tz_name: Optional[str] = None) -> str:
     """“每天 08:30”“每周一、三、五 09:00”“仅一次 11-27 08:30”；认不出的 cron 原样显示。"""
     if kind == "once":

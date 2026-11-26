@@ -29,15 +29,6 @@ _FIRST_HINT = (
     "收不到时可以发 /tasks 查看任务状态。"
 )
 _CLI_NOTE = "（这个任务的目标是命令行，只有 main.py --run-scheduler 运行时才会触发）"
-_STATUS_TEXT = {"active": "进行中", "done": "已完成"}
-_PAUSE_REASON_TEXT = {
-    "user": "你暂停的",
-    "admin": "被管理员暂停",
-    "push_refused": "推送被拒收，请确认没有关闭“允许主动发送消息”，再发 /tasks resume 恢复",
-    "failures": "连续失败，问题解决后发 /tasks resume 恢复",
-}
-_LAST_TEXT = {"ok": "成功", "failed": "失败", "skipped": "已跳过", "missed": "错过了"}
-_MODE_TEXT = {"reminder": "固定提醒", "agent": "到点执行"}
 
 
 def _clean(text, *, keep_newlines: bool) -> str:
@@ -188,26 +179,6 @@ def create_scheduled_task(
     return text
 
 
-def _status_text(job: schedule_store.Job) -> str:
-    if job.status == "paused":
-        return "已暂停（" + _PAUSE_REASON_TEXT.get(job.paused_reason or "", "已暂停") + "）"
-    return _STATUS_TEXT.get(job.status, job.status)
-
-
-def format_job_line(index: int, job: schedule_store.Job) -> str:
-    """一行任务描述：序号、标题、模式、编号前 8 位、状态（含暂停原因）、周期、下次时间、上次结果。"""
-    when = schedule_time.describe(job.kind, job.cron, job.next_run_at, job.timezone)
-    parts = [
-        f"{index}. 「{job.title}」（{_MODE_TEXT.get(job.mode, job.mode)}）编号 {job.short_id}",
-        _status_text(job),
-        when,
-    ]
-    if job.status == "active":
-        parts.append(f"下次 {schedule_time.fmt_local(job.next_run_at, job.timezone)}")
-    parts.append("上次：" + (_LAST_TEXT.get(job.last_status, job.last_status) if job.last_status else "还没执行过"))
-    return "｜".join(parts)
-
-
 @tool
 def list_scheduled_tasks(placeholder: str = "default") -> str:
     """列出当前用户的全部定时任务：序号、任务名、编号、状态、周期、下次触发时间与上次结果（最多 20 条）。
@@ -223,7 +194,7 @@ def list_scheduled_tasks(placeholder: str = "default") -> str:
         return _store_error("查看", e)
     if not jobs:
         return "你现在没有定时任务。"
-    lines = [format_job_line(i, job) for i, job in enumerate(jobs[:LIST_MAX_ROWS], start=1)]
+    lines = [schedule_time.format_job_line(i, job) for i, job in enumerate(jobs[:LIST_MAX_ROWS], start=1)]
     if len(jobs) > LIST_MAX_ROWS:
         lines.append(f"（另有 {len(jobs) - LIST_MAX_ROWS} 个任务没有显示）")
     return "\n".join(lines)

@@ -359,6 +359,7 @@ import app.utils.schedule_time
 import app.infra.schedule_store
 import app.services.scheduler_service
 import app.tools.schedule_tools
+import app.services.task_commands
 
 forbidden = ["app.infra.models", "app.infra.milvus_client", "app.knowledge", "app.memory", "modal"]
 loaded = [m for m in forbidden if any(name == m or name.startswith(m + ".") for name in sys.modules)]

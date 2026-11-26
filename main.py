@@ -15,7 +15,7 @@ from typing import Optional
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
 
-from app.services import chat_service
+from app.services import chat_service, scheduler_service
 from app import config
 from app.utils.identity import Identity, cli_member_identity, owner_identity
 from app.utils.images import guess_mime_type
@@ -81,6 +81,12 @@ def _start_stdin_reader(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue) -
     return thread
 
 
+async def _cli_push(openid: str, text: str) -> None:
+    """CLI 调度器的“推送”：直接打印到控制台（只处理目标为 cli 的任务，不会碰任何 QQ 用户的任务）。"""
+    print("\n⏰ [定时推送]")
+    print(text)
+
+
 def _print_reply(reply) -> None:
     print("\n🤖 [Reply]:")
     print(reply.text)
@@ -140,6 +146,12 @@ async def main():
         help="以 member 身份运行（不开 QQ 就能在终端体验 member：没有文件 / 命令 / 桌面 / 浏览器能力；代码只能在云端沙箱里跑）；"
              "NAME 只能由字母、数字、下划线组成。不写则以 owner 身份运行",
     )
+    parser.add_argument(
+        "--run-scheduler",
+        action="store_true",
+        help="在本进程里运行 CLI 定时任务调度器（需要 SCHEDULER_ENABLED=true）。它只领取目标为命令行的任务"
+             "（owner 在命令行里创建的任务），不会领取任何 QQ 用户的任务，所以不会“偷走”提醒",
+    )
     args = parser.parse_args()
 
     # 注意用 is not None 判断：--member "" 必须报错，而不是悄悄变成 owner
@@ -164,6 +176,12 @@ async def main():
     turn: Optional[asyncio.Task] = None
     try:
         await chat_service.init_service()
+        if args.run_scheduler:
+            if not config.SCHEDULER_ENABLED:
+                print("⚠️ 定时任务开关（SCHEDULER_ENABLED）没有打开，--run-scheduler 已忽略。")
+            else:
+                scheduler_service.start(run_turn=chat_service.run_scheduled_turn, push=_cli_push, cli=True)
+                print("⏰ CLI 定时任务调度器已启动（只领取目标为命令行的任务）。")
 
         queue: asyncio.Queue = asyncio.Queue()
         backlog: collections.deque = collections.deque()   # 运行结束时恰好已取出、还没处理的行
@@ -243,6 +261,7 @@ async def main():
             except Exception as e:
                 print(f"❌ 运行出错: {e}")
     finally:
+        await scheduler_service.stop()                      # 没启动过就是空操作；先停调度器再关服务
         await chat_service.shutdown_service()
         if turn is not None and not turn.done():
             turn.cancel()
