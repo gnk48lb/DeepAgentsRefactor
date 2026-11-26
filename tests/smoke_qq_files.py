@@ -1896,7 +1896,7 @@ def _load_chat_plugin():
 
 def test_13_qq_plugin_files():
     from nonebot.adapters.qq.event import C2CMessageCreateEvent, GroupAtMessageCreateEvent
-    from nonebot.adapters.qq.message import Attachment as AttachmentSeg, Message, MessageSegment
+    from nonebot.adapters.qq.message import Attachment as AttachmentSeg, Message
     from nonebot.adapters.qq.models import FriendAuthor
     from nonebot.adapters.qq.models.qq import Attachment as AttachmentModel
     from nonebot.exception import FinishedException
