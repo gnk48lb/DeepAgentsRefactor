@@ -5,17 +5,22 @@ tests/smoke_scheduler.py
   A1 时区 / 解析 / cron 校验 / next_fire / describe   A2 配置块与 import 卫生   A3 请求上下文 / require_owner / get_current_time
   B1 建库与单例   B2 创建 / 上限 / 去重   B3 列表与编号解析   B4 取消   B5 暂停 / 恢复 / 管理员暂停
   B6 认领（原子性 / 错过窗口 / cli 分流）   B7 收尾   B8 重启恢复   B9 变更监听器   B10 杂项
+  C 调度循环（reminder 端到端 / 错过 / 唤醒 / 停机 / 并发 / 节流 / CLI 分流 / agent 成功）
+  D 失败策略与错误分类   E 事件写入（幂等、不是入站事件、日志卫生）
 所有时间断言都基于固定的 NOW（2026-11-26 08:30:00 +08:00，周四），不依赖真实的今天。
 """
+import asyncio
 import contextlib
 import io
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +36,10 @@ from app.infra import schedule_store
 from app.infra.schedule_store import (
     CLI_TARGET, JobLimitError, JobStateError, RefError, ScheduleStore,
 )
+from app.infra import session_store
+from app.infra.session_store import SessionStore
+from app.services import scheduler_service
+from app.services.scheduler_service import AgentRunResult, PushError
 from app.utils import schedule_time
 from app.utils.schedule_time import ScheduleError
 
@@ -928,6 +937,623 @@ def test_b10_first_hint_and_purge():
         assert s.get_job(live.id) is not None, "进行中的任务永远不清理"
 
 
+# ════════════════════════ C / D / E 调度循环、失败策略、事件 ════════════════════════
+# 这几组场景在真实的事件循环里跑调度器：任务设在“现在 + 零点几秒”，推送与 run_turn 都是假的；
+# 所有等待都带超时，重试 / 节流间隔用 patched() 压到几十毫秒。
+
+FAST = dict(
+    SCHEDULER_PUSH_MIN_INTERVAL_SECONDS=0.01,
+    SCHEDULER_RETRY_DELAY_SECONDS=0.05,
+    SCHEDULER_RETRY_MAX=2,
+    SCHEDULER_MISFIRE_GRACE_SECONDS=900,
+    SCHEDULER_MAX_CONCURRENT_RUNS=2,
+    SCHEDULER_MAX_CONSECUTIVE_FAILURES=3,
+    SCHEDULER_LOCK_WAIT_SECONDS=1,
+)
+
+
+class _SchedEnv(_Env):
+    """调度器场景用的环境：schedules.db 与 sessions.db 都在临时目录里，退出时还原全局单例并重置调度器。"""
+
+    def __enter__(self):
+        super().__enter__()
+        self.sessions = SessionStore(os.path.join(self.dir, "sessions.db"))
+        session_store.set_store(self.sessions)
+        scheduler_service.reset_for_tests()
+        return self
+
+    def __exit__(self, *exc):
+        scheduler_service.reset_for_tests()
+        session_store.close_store()
+        self.sessions.close()
+        super().__exit__(*exc)
+
+
+class FakePush:
+    """假的推送：记录每次调用；script 里按顺序给出每次调用的结果（异常实例会被抛出，其余视为成功）。"""
+
+    def __init__(self, script=None):
+        self.calls: list[tuple[str, str, float]] = []
+        self.script = list(script or [])
+
+    async def __call__(self, openid, text):
+        self.calls.append((openid, text, time.monotonic()))
+        if self.script:
+            item = self.script.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+
+    @property
+    def texts(self):
+        return [c[1] for c in self.calls]
+
+
+class FakeRun:
+    """假的 run_turn：results 里每项是 AgentRunResult / 异常 / 无参协程函数；用完后重复最后一项。"""
+
+    def __init__(self, *results):
+        self.results = list(results) or [AgentRunResult(True, "好的")]
+        self.calls: list[dict] = []
+        self.active = 0
+        self.max_active = 0
+
+    async def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        item = self.results.pop(0) if len(self.results) > 1 else self.results[0]
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            if callable(item):
+                item = await item()
+            if isinstance(item, BaseException):
+                raise item
+            return item
+        finally:
+            self.active -= 1
+
+
+async def wait_until(cond, timeout=5.0, step=0.02):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        await asyncio.sleep(step)
+    return False
+
+
+def soon(seconds=0.25):
+    return time.time() + seconds
+
+
+def run_scenario(coro_fn):
+    asyncio.run(coro_fn())
+
+
+def _runs(store, job):
+    return store.get_runs(job.id)
+
+
+def test_c1_reminder_end_to_end():
+    with _SchedEnv() as env, patched(**FAST):
+        s = env.store
+        once = mk(s, user=U1, title="喝水", kind="once", next_run_at=soon(), prompt="该喝水了")
+        cron = mk(s, user=U2, title="吃药", cron="0 9 * * 1,3,5", next_run_at=soon(0.3), prompt="吃药", spec_key="c")
+        push = FakePush()
+
+        async def scenario():
+            scheduler_service.start(run_turn=FakeRun(), push=push, cli=False)
+            assert scheduler_service.is_running()
+            assert await wait_until(lambda: len(push.calls) == 2)
+            await asyncio.sleep(0.5)              # 多等一会儿：到点只会推一次，不会重复
+            assert len(push.calls) == 2, push.texts
+            await scheduler_service.stop()
+
+        run_scenario(scenario)
+        by_target = {c[0]: c[1] for c in push.calls}
+        assert by_target == {U1: "⏰ 该喝水了", U2: "⏰ 吃药"}, by_target
+        j = s.get_job(once.id)
+        assert (j.status, j.last_status, j.run_count, j.consecutive_failures) == ("done", "ok", 1, 0)
+        r = _runs(s, once)
+        assert len(r) == 1 and r[0].status == "ok" and r[0].finished_at is not None and r[0].error is None
+        # cron：认领时就推进到严格晚于现在的下一次触发
+        j = s.get_job(cron.id)
+        assert j.status == "active" and j.last_status == "ok" and j.run_count == 1
+        assert j.next_run_at == schedule_time.next_fire("0 9 * * 1,3,5", cron.next_run_at, SH) and j.next_run_at > time.time()
+        assert not scheduler_service.is_running()
+
+
+def test_c2_missed_window_and_restart_recovery():
+    with _SchedEnv() as env, patched(**FAST):
+        s = env.store
+        base = time.time()
+        missed_once = mk(s, user=U1, title="开会", kind="once", next_run_at=base - 2000, prompt="开会了")
+        missed_cron = mk(s, user=U2, title="日报", cron="0 9 * * *", next_run_at=base - 2000, prompt="日报", spec_key="m")
+        # 另一个一次性任务：在上一个进程里已被认领（run 仍是 claimed），而且已经过去很久 -> 启动时按“被中断”处理，不重跑
+        interrupted = mk(s, user=U1, title="取快递", kind="once", next_run_at=base - 5000, prompt="取快递", spec_key="i")
+        claimed, _ = s.claim_due(base - 4999, cli=False, grace=900)
+        assert [c.job.id for c in claimed] == [interrupted.id]
+        push = FakePush()
+
+        async def scenario():
+            scheduler_service.start(run_turn=FakeRun(), push=push, cli=False)
+            assert await wait_until(lambda: len(push.calls) == 2)
+            await asyncio.sleep(0.3)
+            await scheduler_service.stop()
+
+        run_scenario(scenario)
+        texts = {c[1] for c in push.calls}
+        hhmm = lambda job: schedule_time.fmt_local(job.next_run_at, SH)[-5:]       # noqa: E731
+        assert texts == {f"「开会」原定 {hhmm(missed_once)} 触发，当时机器人不在线，没有执行。",
+                         f"「取快递」原定 {hhmm(interrupted)} 触发，当时机器人不在线，没有执行。"}, texts
+        assert all("开会了" not in t and "取快递" not in t.replace("「取快递」", "") for t in texts), "没有执行，也就不会推送任务内容"
+        assert len(push.calls) == 2, "每个一次性任务最多一条通知；错过的 cron 静默"
+        assert s.get_job(missed_once.id).last_status == "missed" and s.get_runs(missed_once.id)[0].status == "missed"
+        j = s.get_job(missed_cron.id)
+        assert j.status == "active" and j.last_status == "missed" and j.next_run_at > base and len(s.get_runs(missed_cron.id)) == 1
+        r = s.get_runs(interrupted.id)[0]
+        assert (r.status, r.error) == ("failed", "process_restart")
+        # 再启动一次：不会重复通知，也不会补跑
+        push2 = FakePush()
+
+        async def again():
+            scheduler_service.reset_for_tests()
+            scheduler_service.start(run_turn=FakeRun(), push=push2, cli=False)
+            await asyncio.sleep(0.4)
+            await scheduler_service.stop()
+
+        run_scenario(again)
+        assert push2.calls == []
+
+
+def test_c3_wakeup_stop_and_listener():
+    with _SchedEnv() as env, patched(**FAST):
+        s = env.store
+        push = FakePush()
+        started = {}
+
+        async def scenario():
+            scheduler_service.start(run_turn=FakeRun(), push=push, cli=False)
+            await asyncio.sleep(0.2)                 # 循环此时在睡（没有任务时最长睡 30 秒）
+            t0 = time.monotonic()
+            # 从别的线程创建任务（LangChain 的工具线程）：存储的变更监听器 -> notify_changed -> 唤醒循环
+            th = threading.Thread(target=lambda: mk(s, user=U1, title="喝水", kind="once", next_run_at=soon(0.3), prompt="喝水"))
+            th.start()
+            th.join()
+            assert await wait_until(lambda: len(push.calls) == 1, timeout=3.0), "没有被唤醒"
+            started["wake_delay"] = time.monotonic() - t0
+            await scheduler_service.stop()
+            await scheduler_service.stop()           # 幂等
+            scheduler_service.notify_changed()       # 停止之后：什么都不做
+            assert s._listeners == [], "stop 之后监听器已摘掉"
+
+        run_scenario(scenario)
+        assert started["wake_delay"] < 3.0, started
+
+        # notify_changed：没启动时是空操作；loop 已关闭时吞掉异常
+        scheduler_service.reset_for_tests()
+        scheduler_service.notify_changed()
+        push2 = FakePush()
+
+        async def start_only():
+            scheduler_service.start(run_turn=FakeRun(), push=push2, cli=False)
+            await asyncio.sleep(0.05)
+        run_scenario(start_only)                      # asyncio.run 结束时 loop 被关闭，调度器没来得及 stop
+        scheduler_service.notify_changed()            # 不抛
+        raises(RuntimeError, scheduler_service.start, run_turn=FakeRun(), push=push2)       # 没有运行中的事件循环
+        scheduler_service.reset_for_tests()
+
+        async def twice():
+            scheduler_service.start(run_turn=FakeRun(), push=push2)
+            raises(RuntimeError, scheduler_service.start, run_turn=FakeRun(), push=push2)
+            await scheduler_service.stop()
+            scheduler_service.start(run_turn=FakeRun(), push=push2)       # 停止之后可以再启动
+            await scheduler_service.stop()
+        run_scenario(twice)
+
+
+def test_c4_stop_cancels_inflight_runs():
+    with _SchedEnv() as env, patched(**FAST):
+        s = env.store
+        job = mk(s, user=U1, title="查天气", kind="once", next_run_at=soon(0.1), mode="agent", prompt="查天气")
+        gate = {}
+
+        async def hang():
+            gate["entered"] = True
+            await asyncio.sleep(60)
+
+        run = FakeRun(hang)
+        push = FakePush()
+
+        async def scenario():
+            scheduler_service.start(run_turn=run, push=push, cli=False)
+            assert await wait_until(lambda: gate.get("entered"), timeout=3.0)
+            await scheduler_service.stop()
+
+        run_scenario(scenario)
+        r = s.get_runs(job.id)[0]
+        assert (r.status, r.error) == ("failed", "cancelled")
+        j = s.get_job(job.id)
+        assert j.consecutive_failures == 0 and j.last_status == "failed" and push.calls == []
+
+        # 认领了但还没来得及开跑就被取消：stop() 兜底补写
+        job2 = mk(s, user=U1, title="第二个", kind="once", next_run_at=soon(0.1), mode="agent", prompt="x", spec_key="2")
+
+        async def cancel_before_run():
+            scheduler_service.reset_for_tests()
+            scheduler_service.start(run_turn=FakeRun(hang), push=push, cli=False)
+            sched = scheduler_service._current
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if sched.inflight:
+                    break
+            await scheduler_service.stop()
+        run_scenario(cancel_before_run)
+        assert s.get_runs(job2.id)[0].status == "failed" and s.get_runs(job2.id)[0].error == "cancelled"
+
+
+def test_c5_concurrency_throttle_and_blocked():
+    with _SchedEnv() as env:
+        s = env.store
+        # 并发上限：名额满了其余的等着，每个任务最终都执行
+        with patched(**{**FAST, "SCHEDULER_MAX_CONCURRENT_RUNS": 1}):
+            jobs = [mk(s, user=U1, title=f"任务{i}", kind="once", next_run_at=soon(0.1), mode="agent", prompt=f"p{i}", spec_key=str(i))
+                    for i in range(3)]
+
+            async def slow():
+                await asyncio.sleep(0.15)
+                return AgentRunResult(True, "完成")
+            run, push = FakeRun(slow), FakePush()
+
+            async def scenario():
+                scheduler_service.start(run_turn=run, push=push, cli=False)
+                assert await wait_until(lambda: len(push.calls) == 3, timeout=6.0), push.texts
+                await scheduler_service.stop()
+            run_scenario(scenario)
+            assert run.max_active == 1, "SCHEDULER_MAX_CONCURRENT_RUNS=1：同一时刻只跑一个"
+            assert all(s.get_job(j.id).last_status == "ok" for j in jobs)
+
+        # 推送节流：相邻两条至少隔 SCHEDULER_PUSH_MIN_INTERVAL_SECONDS
+        with patched(**{**FAST, "SCHEDULER_PUSH_MIN_INTERVAL_SECONDS": 0.2, "SCHEDULER_MAX_CONCURRENT_RUNS": 4}):
+            scheduler_service.reset_for_tests()
+            for i in range(3):
+                mk(s, user=U2, title=f"提醒{i}", kind="once", next_run_at=soon(0.1), prompt=f"r{i}", spec_key=f"t{i}")
+            push = FakePush()
+
+            async def throttled():
+                scheduler_service.start(run_turn=FakeRun(), push=push, cli=False)
+                assert await wait_until(lambda: len(push.calls) == 3, timeout=5.0)
+                await scheduler_service.stop()
+            run_scenario(throttled)
+            times = [c[2] for c in push.calls]
+            assert all(b - a >= 0.18 for a, b in zip(times, times[1:])), [round(b - a, 3) for a, b in zip(times, times[1:])]
+
+        # 被 /block 的 member：记 skipped，不推送；owner 不受封禁影响
+        with patched(**FAST):
+            scheduler_service.reset_for_tests()
+            env.sessions.touch_user(U1)
+            env.sessions.set_user_blocked(U1, True)
+            blocked = mk(s, user=U1, title="被封的", kind="once", next_run_at=soon(0.1), prompt="x", spec_key="b")
+            fine = mk(s, user=OWNER, title="主人的", kind="once", next_run_at=soon(0.1), prompt="y", spec_key="o")
+            push = FakePush()
+
+            async def blocked_run():
+                scheduler_service.start(run_turn=FakeRun(), push=push, cli=False)
+                assert await wait_until(lambda: len(push.calls) == 1, timeout=3.0)
+                await asyncio.sleep(0.3)
+                await scheduler_service.stop()
+            run_scenario(blocked_run)
+            assert push.calls[0][0] == OPENID_OWNER and len(push.calls) == 1
+            r = s.get_runs(blocked.id)[0]
+            assert (r.status, r.error) == ("skipped", "blocked")
+            j = s.get_job(blocked.id)
+            assert j.last_status == "skipped" and j.run_count == 0 and j.consecutive_failures == 0
+            assert s.get_runs(fine.id)[0].status == "ok"
+
+
+def test_c6_cli_scheduler_only_takes_cli_jobs():
+    with _SchedEnv() as env, patched(**FAST):
+        s = env.store
+        qq = mk(s, user=U1, title="qq", kind="once", next_run_at=soon(0.1), prompt="q", spec_key="q")
+        cli = mk(s, user=OWNER, title="cli", kind="once", next_run_at=soon(0.1), prompt="c", spec_key="c", target=schedule_store.CLI_TARGET)
+        push = FakePush()
+
+        async def scenario():
+            scheduler_service.start(run_turn=FakeRun(), push=push, cli=True)
+            assert await wait_until(lambda: len(push.calls) == 1, timeout=3.0)
+            await asyncio.sleep(0.3)
+            await scheduler_service.stop()
+        run_scenario(scenario)
+        assert push.calls[0][0] == schedule_store.CLI_TARGET and len(push.calls) == 1
+        assert s.get_job(qq.id).status == "active" and s.get_job(cli.id).status == "done"
+
+
+def test_c7_agent_success_and_run_turn_contract():
+    with _SchedEnv() as env, patched(**FAST):
+        s = env.store
+        job = mk(s, user=U1, title="天气", kind="once", next_run_at=soon(0.1), mode="agent", prompt="查询北京今天的天气", tz=NY)
+        long_job = mk(s, user=U2, title="长", kind="once", next_run_at=soon(0.1), mode="agent", prompt="写长文", spec_key="l")
+        calls_text = {job.id: "北京今天晴，带伞不用。", long_job.id: "字" * 2000}
+        push = FakePush()
+
+        class _Run(FakeRun):
+            async def __call__(self, **kwargs):
+                self.calls.append(kwargs)
+                return AgentRunResult(True, calls_text[kwargs["job_id"]])
+        run = _Run()
+
+        async def scenario():
+            scheduler_service.start(run_turn=run, push=push, cli=False)
+            assert await wait_until(lambda: len(push.calls) == 2, timeout=3.0)
+            await scheduler_service.stop()
+        run_scenario(scenario)
+        by_target = {c[0]: c[1] for c in push.calls}
+        assert by_target[U1] == "北京今天晴，带伞不用。", "agent 的推送正文不带 ⏰ 前缀"
+        assert by_target[U2] == "字" * config.SCHEDULER_PUSH_MAX_CHARS + "（内容过长已截断）"
+        call = next(c for c in run.calls if c["job_id"] == job.id)
+        run_id = s.get_runs(job.id)[0].id
+        assert call == {"job_id": job.id, "user_id": U1, "target_openid": U1, "title": "天气",
+                        "prompt": "查询北京今天的天气", "timezone": NY, "run_ref": f"{run_id}-0"}, call
+        assert s.get_job(job.id).last_status == "ok"
+
+
+# ════════════════════════ D 失败策略 ════════════════════════
+
+def _one_job(env, *, mode="reminder", kind="once", user=U1, prompt="该喝水了", title="喝水", cron="0 9 * * *", **kw):
+    kw.setdefault("next_run_at", soon(0.1))
+    kw.setdefault("max_jobs", 100)
+    return mk(env.store, user=user, title=title, kind=kind, mode=mode, prompt=prompt, cron=cron, **kw)
+
+
+def _run_one(env, job, push, run=None, *, expect_calls=1, settle=0.3, timeout=5.0):
+    async def scenario():
+        scheduler_service.reset_for_tests()
+        scheduler_service.start(run_turn=run or FakeRun(), push=push, cli=False)
+        assert await wait_until(lambda: len(push.calls) >= expect_calls and not scheduler_service._current.inflight, timeout=timeout), push.texts
+        await asyncio.sleep(settle)
+        await scheduler_service.stop()
+    run_scenario(scenario)
+    return env.store.get_job(job.id)
+
+
+def test_d1_transient_retries_and_deadline():
+    with _SchedEnv() as env, patched(**FAST):
+        # transient 一直失败：最多 1 次首发 + SCHEDULER_RETRY_MAX 次重试，然后记失败
+        job = _one_job(env, kind="cron")
+        push = FakePush([PushError("transient", 40034100, "x")] * 10)
+        j = _run_one(env, job, push, expect_calls=3, settle=0.4)
+        assert len(push.calls) == 3, push.texts
+        assert (j.last_status, j.consecutive_failures, j.status) == ("failed", 1, "active")
+        r = env.store.get_runs(job.id)[0]
+        assert r.status == "failed" and r.error == "push_transient"
+        assert len({c[1] for c in push.calls}) == 1, "重试用的是同一段正文"
+        # 重试后成功：只算一次成功，事件只写一次
+        job2 = _one_job(env, prompt="再来一次", title="第二个", spec_key="d1b")
+        push2 = FakePush([PushError("transient", None, "bot offline"), OSError("boom")])
+        j = _run_one(env, job2, push2, expect_calls=3)
+        assert len(push2.calls) == 3 and j.status == "done" and j.last_status == "ok", (push2.texts, j)
+        # 不超过 scheduled_for + 宽限：时钟已经走到宽限边缘，不再重试
+        job3 = mk(env.store, user=U2, title="边缘", kind="once", next_run_at=1000.0, prompt="边缘", spec_key="d1c")
+        push3 = FakePush([PushError("transient", None, "x")] * 5)
+
+        async def at_edge():
+            scheduler_service.reset_for_tests()
+            scheduler_service.start(run_turn=FakeRun(), push=push3, cli=False, clock=lambda: 1000.0 + config.SCHEDULER_MISFIRE_GRACE_SECONDS - 0.01)
+            assert await wait_until(lambda: len(push3.calls) >= 1 and not scheduler_service._current.inflight)
+            await asyncio.sleep(0.3)
+            await scheduler_service.stop()
+        run_scenario(at_edge)
+        assert len(push3.calls) == 1, "离宽限截止不足一个重试间隔：不重试"
+        assert env.store.get_job(job3.id).last_status == "failed"
+
+
+def test_d2_dedupe_toolong_url():
+    with _SchedEnv() as env, patched(**FAST):
+        # dedupe：正文末尾加 [MM-DD HH:MM] 后重试一次；再次 dedupe 就放弃
+        job = _one_job(env, prompt="该喝水了")
+        push = FakePush([PushError("dedupe", 40054005, "dup")])
+        j = _run_one(env, job, push, expect_calls=2)
+        assert push.texts[0] == "⏰ 该喝水了" and len(push.texts) == 2
+        assert push.texts[1].startswith("⏰ 该喝水了\n[") and push.texts[1].endswith("]") and re.fullmatch(r"\[\d\d-\d\d \d\d:\d\d\]", push.texts[1].split("\n")[-1]), push.texts
+        assert j.last_status == "ok"
+        job = _one_job(env, prompt="又一条", title="b", spec_key="d2b")
+        push = FakePush([PushError("dedupe", 40054005, "dup")] * 5)
+        j = _run_one(env, job, push, expect_calls=2, settle=0.3)
+        assert len(push.calls) == 2 and j.last_status == "failed" and env.store.get_runs(job.id)[0].error == "push_dedupe"
+        # too_long：截断后重试一次
+        job = _one_job(env, prompt="长" * 150, title="c", spec_key="d2c")
+        push = FakePush([PushError("too_long", 40054007, "x")])
+        j = _run_one(env, job, push, expect_calls=2)
+        assert len(push.texts[0]) == 152 and push.texts[1].endswith("（内容过长已截断）") and len(push.texts[1]) < len(push.texts[0]), [len(t) for t in push.texts]
+        assert j.last_status == "ok"
+        # url_rejected：去掉链接后重试一次
+        job = _one_job(env, prompt="详情见 https://example.com/a?b=1 和 www.example.org 这里", title="d", spec_key="d2d")
+        push = FakePush([PushError("url_rejected", 40054010, "x")])
+        j = _run_one(env, job, push, expect_calls=2)
+        assert "https://" in push.texts[0] and "https://" not in push.texts[1] and "www." not in push.texts[1] and "（链接已省略）" in push.texts[1], push.texts
+        assert j.last_status == "ok"
+
+
+def test_d3_permanent_pauses_and_stays_silent():
+    with _SchedEnv() as env, patched(**FAST):
+        # 重复任务：暂停，reason=push_refused，不计入连续失败，也不再推任何失败通知
+        job = _one_job(env, kind="cron", prompt="提醒")
+        push = FakePush([PushError("permanent", 40034105, "no permission")] * 5)
+        j = _run_one(env, job, push, expect_calls=1, settle=0.4)
+        assert len(push.calls) == 1, "permanent 立即放弃，不重试"
+        assert (j.status, j.paused_reason, j.consecutive_failures, j.last_status) == ("paused", "push_refused", 0, "failed")
+        assert env.store.get_runs(job.id)[0].error == "push_refused"
+        # 用户在 QQ 里重新打开允许主动消息之后，自己 /tasks resume 就能恢复
+        assert env.store.resume_job(job.id).status == "active"
+        # 一次性任务已是 done：只记录结果，仍是 done
+        job = _one_job(env, kind="once", prompt="一次性", title="o", spec_key="d3b")
+        push = FakePush([PushError("permanent", 40054013, "refused")] * 5)
+        j = _run_one(env, job, push, expect_calls=1)
+        assert (j.status, j.last_status, j.paused_reason) == ("done", "failed", None) and len(push.calls) == 1
+        # agent 任务失败后推失败通知时被拒收：也暂停，且只推了这一条
+        job = _one_job(env, kind="cron", mode="agent", prompt="查天气", title="a", spec_key="d3c")
+        push = FakePush([PushError("permanent", 40034105, "x")] * 5)
+        run = FakeRun(AgentRunResult(False, "", "timeout"))
+        j = _run_one(env, job, push, run, expect_calls=1, settle=0.4)
+        assert len(push.calls) == 1 and (j.status, j.paused_reason) == ("paused", "push_refused"), (push.texts, j)
+
+
+def test_d4_agent_failures():
+    with _SchedEnv() as env, patched(**FAST):
+        expectations = {
+            "hitl": "定时任务「天气」执行时需要你确认一项操作，无人值守的任务不会执行需要授权的操作，已放弃本次执行。",
+            "timeout": "⚠️ 定时任务「天气」这次没能完成（执行超时）",
+            "empty": "⚠️ 定时任务「天气」这次没能完成（没有得到可以发送的结果）",
+            "error": "⚠️ 定时任务「天气」这次没能完成（执行时出了错）",
+            "unavailable": "⚠️ 定时任务「天气」这次没能完成（定时任务功能暂时不可用）",
+        }
+        for i, (error, want) in enumerate(expectations.items()):
+            job = _one_job(env, kind="cron", mode="agent", prompt="查天气", title="天气", spec_key=f"d4{i}")
+            push = FakePush()
+            j = _run_one(env, job, push, FakeRun(AgentRunResult(False, "", error)), expect_calls=1, settle=0.3)
+            assert push.texts == [want], (error, push.texts)
+            assert (j.consecutive_failures, j.status, j.last_status) == (1, "active", "failed"), (error, j)
+            assert env.store.get_runs(job.id)[0].error == error
+        # agent 返回 ok 但正文为空：按 empty 处理
+        job = _one_job(env, kind="cron", mode="agent", prompt="查天气", title="天气", spec_key="d4e")
+        push = FakePush()
+        _run_one(env, job, push, FakeRun(AgentRunResult(True, "  \n ")), expect_calls=1)
+        assert push.texts == [expectations["empty"]]
+        # run_turn 抛异常：按 error 处理（不让调度循环崩）；返回了不认识的东西同样
+        for i, bad in enumerate((RuntimeError("boom"), "not a result")):
+            job = _one_job(env, kind="cron", mode="agent", prompt="查天气", title="天气", spec_key=f"d4x{i}")
+            push = FakePush()
+            _run_one(env, job, push, FakeRun(bad), expect_calls=1)
+            assert push.texts == [expectations["error"]], push.texts
+        # stopped：用户自己 /stop 的，不推通知，也不计失败
+        job = _one_job(env, kind="cron", mode="agent", prompt="查天气", title="天气", spec_key="d4s")
+        push = FakePush()
+        j = _run_one(env, job, push, FakeRun(AgentRunResult(False, "", "stopped")), expect_calls=0, settle=0.5)
+        assert push.calls == [] and j.consecutive_failures == 0 and j.last_status == "failed"
+        # busy：按间隔重试 SCHEDULER_RETRY_MAX 次；仍 busy 才放弃，不计失败，但会说明原因
+        job = _one_job(env, kind="cron", mode="agent", prompt="查天气", title="天气", spec_key="d4b")
+        push = FakePush()
+        run = FakeRun(AgentRunResult(False, "", "busy"))
+        j = _run_one(env, job, push, run, expect_calls=1, settle=0.3)
+        assert len(run.calls) == 1 + config.SCHEDULER_RETRY_MAX, len(run.calls)
+        assert len({c["run_ref"] for c in run.calls}) == len(run.calls), "每次尝试的 run_ref 不同（临时线程 id 不会撞）"
+        assert push.texts == ["⚠️ 定时任务「天气」这次没能完成（你当时正在和我对话，一直没排上）"]
+        assert j.consecutive_failures == 0
+        # busy 之后重试成功
+        job = _one_job(env, kind="cron", mode="agent", prompt="查天气", title="天气", spec_key="d4c")
+        push = FakePush()
+        run = FakeRun(AgentRunResult(False, "", "busy"), AgentRunResult(True, "晴天"))
+        j = _run_one(env, job, push, run, expect_calls=1)
+        assert push.texts == ["晴天"] and len(run.calls) == 2 and j.last_status == "ok"
+
+
+def test_d5_consecutive_failures_pause():
+    with _SchedEnv() as env, patched(**{**FAST, "SCHEDULER_MAX_CONSECUTIVE_FAILURES": 3}):
+        job = _one_job(env, kind="cron", mode="agent", prompt="查天气", title="天气")
+        run = FakeRun(AgentRunResult(False, "", "error"))
+        pushes = []
+        for round_no in range(3):
+            push = FakePush()
+            j = _run_one(env, job, push, run, expect_calls=1)
+            pushes.append(push.texts)
+            assert j.consecutive_failures == round_no + 1
+            if round_no < 2:
+                assert j.status == "active"
+                env.store._conn.execute("UPDATE jobs SET next_run_at = ? WHERE id = ?", (soon(0.1), job.id))      # 让它再到点
+        assert (j.status, j.paused_reason) == ("paused", "failures")
+        assert "/tasks resume" in pushes[2][0] and "已暂停" in pushes[2][0]
+        assert "/tasks resume" not in pushes[0][0]
+        # 成功一次就清零（先恢复）
+        env.store.resume_job(job.id)
+        env.store._conn.execute("UPDATE jobs SET next_run_at = ? WHERE id = ?", (soon(0.1), job.id))
+        j = _run_one(env, job, FakePush(), FakeRun(AgentRunResult(True, "好")), expect_calls=1)
+        assert j.consecutive_failures == 0 and j.last_status == "ok"
+        # reminder 推送连续失败同样会暂停（但没法再通知用户）
+        job2 = _one_job(env, kind="cron", prompt="提醒", title="r", spec_key="d5r")
+        for _ in range(3):
+            push = FakePush([PushError("transient", None, "x")] * 5)
+            j = _run_one(env, job2, push, expect_calls=3, settle=0.2)
+            env.store._conn.execute("UPDATE jobs SET next_run_at = ? WHERE id = ?", (soon(0.1), job2.id))
+        assert (j.status, j.paused_reason, j.consecutive_failures) == ("paused", "failures", 3)
+
+
+def test_d6_push_error_and_result_types():
+    e = PushError("transient", 40034100, "x" * 500)
+    assert (e.kind, e.code) == ("transient", 40034100) and len(e.detail) == 200 and "transient" in str(e)
+    assert PushError("permanent").code is None and PushError("permanent").detail == ""
+    assert AgentRunResult(True, "hi") == AgentRunResult(ok=True, text="hi", error="")
+    raises(Exception, setattr, AgentRunResult(False), "ok", True)        # frozen
+
+
+# ════════════════════════ E 事件写入 ════════════════════════
+
+def test_e1_push_event_is_written_and_idempotent():
+    from app.tools import session_tools
+    with _SchedEnv() as env, patched(**FAST):
+        sa = env.sessions.get_active_session_id(user_id=U1)
+        sb = env.sessions.get_active_session_id(user_id=U2)
+        job = _one_job(env, prompt="该喝水了", title="喝水")
+        _one_job(env, user=U2, prompt="别人的提醒", title="别人", spec_key="e1b")
+        push = FakePush()
+
+        async def scenario():
+            scheduler_service.start(run_turn=FakeRun(), push=push, cli=False)
+            assert await wait_until(lambda: len(push.calls) == 2, timeout=3.0)
+            await asyncio.sleep(0.2)
+            await scheduler_service.stop()
+        run_scenario(scenario)
+        evs = env.sessions.get_events(sa, types=(session_store.EVENT_SCHEDULED_PUSH,))
+        assert len(evs) == 1
+        run_id = env.store.get_runs(job.id)[0].id
+        assert evs[0].payload == {"job_id": job.id[:8], "title": "喝水", "text": "该喝水了", "mode": "reminder", "run_id": run_id}, evs[0].payload
+        assert evs[0].event_key == f"sp:{run_id}"
+        evs_b = env.sessions.get_events(sb, types=(session_store.EVENT_SCHEDULED_PUSH,))
+        assert len(evs_b) == 1 and evs_b[0].payload["text"] == "别人的提醒" and "该喝水了" not in str(evs_b[0].payload), "各写各的会话"
+        # 不是入站事件：不触发 wake，也不进 pending
+        assert session_store.EVENT_SCHEDULED_PUSH == "scheduled_push" and session_store.EVENT_SCHEDULED_PUSH not in session_store.INBOUND_EVENT_TYPES
+        assert env.sessions.get_pending_events(sa) == []
+        # 同一个 run 重复写：幂等
+        assert env.sessions.emit_event(sa, session_store.EVENT_SCHEDULED_PUSH, {"x": 1}, key=f"sp:{run_id}") is None
+        # 回溯工具里的渲染
+        assert session_tools._event_body(evs[0]) == "系统定时推送给用户：「喝水」该喝水了"
+        assert "scheduled_push" in session_tools.get_session_events.description
+
+        # 用户没有任何会话时，先建默认会话再写；写事件失败不影响推送结果
+        job2 = _one_job(env, user=OWNER, prompt="owner的", title="o", spec_key="e1c")
+        orig = session_store.get_store
+
+        def broken():
+            raise RuntimeError("db gone")          # owner 不做封禁检查，所以第一次碰 get_store 的就是写事件
+        session_store.get_store = broken
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                j = _run_one(env, job2, FakePush(), expect_calls=1)
+        finally:
+            session_store.get_store = orig
+        assert j.last_status == "ok" and "写入定时推送事件失败" in buf.getvalue()
+
+
+def test_e2_log_hygiene_and_layering():
+    """日志里不出现任务正文与完整 openid / job id；scheduler_service 不依赖 chat_service / task_commands。"""
+    import ast
+    src = (ROOT / "app" / "services" / "scheduler_service.py").read_text(encoding="utf-8")
+    imported = {n.module for n in ast.walk(ast.parse(src)) if isinstance(n, ast.ImportFrom) and n.module}
+    imported |= {a.name for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Import) for a in n.names}
+    imported |= {f"{n.module}.{a.name}" for n in ast.walk(ast.parse(src)) if isinstance(n, ast.ImportFrom) and n.module for a in n.names}
+    assert not any("chat_service" in m or "task_commands" in m for m in imported), imported
+    with _SchedEnv() as env, patched(**FAST):
+        secret = "绝密正文ABC"
+        job = _one_job(env, prompt=secret, title="绝密标题XYZ")
+        push = FakePush([PushError("transient", 40034100, "限频"), PushError("permanent", 40034105, "拒绝")])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _run_one(env, job, push, expect_calls=2)
+        log = buf.getvalue()
+        assert secret not in log and "绝密标题XYZ" not in log, log
+        assert job.id not in log and U1 not in log, "job id / openid 只显示前 8 位"
+        assert job.id[:8] in log and U1[:8] in log
+
+
 SCENARIOS = [
     ("A1 时区 / 解析 / cron 校验 / next_fire / describe", test_a1_time),
     ("A2 配置块的夹紧回退与 import 卫生", test_a2_config_and_import_hygiene),
@@ -942,6 +1568,21 @@ SCENARIOS = [
     ("B8 重启恢复", test_b8_recover_stale_runs),
     ("B9 变更监听器", test_b9_listeners_and_misc),
     ("B10 首个任务提示标记与清理", test_b10_first_hint_and_purge),
+    ("C1 reminder 端到端：到点只推一次、once 变 done、cron 推进", test_c1_reminder_end_to_end),
+    ("C2 错过窗口 / 重启恢复（不补跑、每个一次性任务最多一条通知）", test_c2_missed_window_and_restart_recovery),
+    ("C3 被 notify 唤醒（来自别的线程）/ 停机 / 重复启动", test_c3_wakeup_stop_and_listener),
+    ("C4 stop 取消在途任务并写 failed(cancelled)", test_c4_stop_cancels_inflight_runs),
+    ("C5 并发上限 / 推送节流 / 被封禁的 member 跳过", test_c5_concurrency_throttle_and_blocked),
+    ("C6 CLI 调度器只领 CLI 的任务", test_c6_cli_scheduler_only_takes_cli_jobs),
+    ("C7 agent 成功路径与 run_turn 调用约定", test_c7_agent_success_and_run_turn_contract),
+    ("D1 transient 重试与宽限截止", test_d1_transient_retries_and_deadline),
+    ("D2 dedupe / too_long / url_rejected 各重试一次", test_d2_dedupe_toolong_url),
+    ("D3 permanent 暂停且不再通知", test_d3_permanent_pauses_and_stays_silent),
+    ("D4 agent 失败的各种原因与通知", test_d4_agent_failures),
+    ("D5 连续失败暂停与恢复", test_d5_consecutive_failures_pause),
+    ("D6 PushError / AgentRunResult", test_d6_push_error_and_result_types),
+    ("E1 推送事件写入、隔离、幂等、不影响推送结果", test_e1_push_event_is_written_and_idempotent),
+    ("E2 日志卫生与分层", test_e2_log_hygiene_and_layering),
 ]
 
 

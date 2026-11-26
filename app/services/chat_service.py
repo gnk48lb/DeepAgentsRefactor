@@ -31,7 +31,7 @@ from langgraph.errors import GraphRecursionError
 from app import config
 from app.agents import orchestrator
 from app.memory import injector, extractor
-from app.services import startup, session_log, file_staging
+from app.services import startup, session_log, file_staging, scheduler_service
 from app.runtime import outbox, hitl, cli_logger
 from app.infra import models, session_store, checkpointer, modal_sandbox
 from app.utils.text import extract_text
@@ -266,6 +266,15 @@ async def init_service() -> None:
 
 def is_initialized() -> bool:
     return _initialized
+
+
+async def run_scheduled_turn(
+    *, job_id: str, user_id: str, target_openid: str, title: str, prompt: str, timezone: str, run_ref: str
+) -> scheduler_service.AgentRunResult:
+    """无人值守的 agent 定时任务（调度器通过 start(run_turn=...) 调用）。
+
+    这一阶段还没有编译无人值守的 scheduled 图，一律回 unavailable：reminder 模式不经过这里，不受影响。"""
+    return scheduler_service.AgentRunResult(False, "", "unavailable")
 
 
 async def shutdown_service() -> None:

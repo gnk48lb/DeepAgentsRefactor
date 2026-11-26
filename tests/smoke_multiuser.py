@@ -1204,6 +1204,197 @@ def test_23_qq_plugin_c2c_only_and_identity():
         mod.chat_service.process_message, mod.chat_service.is_initialized = orig_process, orig_init
 
 
+def test_24_qq_push_error_mapping():
+    """8.8 plugins/chat.py 的 _qq_push：无 msg_id 的纯文本主动消息；错误码 / 异常分类；URL 被抹掉；日志里 openid 只显示前 8 位。"""
+    import contextlib
+    import io
+    import nonebot
+    from nonebot.adapters.qq import Bot as QQBot
+    from nonebot.adapters.qq import exception as qq_exc
+    from nonebot.drivers import Response
+    from app.services.scheduler_service import PushError
+
+    mod = _load_chat_plugin()
+    openid = "OPENIDAAAA00001234"
+    sent = []
+    state = {"raises": None}
+
+    class FakeQQBot(QQBot):
+        async def send_to_c2c(self, openid, message, msg_id=None, msg_seq=None, event_id=None):
+            sent.append({"openid": openid, "message": message, "msg_id": msg_id, "msg_seq": msg_seq, "event_id": event_id})
+            if state["raises"] is not None:
+                raise state["raises"]
+
+    bot = FakeQQBot.__new__(FakeQQBot)
+    orig_get_bots = nonebot.get_bots
+
+    def failed(status, code=None, message="m", cls=qq_exc.ActionFailed):
+        body = {} if code is None and message is None else {"code": code, "message": message}
+        return cls(Response(status, content=json.dumps(body).encode("utf-8")))
+
+    async def push(text="你好"):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            await mod._qq_push(openid, text)
+        return buf.getvalue()
+
+    async def push_error(raises):
+        state["raises"] = raises
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                await mod._qq_push(openid, "你好")
+        except PushError as e:
+            return e, buf.getvalue()
+        finally:
+            state["raises"] = None
+        raise AssertionError("应当抛出 PushError")
+
+    async def scenario():
+        nonebot.get_bots = lambda: {"123": bot}
+        # 成功：主动消息不带 msg_id / msg_seq / event_id；文本里的链接被抹掉（主动消息含链接会被 40054010 拒收）
+        await push("详情见 https://example.com/a 和 www.example.org 这里")
+        assert len(sent) == 1 and sent[0]["openid"] == openid
+        assert sent[0]["msg_id"] is None and sent[0]["msg_seq"] is None and sent[0]["event_id"] is None
+        assert "https://" not in sent[0]["message"] and "www." not in sent[0]["message"] and "（链接已省略）" in sent[0]["message"], sent[0]
+        # 错误码表
+        table = {
+            40034105: "permanent", 40054013: "permanent",
+            40034100: "transient", 50055001: "transient", 40054016: "transient",
+            40054005: "dedupe", 40054007: "too_long", 40054010: "url_rejected",
+            12345678: "transient",
+        }
+        assert {k: v for k, v in mod._PUSH_CODE_KINDS.items()} == {k: v for k, v in table.items() if k != 12345678}
+        for code, kind in table.items():
+            err, _ = await push_error(failed(403, code, "msg"))
+            assert (err.kind, err.code) == (kind, code), (code, err)
+        err, _ = await push_error(failed(500, None, None))                        # 没有响应体
+        assert err.kind == "transient" and err.code is None
+        # 其余异常
+        err, _ = await push_error(failed(429, 40034100, "limited", cls=qq_exc.RateLimitException))
+        assert (err.kind, err.code) == ("transient", 40034100)
+        err, _ = await push_error(failed(401, 11255, "bad token", cls=qq_exc.UnauthorizedException))
+        assert err.kind == "transient"
+        assert (await push_error(qq_exc.NetworkError("down")))[0].kind == "transient"
+        assert (await push_error(qq_exc.ApiNotAvailable()))[0].kind == "transient"
+        assert (await push_error(RuntimeError("意外")))[0].kind == "transient"
+        # 平台已受理的两种情况：不算失败（进入审核 / HTTP 201、202）
+        state["raises"] = qq_exc.AuditException("audit-1")
+        await push()
+        state["raises"] = failed(202, None, None)
+        await push()
+        state["raises"] = failed(201, None, None)
+        await push()
+        state["raises"] = None
+        # 日志：openid 只显示前 8 位，message 只留前 100 字，不带消息正文
+        secret_text = "绝密正文DEF"
+        state["raises"] = failed(403, 40034105, f"用户 {openid} 未授权 " + "长" * 300)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                await mod._qq_push(openid, secret_text)
+        except PushError as e:
+            err = e
+        state["raises"] = None
+        log = buf.getvalue()
+        assert openid not in log and openid[:8] in log and secret_text not in log, log
+        assert "status=403" in log and "code=40034105" in log
+        assert len(err.detail) <= 200 and openid not in err.detail and err.kind == "permanent"
+        # 没有 QQ 机器人在线 / 只有别的 Bot
+        nonebot.get_bots = lambda: {}
+        e = None
+        try:
+            await mod._qq_push(openid, "x")
+        except PushError as ex:
+            e = ex
+        assert e is not None and e.kind == "transient" and "offline" in e.detail
+        nonebot.get_bots = lambda: {"9": object()}
+        try:
+            await mod._qq_push(openid, "x")
+            raise AssertionError("应当抛出 PushError")
+        except PushError as ex:
+            assert ex.kind == "transient"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        nonebot.get_bots = orig_get_bots
+
+
+def test_25_plugin_scheduler_hooks():
+    """8.9 调度器在 init_system 里于 init_service 成功之后启动，在 shutdown_system 里先于 shutdown_service 停止；
+    开关关闭、初始化失败、启动 / 停止抛异常时都不影响主流程。"""
+    import contextlib
+    import io
+    from app import config as cfg
+
+    mod = _load_chat_plugin()
+    cs, ss = mod.chat_service, mod.scheduler_service
+    calls = []
+    state = {"init_ok": True, "start_raises": False, "stop_raises": False}
+    saved = (cs.init_service, cs.is_initialized, cs.shutdown_service, ss.start, ss.stop, cfg.SCHEDULER_ENABLED)
+
+    async def fake_init():
+        calls.append("init")
+        if not state["init_ok"]:
+            raise RuntimeError("初始化失败")
+
+    async def fake_shutdown():
+        calls.append("shutdown_service")
+
+    def fake_start(**kwargs):
+        calls.append(("start", kwargs))
+        if state["start_raises"]:
+            raise RuntimeError("起不来")
+
+    async def fake_stop():
+        calls.append("stop")
+        if state["stop_raises"]:
+            raise RuntimeError("停不下")
+
+    def run(coro_fn):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):     # 插件会 print_exc，别刷屏
+            asyncio.run(coro_fn())
+        return buf.getvalue()
+
+    try:
+        cs.init_service, cs.shutdown_service = fake_init, fake_shutdown
+        cs.is_initialized = lambda: state["init_ok"]
+        ss.start, ss.stop = fake_start, fake_stop
+        # 1. 开关打开：init_service 之后启动（run_turn / push / cli 三个参数），关闭时先停调度器再关服务
+        cfg.SCHEDULER_ENABLED = True
+        run(mod.init_system)
+        assert calls[0] == "init" and calls[1][0] == "start", calls
+        kwargs = calls[1][1]
+        assert kwargs["run_turn"] is cs.run_scheduled_turn and kwargs["push"] is mod._qq_push and kwargs["cli"] is False, kwargs
+        calls.clear()
+        run(mod.shutdown_system)
+        assert calls == ["stop", "shutdown_service"], calls
+        # 2. 开关关闭：不启动
+        calls.clear()
+        cfg.SCHEDULER_ENABLED = False
+        run(mod.init_system)
+        assert calls == ["init"], calls
+        # 3. init_service 失败：不启动调度器，也不抛
+        calls.clear()
+        cfg.SCHEDULER_ENABLED = True
+        state["init_ok"] = False
+        out = run(mod.init_system)
+        assert calls == ["init"] and "初始化失败" in out, (calls, out)
+        state["init_ok"] = True
+        # 4. 调度器启动 / 停止抛异常：只打印，不影响主流程；停止失败后仍然关闭服务
+        calls.clear()
+        state["start_raises"] = state["stop_raises"] = True
+        out = run(mod.init_system)
+        assert "调度器启动失败" in out
+        calls.clear()
+        out = run(mod.shutdown_system)
+        assert calls == ["stop", "shutdown_service"] and "调度器停止失败" in out, (calls, out)
+    finally:
+        cs.init_service, cs.is_initialized, cs.shutdown_service, ss.start, ss.stop, cfg.SCHEDULER_ENABLED = saved
+
+
 SCENARIOS = [
     ("1.1 resolve_platform_user 格式与 owner 映射", test_1_resolve_platform_user),
     ("1.2 平台 id 无法冒充 owner / cli-", test_2_no_impersonation),
@@ -1228,6 +1419,8 @@ SCENARIOS = [
     ("8.5 守卫位置正确且不在 host_shell 里", test_21_guard_call_sites_and_layer),
     ("8.6 LLM 指标记录带 user 字段", test_22_metrics_record_carries_user),
     ("8.7 QQ 插件只处理 C2C，身份来自 openid", test_23_qq_plugin_c2c_only_and_identity),
+    ("8.8 _qq_push：主动消息、错误码 / 异常分类、日志卫生", test_24_qq_push_error_mapping),
+    ("8.9 插件里调度器的启动 / 停止顺序与容错", test_25_plugin_scheduler_hooks),
 ]
 
 

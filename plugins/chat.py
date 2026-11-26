@@ -2,13 +2,15 @@ import base64
 import time
 import traceback
 from nonebot import on_message, get_driver
+from nonebot.adapters.qq import Bot as QQBot
+from nonebot.adapters.qq import exception as qq_exc
 from nonebot.adapters.qq.event import C2CMessageCreateEvent, MessageEvent
 from nonebot.adapters.qq.message import MessageSegment, Message
 from nonebot.matcher import Matcher
 from nonebot.exception import FinishedException
 
 from app import config
-from app.services import chat_service
+from app.services import chat_service, scheduler_service
 from app.utils.files import incoming_files_from_attachments
 from app.utils.identity import resolve_platform_user
 from app.utils.text import URL_REGEX, defang_urls
@@ -50,6 +52,65 @@ def _make_image_segment(url: str) -> MessageSegment:
             return MessageSegment.text("[图片发送失败]")
     return MessageSegment.image(url)
 
+# ── 主动推送（定时任务到点后由 scheduler_service 调用）──
+# 错误码表：ActionFailed.code -> PushError.kind。“来源”是依据，“实测”指 tests/live_qq_push.py 在真机上是否触发过：
+# 2026-11-26 的第一轮真机探针里，无 msg_id 的主动文本能发出，没有触发过下面任何一个错误码，所以全部是平台文档的说法、未实测；
+# 用户关闭“允许主动发送消息”之后的错误码那一项（用例 ⑥）那次也没量到（发送仍然成功），permanent 组仍是文档值。
+_PUSH_CODE_KINDS = {
+    40034105: "permanent",     # 无主动消息权限                来源：平台文档    实测：否
+    40054013: "permanent",     # 用户拒绝接收                  来源：平台文档    实测：否
+    40034100: "transient",     # 频率限制                      来源：平台文档    实测：否（连发 8 条没有触发）
+    50055001: "transient",     # 服务端要求重试                来源：平台文档    实测：否
+    40054016: "transient",     # 机器人离线                    来源：平台文档    实测：否
+    40054005: "dedupe",        # 内容重复                      来源：平台文档    实测：否（间隔 1 秒的相同内容没有被去重）
+    40054007: "too_long",      # 内容过长                      来源：平台文档    实测：否（4000 字可发）
+    40054010: "url_rejected",  # 含不允许的链接                来源：平台文档    实测：否（https 链接与裸域名都没被拒）
+}
+# 表外的 ActionFailed 一律按 transient 处理（有次数与时间上限）。适配器里另有几类不是 ActionFailed 的情况：
+#   AuditException（2xx 且带 audit_id，消息进入审核）、HTTP 201 / 202（适配器统一抛成 ActionFailed）：都按“平台已受理”处理；
+#   RateLimitException（429）/ UnauthorizedException（401，适配器已刷新过一次令牌）/ NetworkError / ApiNotAvailable：transient。
+_PUSH_LOG_MESSAGE_CHARS = 100
+
+
+async def _qq_push(openid: str, text: str) -> None:
+    """经 QQ C2C 向用户主动发一条纯文本（不带 msg_id）；失败一律抛 scheduler_service.PushError。
+
+    get_bots 在函数里惰性导入：smoke_multiuser 的桩加载器只替换了 on_message / get_driver。
+    文本先过 _strip_urls（主动消息里的链接会被 40054010 拒收）。日志里 openid 只显示前 8 位，不记录正文。"""
+    from nonebot import get_bots
+
+    PushError = scheduler_service.PushError
+    bot = next((b for b in get_bots().values() if isinstance(b, QQBot)), None)
+    if bot is None:
+        raise PushError("transient", None, "bot offline")
+    tag = openid[:8]
+
+    def scrub(value) -> str:
+        return " ".join(str(value or "").replace(openid, tag).split())[:_PUSH_LOG_MESSAGE_CHARS]
+
+    try:
+        await bot.send_to_c2c(openid=openid, message=_strip_urls(text))
+    except qq_exc.AuditException:
+        return                                              # 进入审核：平台已受理
+    except qq_exc.RateLimitException as e:
+        print(f"[plugins.chat] 主动推送被限频 openid={tag} code={e.code}")
+        raise PushError("transient", e.code, "rate limited") from None
+    except qq_exc.UnauthorizedException:
+        print(f"[plugins.chat] 主动推送未授权（令牌刷新后仍被拒）openid={tag}")
+        raise PushError("transient", None, "unauthorized") from None
+    except qq_exc.ActionFailed as e:
+        if e.status_code in (201, 202):
+            return
+        print(f"[plugins.chat] 主动推送失败 openid={tag} status={e.status_code} code={e.code} message={scrub(e.message)!r}")
+        raise PushError(_PUSH_CODE_KINDS.get(e.code, "transient"), e.code, f"status={e.status_code} {scrub(e.message)}") from None
+    except (qq_exc.NetworkError, qq_exc.ApiNotAvailable) as e:
+        print(f"[plugins.chat] 主动推送网络 / 接口不可用 openid={tag} {type(e).__name__}")
+        raise PushError("transient", None, type(e).__name__) from None
+    except Exception as e:
+        print(f"[plugins.chat] 主动推送异常 openid={tag} {type(e).__name__}")
+        raise PushError("transient", None, type(e).__name__) from None
+
+
 @driver.on_startup
 async def init_system():
     """在 NoneBot 启动时初始化 chat_service 服务"""
@@ -58,10 +119,23 @@ async def init_system():
     except Exception as e:
         print(f"[ERROR] chat_service 初始化失败: {e}")
         traceback.print_exc()
+    # 定时任务调度器必须在 init_service 成功之后启动（NoneBot 的 startup 钩子按注册顺序串行）
+    if chat_service.is_initialized() and config.SCHEDULER_ENABLED:
+        try:
+            scheduler_service.start(run_turn=chat_service.run_scheduled_turn, push=_qq_push, cli=False)
+        except Exception as e:
+            print(f"[ERROR] 定时任务调度器启动失败: {e}")
+            traceback.print_exc()
 
 @driver.on_shutdown
 async def shutdown_system():
     """在 NoneBot 关闭时释放 chat_service 与 MCP 资源"""
+    # shutdown 钩子倒序执行：先停调度器（取消在途的定时任务），再关服务
+    try:
+        await scheduler_service.stop()
+    except Exception as e:
+        print(f"[ERROR] 定时任务调度器停止失败: {e}")
+        traceback.print_exc()
     try:
         await chat_service.shutdown_service()
     except Exception as e:

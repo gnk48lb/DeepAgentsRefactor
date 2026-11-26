@@ -79,6 +79,8 @@ def _event_body(ev) -> str:
         return f"[{p.get('name', '')}/{p.get('status', '')}] {p.get('text', '')}"
     if t == "file_uploaded":
         return f"用户上传了文件：{p.get('name', '')}（{format_file_size(p.get('size', 0))}）→ {p.get('path', '')}"
+    if t == "scheduled_push":
+        return f"系统定时推送给用户：「{p.get('title', '')}」{p.get('text', '')}"
     if t == "turn_failed":
         return f"{p.get('reason', '')} {p.get('detail', '')}".strip()
     if t == "turn_abandoned":
@@ -160,7 +162,7 @@ def get_session_events(
     参数：
     - start_seq: 起始事件序号。<=0 表示取该会话最新的 limit 条；>=1 表示从该序号（含）向后取 limit 条。
     - limit: 返回条数，默认 10，最大 20。limit=1 时单条内容不再截断到短上限，适合读一条事件的全文。
-    - types: 事件类型过滤，逗号分隔，可选 user_message, assistant_message, expert_report, tool_call, tool_result, file_uploaded。留空表示不过滤。
+    - types: 事件类型过滤，逗号分隔，可选 user_message, assistant_message, expert_report, tool_call, tool_result, file_uploaded, scheduled_push（系统按定时任务主动推给用户的内容）。留空表示不过滤。
     - session_id: 会话 id（可只写前几位）。留空表示当前对话所在的会话。
     """
     user_id = _user_id_of(config)
