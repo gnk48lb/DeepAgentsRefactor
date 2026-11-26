@@ -234,6 +234,7 @@ def test_d_prompt_uniqueness_and_identity():
         MEMBER_MAIN_AGENT_PROMPT_CODE,
         MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED,
         MEMBER_MAIN_AGENT_PROMPT_SCHED,
+        SCHEDULED_MAIN_AGENT_PROMPT,
     )
     from app.memory.extractor import MEMORY_EXTRACTOR_PROMPT, MEMORY_RECONCILER_PROMPT
     from app.agents.experts import (
@@ -262,7 +263,8 @@ def test_d_prompt_uniqueness_and_identity():
     assert ident(file_agent.PROMPT + file_agent.PROMPT_MARKITDOWN) == "FileAgent"
     assert ident(code_agent.MEMBER_PROMPT) == "CodeAgent", "member 的云端 CodeAgent 提示词要能被 cli_logger 识别"
     assert ident(MEMBER_MAIN_AGENT_PROMPT_CODE) == "MainAgent (Orchestrator)"
-    for _sched in (MAIN_AGENT_PROMPT_SCHED, MEMBER_MAIN_AGENT_PROMPT_SCHED, MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED):
+    for _sched in (MAIN_AGENT_PROMPT_SCHED, MEMBER_MAIN_AGENT_PROMPT_SCHED, MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED,
+                   SCHEDULED_MAIN_AGENT_PROMPT):
         assert ident(_sched) == "MainAgent (Orchestrator)", "追加了调度说明的主管提示词仍要被识别为主管"
     for _p in (media_agent.PROMPT, media_agent.DESCRIPTION, MAIN_AGENT_PROMPT, MEMBER_MAIN_AGENT_PROMPT,
                MEMBER_MAIN_AGENT_PROMPT_CODE, code_agent.MEMBER_PROMPT, code_agent.MEMBER_DESCRIPTION):

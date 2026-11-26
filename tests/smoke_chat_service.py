@@ -1651,7 +1651,7 @@ async def test_r5_shutdown_order_and_isolation():
         await _teardown()
 
 
-async def _init_service_with_member_experts(member_experts):
+async def _init_service_with_member_experts(member_experts, scheduled=None):
     """照 P14 的做法：用假的 build_main_agents / open_checkpointer 跑真实的 init_service。"""
     global _env
     _env = _Env()
@@ -1667,7 +1667,8 @@ async def _init_service_with_member_experts(member_experts):
         def mk(reply):
             return create_deep_agent(model=ScriptedModel(script=[AIMessage(content=reply)]), subagents=[], checkpointer=checkpointer)
 
-        return types.SimpleNamespace(owner=mk("o"), member=mk("m"), owner_experts=("FileAgent",), member_experts=member_experts)
+        extra = {"scheduled": scheduled, "scheduled_experts": ("KnowledgeAgent", "MediaAgent", "MapAgent")} if scheduled is not None else {}
+        return types.SimpleNamespace(owner=mk("o"), member=mk("m"), owner_experts=("FileAgent",), member_experts=member_experts, **extra)
 
     checkpointer.open_checkpointer, cs.models.validate_required_keys, cs.orchestrator.build_main_agents = open_tmp, lambda: None, fake_build
     out = io.StringIO()
@@ -1702,6 +1703,29 @@ async def test_r6_startup_banner_and_whoami():
         assert "CodeAgent 后端：未启用" in whoami and "云端沙箱" not in whoami, whoami
         assert "CodeAgent 后端：本机 Docker" in (await _say(ID, "/whoami")).text
         await cs.shutdown_service()
+        await _teardown()
+
+
+async def test_r8_scheduled_graph_wiring():
+    """R8 init_service 只在 built.scheduled 非 None 时才把第三张图写进 _agents["scheduled"]（旧的假 build 没有这个属性也照常工作），
+    启动横幅多一行“定时任务：已启用 / 未启用”；_agent_for 永远只按 owner / member 取图，绝不返回 scheduled 图。"""
+    members = ("KnowledgeAgent", "MediaAgent", "MapAgent")
+    with _ModalSpy(status=(False, "MODAL_DISABLED=true")):
+        banner = await _init_service_with_member_experts(members)
+        assert set(cs._agents) == {"owner", "member"}, cs._agents
+        assert "⏰ [chat_service] 定时任务：未启用" in banner, banner
+        await cs.shutdown_service()
+        await _teardown()
+
+        sentinel = object()
+        banner = await _init_service_with_member_experts(members, scheduled=sentinel)
+        assert set(cs._agents) == {"owner", "member", "scheduled"} and cs._agents["scheduled"] is sentinel, cs._agents
+        assert "⏰ [chat_service] 定时任务：已启用" in banner, banner
+        assert cs._agent_for("owner") is cs._agents["owner"] and cs._agent_for(MEMBER_A) is cs._agents["member"]
+        for uid in ("owner", MEMBER_A, "scheduled"):
+            assert cs._agent_for(uid) is not sentinel, uid
+        await cs.shutdown_service()
+        assert cs._agents == {} and not cs.is_initialized(), "shutdown_service 之后三张图都清掉"
         await _teardown()
 
 
@@ -1763,6 +1787,7 @@ SCENARIOS = [
     ("R5 关闭顺序与隔离", test_r5_shutdown_order_and_isolation),
     ("R6 启动横幅与 /whoami", test_r6_startup_banner_and_whoami),
     ("R7 启动提示文案", test_r7_startup_notice_wording),
+    ("R8 scheduled 图的接线与启动横幅", test_r8_scheduled_graph_wiring),
 ]
 
 

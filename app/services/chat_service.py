@@ -37,6 +37,7 @@ from app.infra import models, session_store, checkpointer, modal_sandbox
 from app.utils.text import extract_text
 from app.utils.files import IncomingFile
 from app.utils.images import guess_mime_type
+from app.utils import schedule_time
 from app.utils.context import RequestContext, set_request_context, reset_request_context
 from app.utils.identity import OWNER_USER_ID, Identity, invalid_owner_ids, validate_user_id
 
@@ -82,6 +83,7 @@ class _TurnHandle:
     started_at: float            # time.monotonic()
     stop_requested: bool = False
     cancel_sent_at: float = 0.0
+    source: str = "chat"         # chat：用户的一轮对话；scheduled：无人值守的定时任务（没有宿主机命令 / 沙箱要终止）
 
 
 # 每个用户当前正在运行的一轮（仅普通消息 / Y-N 审批；斜杠命令在锁内同步执行，不可被 /stop 取消）
@@ -229,6 +231,9 @@ async def init_service() -> None:
         _checkpointer = saver
         built = await orchestrator.build_main_agents(checkpointer=saver)
         _agents = {"owner": built.owner, "member": built.member}
+        scheduled = getattr(built, "scheduled", None)       # 只有定时任务开关打开时才有；_agent_for 永远不会返回它
+        if scheduled is not None:
+            _agents["scheduled"] = scheduled
         await recover_orphans()
         info = store.get_session(sid, user_id=OWNER_USER_ID)
         if config.QQ_FILE_ENABLED:
@@ -247,6 +252,7 @@ async def init_service() -> None:
         raise
     print(f"🧩 [chat_service] owner 图专家: {', '.join(built.owner_experts)}")
     print(f"🧩 [chat_service] member 图专家: {', '.join(built.member_experts)}")
+    print(f"⏰ [chat_service] 定时任务：{'已启用' if _agents.get('scheduled') is not None else '未启用'}")
     # 以真正编译出来的结果为准，不要自己再算一遍门控
     _member_code_enabled = "CodeAgent" in built.member_experts
     if _member_code_enabled:
@@ -268,13 +274,100 @@ def is_initialized() -> bool:
     return _initialized
 
 
+def _scheduled_input(title: str, prompt: str, timezone: str) -> str:
+    """无人值守任务的输入：一条 HumanMessage 的正文。标题与指令里的标签去掉，免得提前闭合这个块。"""
+    def clean(s) -> str:
+        return str(s).replace("</scheduled_task>", "").replace("<scheduled_task>", "")
+    return (
+        "<scheduled_task>\n"
+        f"标题：{clean(title)}\n"
+        f"触发时间（业务时区）：{schedule_time.fmt_full(time.time(), timezone)}\n"
+        "指令：\n"
+        f"{clean(prompt)}\n"
+        "</scheduled_task>"
+    )
+
+
 async def run_scheduled_turn(
     *, job_id: str, user_id: str, target_openid: str, title: str, prompt: str, timezone: str, run_ref: str
 ) -> scheduler_service.AgentRunResult:
-    """无人值守的 agent 定时任务（调度器通过 start(run_turn=...) 调用）。
+    """无人值守地跑一次 agent 模式的定时任务（调度器通过 start(run_turn=...) 调用），返回 AgentRunResult。
 
-    这一阶段还没有编译无人值守的 scheduled 图，一律回 unavailable：reminder 模式不经过这里，不受影响。"""
-    return scheduler_service.AgentRunResult(False, "", "unavailable")
+    - 只用第三张专用图（_agents["scheduled"]，不经 _agent_for）：没有它就是 unavailable；
+    - 等该用户的锁最多 SCHEDULER_LOCK_WAIT_SECONDS（用户正在聊天就是 busy，由调度器按间隔重试），持锁之后才登记 /stop 句柄；
+    - 在临时线程 sched-<job8>-<run_ref> 里跑，结束后删除这个线程；不查长期记忆、不镜像事件日志、不写 assistant_message、
+      不提取记忆、不清理嵌套 checkpoint：指令必须自包含，调度器只拿最终文字去推送；
+    - 请求上下文标记 is_scheduled，require_owner() 一律拒绝；member 仍要过全局并发信号量（先锁后信号量，顺序同 wake）。
+    """
+    agent = _agents.get("scheduled")
+    if agent is None:
+        return scheduler_service.AgentRunResult(False, "", "unavailable")
+    try:
+        validate_user_id(user_id)
+    except ValueError:
+        return scheduler_service.AgentRunResult(False, "", "error")
+    lock = _user_lock(user_id)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=config.SCHEDULER_LOCK_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        return scheduler_service.AgentRunResult(False, "", "busy")
+    thread_id = f"sched-{job_id[:8]}-{run_ref}"
+    try:
+        turn_start = time.perf_counter()
+        result = await _run_cancellable(
+            _scheduled_body(agent, user_id, target_openid, thread_id, _scheduled_input(title, prompt, timezone)),
+            user_id, thread_id, turn_start, source="scheduled",
+        )
+        # 被 /stop 取消的那一轮 _run_cancellable 返回 None
+        return result if result is not None else scheduler_service.AgentRunResult(False, "", "stopped")
+    finally:
+        lock.release()
+        if _checkpointer is not None:
+            try:
+                await _checkpointer.adelete_thread(thread_id)
+            except Exception as e:                   # 尽力而为：崩溃时残留的临时线程不自动清理（README 已知限制）
+                print(f"⚠️ [scheduled] 删除临时线程失败 (非致命): {type(e).__name__}")
+
+
+async def _scheduled_body(agent: Any, user_id: str, target_openid: str, thread_id: str, text: str) -> scheduler_service.AgentRunResult:
+    """在 _run_cancellable 起的独立 task 里跑：设请求上下文与发件箱（图片一律丢弃，只推文本）。"""
+    is_owner = user_id == OWNER_USER_ID
+    token = set_request_context(RequestContext(
+        user_id=user_id, session_id=thread_id, is_owner=is_owner, raw_id=target_openid, is_scheduled=True,
+    ))
+    sem = None if is_owner else _member_semaphore()
+    try:
+        outbox.begin()
+        cfg = _run_config(thread_id, user_id)
+        try:
+            if sem is not None:
+                await sem.acquire()
+            try:
+                await asyncio.wait_for(
+                    agent.ainvoke({"messages": [HumanMessage(content=text)]}, cfg),
+                    timeout=config.AGENT_TURN_TIMEOUT_SECONDS,
+                )
+            finally:
+                if sem is not None:
+                    sem.release()
+            state = await agent.aget_state(_state_config(thread_id))
+        except asyncio.TimeoutError:
+            return scheduler_service.AgentRunResult(False, "", "timeout")
+        except GraphRecursionError:
+            return scheduler_service.AgentRunResult(False, "", "error")
+        except Exception as e:                       # CancelledError 是 BaseException：/stop 与停机照常生效
+            print(f"⚠️ [scheduled] 无人值守任务出错: {type(e).__name__}")
+            return scheduler_service.AgentRunResult(False, "", "error")
+        if hitl.has_pending_interrupts(state):
+            return scheduler_service.AgentRunResult(False, "", "hitl")
+        for m in reversed(state.values.get("messages", [])):
+            if isinstance(m, AIMessage):
+                final_text = extract_text(getattr(m, "content", "")).strip()
+                if final_text:
+                    return scheduler_service.AgentRunResult(True, final_text, "")
+        return scheduler_service.AgentRunResult(False, "", "empty")
+    finally:
+        reset_request_context(token)
 
 
 async def shutdown_service() -> None:
@@ -633,14 +726,14 @@ async def _run_turn(
     return await wake(sid, turn_start=turn_start)
 
 
-async def _run_cancellable(coro, user_id: str, session_id: str, turn_start: float) -> Optional[ChatReply]:
+async def _run_cancellable(coro, user_id: str, session_id: str, turn_start: float, source: str = "chat") -> Optional[ChatReply]:
     """把一轮对话放进独立 task 并登记该用户的句柄，使 /stop 能在用户锁之外取消它。
 
     被 /stop 取消的那一轮返回 None（plugins/chat.py 对 None 直接 return，不会多发一条回复）。
     禁止用 asyncio.current_task().cancel() 实现 /stop：当前 task 是 NoneBot handler / CLI 主 task，会误杀调用方。
     """
     task = asyncio.create_task(coro, name="chat-turn")
-    handle = _TurnHandle(task=task, session_id=session_id, user_id=user_id, started_at=time.monotonic())
+    handle = _TurnHandle(task=task, session_id=session_id, user_id=user_id, started_at=time.monotonic(), source=source)
     _current_turns[user_id] = handle            # 与 create_task 之间不能有 await
     try:
         return await task
@@ -690,7 +783,9 @@ async def _stop_current_turn(user_id: str) -> tuple[str, int]:
         handle.cancel_sent_at = now
         handle.task.cancel()
     killed = 0
-    if user_id == OWNER_USER_ID:
+    if handle.source == "scheduled":
+        pass        # 无人值守的图里没有宿主机命令、本机沙箱和云端沙箱：不调用任何终止原语（member 的 /stop 也绝不触发它们）
+    elif user_id == OWNER_USER_ID:
         # 宿主机命令与 Docker 沙箱只有 owner 能用，而这两个终止原语是进程级全局的：member 的 /stop 绝不能触发它们，
         # 否则会杀掉 owner 正在跑的命令。
         killed = await asyncio.to_thread(_kill_side_effects)
@@ -718,6 +813,11 @@ async def _cmd_stop(identity: Identity, turn_start: float) -> ChatReply:
     uid = identity.user_id
     handle = _current_turns.get(uid)
     status, killed = await _stop_current_turn(uid)
+    if handle is not None and handle.source == "scheduled" and status != "idle":
+        # 正在跑的是无人值守的定时任务：取消、等待收尾即可，没有会话镜像，也没有待授权的操作要检查
+        if status == "timeout":
+            return _command_reply("已发送中止指令，但定时任务还在收尾，请稍后再发消息；仍无响应可再发一次 /stop。", turn_start)
+        return _command_reply("已中止正在运行的定时任务。", turn_start)
     store = session_store.get_store()
     sid = handle.session_id if handle is not None else store.get_active_session_id(user_id=uid)
 
@@ -875,8 +975,10 @@ async def _process_unblocked(text: str, image_url: Optional[str], identity: Iden
 
     # 该用户的锁已被占用：直接返回占用提示，不排队；不同用户互不影响
     if lock.locked():
-        busy = "上一条消息还在处理中，请稍候再发。"
         turn = _current_turns.get(uid)
+        if turn is not None and turn.source == "scheduled":
+            return ChatReply("正在执行你的定时任务，请稍候再发；需要中止请发送 /stop", [])
+        busy = "上一条消息还在处理中，请稍候再发。"
         if turn is not None:
             busy += f"（已运行 {int(time.monotonic() - turn.started_at)} 秒）"
         return ChatReply(busy + "如需中止请发送 /stop", [])

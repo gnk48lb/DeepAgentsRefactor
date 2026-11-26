@@ -31,6 +31,7 @@ from app.agents.prompts import (
     MEMBER_MAIN_AGENT_PROMPT_CODE,
     MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED,
     MEMBER_MAIN_AGENT_PROMPT_SCHED,
+    SCHEDULED_MAIN_AGENT_PROMPT,
 )
 from app.agents.skills import (
     SKILLS_MEMBER_DIR,
@@ -151,6 +152,9 @@ class MainAgents:
     member: Any
     owner_experts: tuple
     member_experts: tuple
+    # 无人值守的定时任务专用图（只有 SCHEDULER_ENABLED 打开时才编译）；新字段只能加在末尾并带默认值
+    scheduled: Any = None
+    scheduled_experts: tuple = ()
 
 
 def _tool_names(tools) -> set:
@@ -230,6 +234,42 @@ def _assert_member_graph_safe(supervisor_tools: list, subagents: list, vetted_co
         bad = sorted(_tool_names(sa.get("tools")) & _MEMBER_FORBIDDEN_TOOL_NAMES)
         if bad:
             raise RuntimeError(f"member 图的子专家 '{sa['name']}' 持有宿主机相关工具: {bad}")
+
+
+def _assert_scheduled_graph_safe(supervisor_tools: list, subagents: list) -> None:
+    """scheduled 图的启动期断言（失败即关闭）：监督者工具名恰为 {get_current_time}（没有任何 schedule / 会话回溯工具，
+    无人值守的任务既不能再创建任务，也不能读会话记录）；专家名恰为 Knowledge / Media / Map，没有任何预编译专家
+    （CodeAgent 等会带来 HITL 中断与云端费用）。"""
+    names = _tool_names(supervisor_tools)
+    if names != {"get_current_time"}:
+        raise RuntimeError(f"scheduled 图的主管工具必须恰为 get_current_time，实际是 {sorted(names)}")
+    expert_names = [sa["name"] for sa in subagents]
+    if expert_names != list(_MEMBER_EXPERT_NAMES):
+        raise RuntimeError(f"scheduled 图的专家必须恰为 {list(_MEMBER_EXPERT_NAMES)}，实际是 {expert_names}")
+    precompiled = [sa["name"] for sa in subagents if "runnable" in sa]
+    if precompiled:
+        raise RuntimeError(f"scheduled 图不允许预编译的子专家: {precompiled}")
+
+
+def _build_scheduled_agent(checkpointer: BaseCheckpointSaver):
+    """无人值守的第三张图：Knowledge / Media / Map 三个声明式专家，监督者工具只有 get_current_time。
+    owner 的定时任务也走它：不复用 owner 图（有宿主机能力），也不复用 member 图（带会话回溯工具，可能带云端 CodeAgent）。
+    图里不挂任何会产生 HITL 中断的工具，也没有会话回溯 / schedule 工具。只在 config.SCHEDULER_ENABLED 为真时构建（调用方判断）。"""
+    subagents = _member_subagents(None)
+    supervisor_tools = [knowledge_tools.get_current_time]
+    _assert_member_graph_safe(supervisor_tools, subagents)
+    _assert_scheduled_graph_safe(supervisor_tools, subagents)
+    agent = create_deep_agent(
+        model=models.orchestrator_llm,
+        tools=supervisor_tools,
+        system_prompt=SCHEDULED_MAIN_AGENT_PROMPT,
+        subagents=subagents,
+        middleware=[ToolCallLimitMiddleware(tool_name="task", run_limit=6, exit_behavior="continue")],
+        backend=build_member_skills_backend(),
+        permissions=_SUPERVISOR_PERMISSIONS,
+        checkpointer=checkpointer,
+    )
+    return agent, tuple(sa["name"] for sa in subagents)
 
 
 def _build_member_agent(checkpointer: BaseCheckpointSaver):
@@ -345,4 +385,10 @@ async def build_main_agents(
 
     owner, owner_experts = await _build_owner_agent(checkpointer)
     member, member_experts = _build_member_agent(checkpointer)
-    return MainAgents(owner=owner, member=member, owner_experts=owner_experts, member_experts=member_experts)
+    scheduled, scheduled_experts = None, ()
+    if config.SCHEDULER_ENABLED:            # 开关在调用时现读：关闭时不编译第三张图
+        scheduled, scheduled_experts = _build_scheduled_agent(checkpointer)
+    return MainAgents(
+        owner=owner, member=member, owner_experts=owner_experts, member_experts=member_experts,
+        scheduled=scheduled, scheduled_experts=scheduled_experts,
+    )

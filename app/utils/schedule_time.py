@@ -97,6 +97,12 @@ def fmt_local(epoch: float, tz_name: Optional[str] = None) -> str:
     return _at(epoch, tz_name).strftime("%m-%d %H:%M")
 
 
+def fmt_full(epoch: float, tz_name: Optional[str] = None) -> str:
+    """“YYYY-MM-DD HH:MM 星期X”，按给定时区（默认业务时区）。"""
+    dt = _at(epoch, tz_name)
+    return f"{dt:%Y-%m-%d %H:%M} {_WEEKDAY_FULL[dt.weekday()]}"
+
+
 def fmt_now(now: float, tz_name: Optional[str] = None) -> str:
     """错误信息里带的“当前业务时间”，帮模型自我纠正（它必须先 get_current_time 再换算 run_at）。"""
     dt = _at(now, tz_name)

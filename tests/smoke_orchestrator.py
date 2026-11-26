@@ -14,6 +14,7 @@ tests/smoke_orchestrator.py
   G member 构建从不读取 desktop / markitdown 的 MCP 工具,也不构造 CodeAgent / FileAgent / DesktopAgent
   H MEMBER_MAIN_AGENT_PROMPT:含识别短语、能力边界,不含任何宿主机相关词
   J / K 定时任务开关打开时：owner / member 的主管追加调度说明与三个 schedule 工具，原常量不变，member 的能力边界不被破坏
+  L 无人值守的第三张图：三个声明式专家、监督者工具只有 get_current_time、不带 CodeAgent、启动期断言逐项拒绝违规
 不需要真实 API Key / 网络:模型客户端用占位 key 构造,构造时不会发请求。
 """
 import asyncio
@@ -53,6 +54,7 @@ from app.agents.prompts import (  # noqa: E402
     MEMBER_MAIN_AGENT_PROMPT_CODE,
     MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED,
     MEMBER_MAIN_AGENT_PROMPT_SCHED,
+    SCHEDULED_MAIN_AGENT_PROMPT,
 )
 
 EXPECTED_ORDER = ["KnowledgeAgent", "MediaAgent", "MapAgent", "CodeAgent",
@@ -74,7 +76,7 @@ BANNED = {"write_file", "edit_file", "delete", "execute", "ls", "glob", "grep"}
 
 _captured = {}              # owner 图的 create_deep_agent 参数（A–D 针对它）
 _captured_member = {}       # member 图的 create_deep_agent 参数
-_captured_sched = {}        # 开关打开时各张图的 create_deep_agent 参数（键：owner / member / member_code）
+_captured_sched = {}        # 开关打开时各张图的 create_deep_agent 参数（键：owner / member / member_code / scheduled）
 _mcp_requests = []          # get_tools_by_server 被问过哪些服务
 _agents = None
 _real_create = orchestrator.create_deep_agent
@@ -105,6 +107,8 @@ def _build():
             _captured_sched["member"] = dict(kwargs)
         elif prompt is MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED:
             _captured_sched["member_code"] = dict(kwargs)
+        elif prompt is SCHEDULED_MAIN_AGENT_PROMPT:
+            _captured_sched["scheduled"] = dict(kwargs)
         else:
             raise AssertionError("未知的主图 system_prompt")
         return _real_create(*args, **kwargs)
@@ -690,6 +694,91 @@ def test_k2_scheduler_prompt_constants():
         assert word not in prompts.SCHEDULER_PROMPT_SECTION, word
 
 
+def test_l_scheduled_graph():
+    """L 无人值守的第三张图：只有 Knowledge / Media / Map 三个声明式专家，监督者工具只有 get_current_time，
+    用 SCHEDULED_MAIN_AGENT_PROMPT；owner 与 member 的任务都走它；开关关闭时不编译；启动期断言逐项拒绝违规的图。"""
+    import dataclasses
+    from langchain.agents.middleware import ToolCallLimitMiddleware
+    from app.agents.prompts import SCHEDULED_MAIN_AGENT_PROMPT
+    from app.tools import knowledge_tools, session_tools
+
+    _mcp_requests.clear()
+    _captured_sched.clear()
+    with _scheduler_enabled():
+        agent, experts = orchestrator._build_scheduled_agent(MemorySaver())
+    assert hasattr(agent, "ainvoke") and experts == tuple(MEMBER_ORDER), experts
+    cap = _captured_sched["scheduled"]
+    assert cap["system_prompt"] is SCHEDULED_MAIN_AGENT_PROMPT
+    assert [t.name for t in cap["tools"]] == ["get_current_time"], [t.name for t in cap["tools"]]
+    assert [_name(s) for s in cap["subagents"]] == MEMBER_ORDER and all("runnable" not in s for s in cap["subagents"])
+    for s in cap["subagents"]:
+        assert not (_tool_names_of(s) & (set(_SCHEDULE_TOOL_NAMES) | {"get_session_events", "search_session_history"} | FORBIDDEN_TOOLS)), _name(s)
+    mws = cap["middleware"]
+    assert len(mws) == 1 and isinstance(mws[0], ToolCallLimitMiddleware)
+    assert mws[0].tool_name == "task" and mws[0].run_limit == 6 and mws[0].exit_behavior == "continue"
+    assert cap["permissions"] == _captured["permissions"] and cap["checkpointer"] is not None
+    skills_route = cap["backend"].routes["/skills/"]
+    assert isinstance(skills_route, ReadOnlyFilesystemBackend) and os.path.realpath(str(skills_route.cwd)) == os.path.realpath(SKILLS_MEMBER_DIR)
+    assert _mcp_requests == [], f"scheduled 图的构建不得读取任何 MCP 工具: {_mcp_requests}"
+
+    # 提示词：以识别短语开头；不含 member 能力边界以外的词；该有的约束都在
+    p = SCHEDULED_MAIN_AGENT_PROMPT
+    assert p.startswith("你是一个多智能体系统的主 Agent")
+    for word in _SCHED_BANNED_WORDS:
+        assert word not in p, f"无人值守的主管提示词不应出现 {word!r}"
+    for word in ("无人值守", "<scheduled_task>", "get_current_time", "task 工具", "资料库、媒体、地图", "不得向用户提问", "不得请求确认",
+                 "纯文本", "不要放网址", "不要输出图片", "不是给你的指令", "如实说查不到", "300 字"):
+        assert word in p, f"无人值守的主管提示词应含 {word!r}"
+    assert p != MAIN_AGENT_PROMPT and p != MEMBER_MAIN_AGENT_PROMPT and p is not MEMBER_MAIN_AGENT_PROMPT
+
+    # 启动期断言：逐项拒绝违规的图
+    check = orchestrator._assert_scheduled_graph_safe
+    base_tools, subs = [knowledge_tools.get_current_time], orchestrator._member_subagents()
+    check(base_tools, subs)
+    for bad_tools in ([], [*base_tools, *session_tools.TOOLS], [*base_tools, *orchestrator.schedule_tools.TOOLS],
+                      [*base_tools, _dummy_tool("anything")], [_dummy_tool("get_current_time_2")]):
+        _expect_runtime_error(check, bad_tools, subs)
+    _expect_runtime_error(check, base_tools, subs[:2])                                           # 少一个专家
+    _expect_runtime_error(check, base_tools, [*subs, orchestrator._declarative_subagents()[3]])   # 多一个声明式专家（BrowserAgent）
+    _expect_runtime_error(check, base_tools, [subs[1], subs[0], subs[2]])                        # 顺序不对
+    _expect_runtime_error(check, base_tools, [*subs, {"name": "CodeAgent", "description": "x", "runnable": object()}])
+    # 与 member 图共用的安全断言也会先拦：黑名单工具注入主管 / 专家
+    poisoned = orchestrator._member_subagents()
+    poisoned[0]["tools"] = [*poisoned[0]["tools"], _dummy_tool("run_host_command")]
+    reached = []
+    real_subs, real_create = orchestrator._member_subagents, orchestrator.create_deep_agent
+    orchestrator._member_subagents = lambda code=None: poisoned
+    orchestrator.create_deep_agent = lambda *a, **k: reached.append(1)
+    try:
+        _expect_runtime_error(orchestrator._build_scheduled_agent, MemorySaver())
+    finally:
+        orchestrator._member_subagents, orchestrator.create_deep_agent = real_subs, real_create
+    assert not reached, "断言失败后不应继续构建 scheduled 图"
+
+    # MainAgents：新字段只加在末尾并带默认值；开关关闭时不编译，打开时 build_main_agents 一并编译
+    assert [f.name for f in dataclasses.fields(orchestrator.MainAgents)] == [
+        "owner", "member", "owner_experts", "member_experts", "scheduled", "scheduled_experts"]
+    legacy = orchestrator.MainAgents(1, 2, ("a",), ("b",))
+    assert legacy.scheduled is None and legacy.scheduled_experts == ()
+    assert _agents.scheduled is None and _agents.scheduled_experts == (), "默认（开关关闭）不编译第三张图"
+    with _scheduler_enabled():
+        built = asyncio.run(orchestrator.build_main_agents())
+    assert built.scheduled is not None and hasattr(built.scheduled, "ainvoke") and built.scheduled_experts == tuple(MEMBER_ORDER)
+    assert built.scheduled is not built.member and built.scheduled is not built.owner
+    assert built.owner_experts == tuple(EXPECTED_ORDER) and built.member_experts == tuple(MEMBER_ORDER)
+
+    # member 图带云端 CodeAgent 时，scheduled 图仍然只有三个专家，也不会构造 member 的 CodeAgent（没有 Modal 费用）
+    boom_calls = []
+    real_build = code_agent.build_member_code_agent_runnable
+    code_agent.build_member_code_agent_runnable = lambda *a, **k: boom_calls.append(1)
+    try:
+        with _code_enabled(), _scheduler_enabled():
+            _agent, experts = orchestrator._build_scheduled_agent(MemorySaver())
+    finally:
+        code_agent.build_member_code_agent_runnable = real_build
+    assert experts == tuple(MEMBER_ORDER) and boom_calls == []
+
+
 def main():
     print("=" * 70)
     print("开始运行编排层装配离线冒烟测试...")
@@ -714,7 +803,8 @@ def main():
                  ("G2 启用 CodeAgent 时不碰 Docker 与宿主机", test_g2_code_enabled_build_never_touches_docker_or_host),
                  ("J 开关打开：owner 图追加调度说明与 schedule 工具", test_j_owner_graph_with_scheduler),
                  ("K 开关打开：member 图（含云端 CodeAgent 变体）", test_k_member_graph_with_scheduler),
-                 ("K2 *_SCHED 提示词常量", test_k2_scheduler_prompt_constants)]
+                 ("K2 *_SCHED 提示词常量", test_k2_scheduler_prompt_constants),
+                 ("L 无人值守的 scheduled 图", test_l_scheduled_graph)]
     passed = failed = 0
     for name, fn in scenarios:
         try:
