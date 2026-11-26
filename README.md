@@ -8,6 +8,13 @@
 
 GNK48-Agent 采用声明式主智能体配合垂直领域子专家架构。主 Agent 基于 ReAct 循环进行意图分析与全局任务规划，通过 deepagents 内置的 `task` 工具将子任务委派给各个领域专家；针对涉及敏感操作的专家，通过编译式 LangGraph 子图实现单步 Human-in-the-loop (HITL) 动态授权与状态隔离。
 
+**主要功能**
+- 多智能体问答与任务执行：知识 / 媒体 / 地图 / 代码 / 浏览器 / 文件 / 桌面七类专家按需委派（见 2.3）。
+- 多用户（owner / member）：能力在编译期门控，member 只有资料库、媒体、地图与云端代码沙箱（见 2.4）。
+- QQ 文件接收：先发文件、再用文字提问（见 2.4）。
+- 会话与事件日志：多会话、重启恢复、挂起授权持久化、会话记录回溯（见 2.11）。
+- **定时任务与主动推送**：用自然语言创建提醒或定时查询（“每天早上 7:30 提醒我带不带伞，先查北京天气”），到点无人值守地执行并经 QQ 主动消息推给用户；`/tasks` 管理，默认关闭（见 2.12）。
+
 ---
 
 ## 2. 系统架构与分层规则
@@ -15,7 +22,7 @@ GNK48-Agent 采用声明式主智能体配合垂直领域子专家架构。主 A
 ### 2.1 分层架构与依赖约束（单向，只能向下 import）
 系统严格遵循 6 层单向依赖架构：
 ```text
-L5 Services  (app/services/startup.py, chat_service.py, session_log.py)
+L5 Services  (app/services/startup.py, chat_service.py, session_log.py, scheduler_service.py, task_commands.py)
    ↓
 L4 Agents    (app/agents/spec.py, prompts.py, orchestrator.py, experts/*)
    ↓
@@ -101,10 +108,11 @@ L0 Config & Utils    (app/config.py, app/utils/*)
   - `/reset`：只清空当前会话的对话上下文（含挂起的授权），**事件日志保留**；**只有 owner 的 `/reset` 才会重置本机 Docker 沙箱**（Docker 沙箱仍是进程级全局，`/new`、`/switch` 不会动它）；member 的 `/reset` 只终止自己当前会话的云端沙箱。任务正在运行时，`/reset` 会先中止你自己的当前任务（回复以“已先中止正在运行的任务。”开头），再执行清空。
   - `/stop`：中止**你自己**正在运行的任务（语义见 2.11「中止（/stop）语义」）。它不等用户锁，任务运行期间也能立即生效；CLI 里任务运行期间同样可以输入 `/stop`。没有任务在跑时只回复“当前没有正在运行的任务。”。宿主机命令与 Docker 沙箱的终止原语是进程级全局的，只有 owner 的 `/stop` 才会触发；member 的 `/stop` 只取消自己那一轮（并中断自己会话里的云端命令），不会波及任何人。
   - `/whoami`：纯文本显示平台 ID、内部 ID、身份（管理员 / 成员）与 CodeAgent 后端（owner 为本机 Docker，member 为云端沙箱（Modal）或未启用）。
+  - `/tasks [rm|pause|resume <序号|编号前缀>]`：查看与管理自己的定时任务（`rm` 别名 `del`）；owner 另可用 `/tasks all` 列出所有人的任务、用编号前缀管任何人的任务。开关关闭时回复“定时任务功能未启用。”，详见 2.12。
 - 仅 owner（非 owner 发送时固定回复“该命令仅管理员可用”，不泄露任何信息）：
   - `/users`：列出序号、备注、id 前 8 位、最后活跃时间、会话数与 `[已封禁]` 标记；序号按首次出现的先后排，保持稳定。备注是留给你记数字 QQ 号或昵称的。
   - `/label <序号|id前缀> <备注>`：给用户加备注（最长 40 字符，留空清除）。
-  - `/block <序号|id前缀>` / `/unblock <序号|id前缀>`：封禁 / 解封。被封的 member 对任何输入都只会收到“你当前无法使用本机器人。”，不会进入任何流程；封禁时会顺手中止他正在跑的任务，并回收他的全部云端沙箱。owner 不可被封禁。
+  - `/block <序号|id前缀>` / `/unblock <序号|id前缀>`：封禁 / 解封。被封的 member 对任何输入都只会收到“你当前无法使用本机器人。”，不会进入任何流程；封禁时会顺手中止他正在跑的任务，并回收他的全部云端沙箱；定时任务开关打开时还会暂停他名下进行中的定时任务（`/unblock` 不自动恢复，见 2.12）。owner 不可被封禁。
   - 管理命令与 `/new`、`/switch` 一样在用户锁内处理：你自己有任务在跑时会收到忙提示，先 `/stop` 再发。
 
 **隐私与可见性提示**
@@ -221,10 +229,10 @@ QQ 私聊里可以先发文件、再用文字提问（QQ 会把每个文件作�
 - `checkpoints.db`（官方 `AsyncSqliteSaver`）：LangGraph checkpoint，负责“续跑”（模型上下文与 HITL 中断）。`thread_id == session_id`。
 - 两者分工：checkpoint 负责续跑，事件日志负责记录与回溯；不要试图从事件日志重建模型上下文。
 
-**事件类型**：`session_created`、`user_message`（原话 / 翻译后文本 / 是否带图）、`approval`、`approval_request`、`assistant_message`（文本 + 图片张数）、`expert_report`（task 返回的专家完整战报）、`tool_call`、`tool_result`、`turn_failed`（`reason`：`recursion_limit` / `timeout` / `error` / `no_pending_approval` / `user_stop` / `cancelled`）、`turn_abandoned`、`session_reset`。事件只追加、不改写；“待处理”由会话游标 `processed_seq` 表达（入站事件 `user_message` / `approval` 的 seq 大于游标即待处理）。图片字节永远不进事件日志，只记张数。
+**事件类型**：`session_created`、`user_message`（原话 / 翻译后文本 / 是否带图）、`approval`、`approval_request`、`assistant_message`（文本 + 图片张数）、`expert_report`（task 返回的专家完整战报）、`tool_call`、`tool_result`、`turn_failed`（`reason`：`recursion_limit` / `timeout` / `error` / `no_pending_approval` / `user_stop` / `cancelled`）、`turn_abandoned`、`session_reset`、`scheduled_push`（系统定时推送给用户的内容，不是入站事件，见 2.12）。事件只追加、不改写；“待处理”由会话游标 `processed_seq` 表达（入站事件 `user_message` / `approval` 的 seq 大于游标即待处理）。图片字节永远不进事件日志，只记张数。
 
 **wake 与重启恢复语义**
-- wake 只做按需触发（用户消息 / Y-N 审批），不做定时、cron、后台主动唤醒，也不做崩溃自动重试。
+- wake 只做按需触发（用户消息 / Y-N 审批），不做定时、cron、后台主动唤醒，也不做崩溃自动重试。定时任务由独立的调度器驱动，不经过 wake，也不走这条路径上的会话状态（见 2.12）。
 - 收到消息：写入 `user_message` 事件 → `wake(会话)` → 读取未处理的入站事件逐条处理 → 推进游标（成功失败都推进）。
 - 挂起授权：状态在 checkpoint 里，原话与已生成的图片落在 `turn_state`。进程重启后回复 Y/N 照常恢复，已完成的专家不会重跑，挂起前生成的图片仍随最终回复发出。
 - 崩溃遗留：启动时对每个有未处理入站事件的会话先镜像已落盘的消息，再追加 `turn_abandoned{process_restart}` 并推进游标，**不自动重跑**（回复通道已断，且重放可能让已批准的宿主机命令再执行一次）。
@@ -251,6 +259,55 @@ QQ 私聊里可以先发文件、再用文字提问（QQ 会把每个文件作�
 
 **严格 msgpack**：checkpointer 创建时显式传入 `allowed_msgpack_modules=None`（等价于 `LANGGRAPH_STRICT_MSGPACK=true`），checkpoint 反序列化只允许 LangGraph 内置的安全类型；重启恢复测试覆盖了本项目用到的状态类型。
 
+### 2.12 定时任务与主动推送
+owner 和 member 都可以在 QQ 私聊里用自然语言让机器人定时做事，例如：“每天早上 7:30 提醒我带不带伞，先查北京天气”（agent 模式 + `30 7 * * *`）、“30 分钟后提醒我关火”（reminder 模式 + `in_minutes=30`）、“每周一三五 9 点提醒我吃药”（reminder + `0 9 * * 1,3,5`）、“我有哪些提醒 / 把第二个删掉”。到点后系统无人值守地执行，再经 QQ 主动消息推给创建它的那个用户。各管各的任务，没有任何跨用户的创建 / 查看 / 取消（owner 只能用 `/tasks` 管理，见下）。
+
+**默认关闭**：`.env` 里设 `SCHEDULER_ENABLED=true` 并重启 `bot.py` 才启用。关闭时不创建 `schedules.db`、不编译第三张图、不挂 schedule 工具、不追加提示词段、不启动调度器，`/tasks` 回复“定时任务功能未启用。”，`/block` 也完全不碰任务库。所有 `SCHEDULER_*` 与 `DEFAULT_TIMEZONE` 的含义和默认值见 `.env.example`（写错的值回退或夹紧，不会让 import 崩溃）。
+
+**两种模式、三种时间参数**
+- `reminder`：到点把一句固定文案原样发出（`⏰ ` 加原文），不调用任何模型。
+- `agent`：到点由系统按创建时写好的指令执行一次受限的 Agent，把最终文字发给用户。指令必须自包含（到点时没有当前对话、看不到上下文和长期记忆）；到点执行时只有资料库 / 媒体 / 地图（含天气）三类能力，做不到的需求主管会直接告诉用户做不到，不会创建任务。
+- 时间参数三选一，由主管模型把“明天下午三点”之类换算好（代码里不解析自然语言时间）：`in_minutes`（几分钟后，一次性）、`run_at`（用户本地时间 `YYYY-MM-DD HH:MM`，一次性，必须晚于现在 10 秒以上、一年之内）、`cron`（5 段：分 时 日 月 周，重复）。cron 的校验在 `app/utils/schedule_time.py`：恰好 5 段，不接受 `@daily` 之类的别名与秒 / 年字段；366 天内一次都不触发（如 2 月 30 日）或相邻两次触发间隔小于 `SCHEDULER_MIN_INTERVAL_MINUTES`（默认 30 分钟）都会拒绝，并带着当前业务时间提示模型怎么改。
+
+**时区**：业务时区是 `DEFAULT_TIMEZONE`（IANA 名，默认 `Asia/Shanghai`；依赖 `tzdata`，Windows 与精简 Linux 镜像都没有系统时区库）。库里只存 epoch 秒、cron 字符串和创建任务时的时区名，之后改配置不会悄悄挪动已有任务；`get_current_time` 也改成输出业务时区的时间（格式不变）。`session_tools` 的事件时间与文件清单的时间仍用系统本地时区，所以 **VPS 上要把系统时区与 `DEFAULT_TIMEZONE` 对齐**（`timedatectl set-timezone Asia/Shanghai` 或设置 `TZ` 环境变量）。cron 在夏令时地区的行为取 cronsim 的实测结果：缺失的小时里固定时刻的任务顺延到当天第一个存在的时刻，带步长的任务当天跳过；重复的小时里固定时刻的任务只触发一次。
+
+**架构（能力门控仍在编译期）**
+- 启动时在 owner / member 两张图之外再编译第三张图（只在开关打开时）：专家只有 Knowledge / Media / Map 三个声明式专家，主管工具只有 `get_current_time`，没有会话回溯工具、没有 schedule 工具、没有任何会产生 HITL 中断的工具，也不带云端 CodeAgent（没有 Modal 费用）；owner 的定时任务也走它，不复用 owner 图（有宿主机能力）或 member 图。`_assert_scheduled_graph_safe` 在启动期断言这些，违反直接阻止启动。提示词是 `SCHEDULED_MAIN_AGENT_PROMPT`（无人值守、不得提问或请求确认、最终回复会被原样推送：自然简短的纯文本、不含网址）。
+- 三个 schedule 工具（`create_scheduled_task` / `list_scheduled_tasks` / `cancel_scheduled_task`）只挂在 owner 与 member 的主管上，调度说明在编译期追加到主管提示词末尾（原提示词常量一个字不动，开关关闭时传给 `create_deep_agent` 的仍是原常量对象）。**推送目标由代码在创建时从请求上下文取**（`RequestContext.user_id` / `raw_id`，必须能映射回当前用户），工具签名里没有任何 target / user 参数，模型既指定不了也改不了；无人值守的任务里 `require_owner()` 与 schedule 工具一律拒绝（`RequestContext.is_scheduled`）。
+- 无人值守的一次运行（`chat_service.run_scheduled_turn`）：先等该用户的锁最多 `SCHEDULER_LOCK_WAIT_SECONDS`（用户正在聊天就按“忙”处理，由调度器按间隔重试），持锁后在临时线程 `sched-<job8>-<run_ref>` 里跑一次，结束后删除线程；member 仍要过全局并发信号量。不查长期记忆、不镜像事件日志、不写 `assistant_message`、不提取记忆、不清理嵌套 checkpoint。运行期间 `/stop` 会取消它（回复“已中止正在运行的定时任务。”，不触发任何宿主机 / 沙箱终止原语），用户的普通消息收到“正在执行你的定时任务，请稍候再发；需要中止请发送 /stop”。
+
+**存储与调度（`app/infra/schedule_store.py`、`app/services/scheduler_service.py`）**
+- 独立的 `storage/schedules.db`（WAL，写入一律 `BEGIN IMMEDIATE`，schema 版本记在 `meta` 表）：`jobs`（任务、状态 active / paused / done、暂停原因 user / admin / push_refused / failures）、`runs`（每次执行，`UNIQUE(job_id, scheduled_for)` 是“至多一次”的最终保险，每个任务只留最近 20 条）。已完成的一次性任务保留 30 天后清理。取消 = 删除该任务及其全部 run。
+- **至多一次**：`claim_due` 在一个事务里取到点的任务、插入 `claimed` 的 run，并**在认领时就推进 `next_run_at`**（一次性任务置 done），所以运行中崩溃也不会重跑；重启时超过 `AGENT_TURN_TIMEOUT_SECONDS + 300` 秒仍是 `claimed` 的 run 记为 `failed(process_restart)`，不补跑。错过窗口（`SCHEDULER_MISFIRE_GRACE_SECONDS`，默认 900 秒）：一次性任务向用户说明一次“「标题」原定 HH:MM 触发，当时机器人不在线，没有执行。”，重复任务静默跳过只记 run。
+- 调度循环：到点认领 → 每个认领一个 asyncio task（同时最多 `SCHEDULER_MAX_CONCURRENT_RUNS` 个）→ 睡到下一个到点时刻，最长 30 秒，创建 / 取消 / 暂停 / 恢复任务时会唤醒它（存储的变更监听器，线程安全）。推送有全局节流（`SCHEDULER_PUSH_MIN_INTERVAL_SECONDS`）。
+- 单实例：多开 `bot.py` 时认领是原子的，不会重复执行，但仍不受支持。启动 / 停止顺序：调度器在 `init_service` 成功之后启动，在 `shutdown_service` 之前停止（停止时被取消的 `claimed` run 立即写成 `failed(cancelled)`）。
+
+**推送与失败策略**（`plugins/chat.py` 的 `_qq_push` 用 `Bot.send_to_c2c`，不带 `msg_id`，文本先抹掉链接；错误码表在该文件顶部并标注来源与是否实测）
+
+| 情况 | 处理 |
+| --- | --- |
+| 用户正忙（锁等不到）/ 临时推送错误 | 每隔 `SCHEDULER_RETRY_DELAY_SECONDS` 重试，最多 `SCHEDULER_RETRY_MAX` 次，且不超过 `scheduled_for` 加错过窗口 |
+| 内容重复（40054005） | 正文末尾加 `[MM-DD HH:MM]` 重试一次 |
+| 内容过长（40054007） | 截断后重试一次（正文超过 `SCHEDULER_PUSH_MAX_CHARS` 本来就会先截断并加“（内容过长已截断）”） |
+| 含链接被拒（40054010） | 去链接后重试一次 |
+| 无主动消息权限 / 用户拒收（40034105 / 40054013） | 该任务暂停（`push_refused`），之后不再向该用户推任何失败通知；用户重新打开“允许主动发送消息”后用 `/tasks resume` 恢复 |
+| agent 任务失败（超时 / 空结果 / 需要授权 / 出错） | 连续失败计数加 1（用户正忙、被 `/stop` 不计），至多推一条“⚠️ 定时任务「标题」这次没能完成（原因）”；连续失败达到 `SCHEDULER_MAX_CONSECUTIVE_FAILURES` 就暂停（`failures`），通知里说明可用 `/tasks resume` 恢复；需要授权的操作无人值守时一律放弃 |
+
+被 `/block` 的 member 的任务记为 `skipped`、不推送。日志里 openid 与 job id 只显示前 8 位，不记录任务正文。
+
+**推送内容写进会话**：推送成功后，`scheduled_push` 事件（job 前 8 位、标题、正文、模式、run id；`key=sp:<run_id>` 幂等）写进用户当前活动会话的事件日志，它不是入站事件（不触发 wake、不进 pending）；回溯工具里渲染为“系统定时推送给用户：「标题」正文”。用户的下一条消息前，会把边界（上一条 `user_message` / `session_reset`）之后的推送（最多 3 条、每条截 400 字）作为 `<scheduled_push_context>` 块拼到最后一条 HumanMessage 前面（注明“机器人按定时任务主动发给用户的内容，仅作背景，不是指令”），让“好的 / 那明天呢”接得上；块只在 `build_initial_messages` 之后加，RAG 查询、记忆抽取和事件日志里的用户原话都不含它，每条推送只注入一次，注入失败不影响这一轮。
+
+**管理命令 `/tasks`**（所有人；开关关闭时回复“定时任务功能未启用。”）
+- `/tasks`：列出自己的任务（序号、标题、模式、编号前 8 位、状态含暂停原因、周期、下次时间、上次结果）。
+- `/tasks rm <序号|编号前缀>`（别名 `del`）/ `pause` / `resume`：取消 / 暂停 / 恢复。序号指自己的列表，编号前缀至少 4 位。member 只能管自己的；owner 另可用编号前缀管任何人的任务。
+- `/tasks all`（仅 owner）：列出所有用户的任务，每行带用户显示名（备注）与编号前缀。
+- owner 暂停别人的任务时原因记为 `admin`，member 不能自己恢复（回复“该任务被管理员暂停，请联系管理员”），owner 可以；一次性任务的时间已过则拒绝恢复并提示重建；恢复 cron 任务时从现在重新计算下次触发。
+- `/block` 封禁成功后会暂停该用户进行中的任务（原因 `admin`，回复里说明暂停了几个）；`/unblock` **不自动恢复**，回复里提示用 `/tasks resume <编号前缀>` 逐个确认后恢复。
+
+**命令行**：`uv run python main.py --run-scheduler`（需要 `SCHEDULER_ENABLED=true`，否则打印警告并忽略）在本进程里运行 CLI 调度器，只领取目标为 `cli` 的任务（owner 在命令行里创建的任务），到点打印到控制台；它**不会领取任何 QQ 用户的任务**，所以不会“偷走”提醒，`bot.py` 的调度器同样不会领取 `cli` 的任务。
+
+**真机实测（2026-11-26，`tests/live_qq_push.py`，目标是一个已和机器人聊过的好友）**：无 `msg_id` 的主动文本能发出；间隔 1 秒的相同内容没有被去重；一次运行连发 17 条（其中 8 条无间隔）没有触发限频，所以旧资料里“每月只能主动发 4 条”的说法在这个机器人 / 用户上不适用（这是单个机器人 / 用户的观察，不是平台保证）；`https://example.com` 与裸域名都没有被拒收（仍保留抹掉链接的做法，保守）；4000 字的文本可以发出。**没有量到的**：用户关闭“允许主动发送消息”之后的错误码（那次运行时发送仍然成功），所以 `plugins/chat.py` 错误码表里的 permanent 组仍是平台文档的说法、标注“未实测”；“刚聊完 / 隔 1 天 / 隔 7 天”的互动窗口也只测了第一档。
+
 ---
 
 ## 3. 目录结构
@@ -267,7 +324,8 @@ DeepAgentsRefactor/
 │   │   ├── text.py           # 纯文本抽取与规范化
 │   │   ├── images.py         # 图像压缩、MIME 类型推导与 Base64 编码
 │   │   ├── context.py        # 请求上下文（RequestContext，基于 contextvars）与 require_owner 门控（只用标准库）
-│   │   └── identity.py       # 用户身份：平台 openid / CLI 名字 -> 内部 user_id，validate_user_id 白名单
+│   │   ├── identity.py       # 用户身份：平台 openid / CLI 名字 -> 内部 user_id，validate_user_id 白名单
+│   │   └── schedule_time.py  # 定时任务的时间解析与计算：业务时区、in_minutes / run_at / cron 校验（cronsim）、next_fire、describe（只用标准库与 cronsim）
 │   ├── runtime/              # L1: 运行时公共辅助
 │   │   ├── outbox.py         # 多模态消息发件箱旁路
 │   │   ├── hitl.py           # 人工授权 (HITL) 辅助与中断恢复
@@ -280,6 +338,7 @@ DeepAgentsRefactor/
 │   │   ├── modal_image.py    # Modal 命名镜像的纯定义（apt / pip 列表、环境变量、字体自检、build_image）；由 scripts/build_modal_image.py 使用
 │   │   ├── host_shell.py     # 宿主机命令运行器 / 环境变量白名单 / 免授权判定（FileAgent run_host_command）
 │   │   ├── session_store.py  # 会话 / 事件日志 / 挂起态 / 每用户活动会话指针 / users 表（标准库 sqlite3，sessions.db，schema v2）
+│   │   ├── schedule_store.py # 定时任务存储：jobs / runs / meta（标准库 sqlite3，独立的 schedules.db，原子认领、错过窗口、重启恢复）
 │   │   ├── checkpointer.py   # LangGraph checkpoint 的 AsyncSqliteSaver 打开 / 关闭 / 嵌套命名空间清理（checkpoints.db）
 │   │   ├── browser_service.py# 浏览器自动化控制封装 (Playwright)
 │   │   └── mcp_service.py    # MCP 协议客户端管理
@@ -299,6 +358,7 @@ DeepAgentsRefactor/
 │   │   └── guards.py         # 记忆纯函数代码护栏（证据校验/文本合规/对账规则）
 │   ├── tools/                # L3: 工具集合与适配器
 │   │   ├── knowledge_tools.py# RAG / Tavily / 时间查询工具
+│   │   ├── schedule_tools.py # 定时任务工具（create_scheduled_task / list_scheduled_tasks / cancel_scheduled_task，只挂在 owner 与 member 的主管上）
 │   │   ├── session_tools.py  # 主 Agent 的会话记录回溯工具（get_session_events / search_session_history，只读，只读当前用户自己的会话）
 │   │   ├── media_tools.py    # 媒体图谱检索工具
 │   │   ├── sql_tools.py      # MySQL 查询工具
@@ -309,9 +369,9 @@ DeepAgentsRefactor/
 │   ├── agents/               # L4: 智能体编排与专家定义
 │   │   ├── spec.py           # 声明式 ExpertSpec 数据结构
 │   │   ├── budget.py         # 专家工具调用预算（软 / 硬两级停止条件）
-│   │   ├── prompts.py        # 主 Agent 提示词（owner 的 MAIN_AGENT_PROMPT、member 的 MEMBER_MAIN_AGENT_PROMPT / 带云端 CodeAgent 的 MEMBER_MAIN_AGENT_PROMPT_CODE）与唯一的 WORKER_BASE_PROMPT
+│   │   ├── prompts.py        # 主 Agent 提示词（owner 的 MAIN_AGENT_PROMPT、member 的 MEMBER_MAIN_AGENT_PROMPT / 带云端 CodeAgent 的 MEMBER_MAIN_AGENT_PROMPT_CODE，以及追加了调度说明的 *_SCHED 与无人值守的 SCHEDULED_MAIN_AGENT_PROMPT）与唯一的 WORKER_BASE_PROMPT
 │   │   ├── skills.py         # Skills 虚拟文件系统 Backend 路由（含 member 只读的 ReadOnlyFilesystemBackend 与 skills_member/ 的路由）
-│   │   ├── orchestrator.py   # owner / member 两张主图的构建与多专家编排（member 图编译期不含任何宿主机路径）
+│   │   ├── orchestrator.py   # owner / member 两张主图（以及开关打开时无人值守的第三张图）的构建与多专家编排（member 与 scheduled 图编译期不含任何宿主机路径）
 │   │   └── experts/          # 7 个垂直领域子专家实现
 │   │       ├── knowledge_agent.py
 │   │       ├── media_agent.py
@@ -323,6 +383,8 @@ DeepAgentsRefactor/
 │   └── services/             # L5: 应用服务与业务流程调度
 │       ├── startup.py        # 全局数据库与服务初始化入口
 │       ├── chat_service.py   # 多用户多模态会话状态机：身份校验、每用户一把锁、member 并发上限、斜杠命令、per-user /stop 与 wake 调度
+│       ├── scheduler_service.py # 定时任务调度器：到点认领、reminder / agent 执行、推送失败策略、全局节流（不 import chat_service，run_turn 与 push 由调用方传入）
+│       ├── task_commands.py  # /tasks 斜杠命令（列出 / rm / pause / resume / all），只依赖存储与时间工具
 │       └── session_log.py    # 事件日志镜像（mirror_messages）与命令输出格式化
 ├── deploy/                   # 部署配置
 │   ├── docker-compose.yml    # Neo4j 等后台服务容器编排
@@ -348,6 +410,7 @@ DeepAgentsRefactor/
 │   ├── fixtures/amap/        # 高德工具契约与 Golden 样本数据
 │   ├── live_amap_golden.py   # 高德在线 Golden 数据集比对测试
 │   ├── live_modal.py         # Modal 真机验收与实测（只由用户运行，需要真实令牌，会产生少量费用；不带 --live 什么都不做）
+│   ├── live_qq_push.py       # QQ 主动消息真机探针（只由用户运行，会给目标用户发测试消息；不带 --live 什么都不做；结果见 2.12）
 │   ├── run_smoke.py          # 一键运行全部离线冒烟测试
 │   ├── _support.py           # 测试公用辅助（owner_context() / member_context()）
 │   ├── _fake_modal.py        # 忠实的 FakeModal（复刻真实 SDK 的签名与会让天真实现出错的行为），所有 Modal 相关测试靠它离线运行
@@ -364,6 +427,8 @@ DeepAgentsRefactor/
 │   ├── smoke_modal.py        # Modal 云端沙箱离线冒烟测试（配置与门控、池与熔断、执行 / 中止语义、路由与隔离、镜像与管理脚本、member CodeAgent 越权尝试）
 │   ├── smoke_multiuser.py    # 多用户：身份与上下文、会话库 v2 迁移与隔离、回溯工具隔离、上下文传播、纵深防御离线冒烟测试
 │   ├── smoke_orchestrator.py # 主管编排（owner / member 双图）与专家装配冒烟测试
+│   ├── smoke_scheduled_agent.py # 无人值守 agent 定时任务（run_scheduled_turn）离线冒烟测试：假 agent / 假 checkpointer
+│   ├── smoke_scheduler.py    # 定时任务离线冒烟测试：时间解析、存储、调度循环、失败策略、事件、工具、/tasks 与 CLI
 │   ├── smoke_session.py      # 会话存储 / 事件日志镜像 / 回溯工具离线冒烟测试
 │   ├── smoke_skills.py       # Skills 规范与 Backend 路由冒烟测试
 │   └── smoke_units.py        # 纯函数单元冒烟测试
@@ -397,6 +462,7 @@ uv sync
 - `SESSIONS_DB_PATH` / `CHECKPOINT_DB_PATH` / `CHECKPOINT_PRUNE_NESTED`（可选）：会话库、checkpoint 库路径与嵌套 checkpoint 清理开关，默认 `storage/sessions.db`、`storage/checkpoints.db`、开启，见 2.11。
 - `OWNER_USER_IDS`（多用户）：逗号分隔的平台 openid，命中的 QQ 用户与本地 CLI 是 owner（管理员），其余是 member。先用主号私聊机器人发 `/whoami` 取得平台 ID，再写进来并重启；openid 与机器人 AppID 绑定，见 2.4。
 - `MAX_CONCURRENT_MEMBER_TURNS`（可选，默认 3）：member 同时处理的轮数上限，owner 不占用；`MEMBER_WELCOME_TEXT`（可选）：新 member 的第一条回复前附带一次的欢迎语。
+- `SCHEDULER_ENABLED`（可选，默认 `false`）及 `DEFAULT_TIMEZONE`（默认 `Asia/Shanghai`）、`SCHEDULES_DB_PATH`、`SCHEDULER_MAX_JOBS_OWNER` / `SCHEDULER_MAX_JOBS_MEMBER`（默认 30 / 5）、`SCHEDULER_MIN_INTERVAL_MINUTES`（30）、`SCHEDULER_MISFIRE_GRACE_SECONDS`（900）、`SCHEDULER_LOCK_WAIT_SECONDS`（60）、`SCHEDULER_MAX_CONCURRENT_RUNS`（2）、`SCHEDULER_PUSH_MAX_CHARS`（1500）、`SCHEDULER_PUSH_MIN_INTERVAL_SECONDS`（0.5）、`SCHEDULER_MAX_CONSECUTIVE_FAILURES`（3）、`SCHEDULER_RETRY_MAX` / `SCHEDULER_RETRY_DELAY_SECONDS`（3 / 30）：定时任务与主动推送的总开关、业务时区与各项限额，默认值与说明见 2.12 与 `.env.example`；开启后重启 `bot.py`，VPS 上要把系统时区与 `DEFAULT_TIMEZONE` 对齐。
 - `QQ_FILE_*` / `QQ_INBOX_TTL_DAYS`（可选）：QQ 文件接收的总开关、member 开关、单文件大小、下载期限、数量与并发限制、inbox 保留天数、清单长度与文件名显示方式，全部有默认值，见 2.4「QQ 文件接收」与 `.env.example`。
 - `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`（可选）：Modal 云端沙箱令牌（member 的 CodeAgent 用）。**不配置则 member 没有代码能力，行为与阶段 1 一致**；令牌只放在 `.env` 里，绝不会传进沙箱。另有一组 `MODAL_*` 旁路可调项（总开关 `MODAL_DISABLED`、镜像名、CPU / 内存、空闲超时、每用户 / 全局沙箱上限、是否断网、中止方式 `MODAL_INTERRUPT_MODE`、审计日志路径……），默认值与说明见 `.env.example` 与 2.4；费用上限要在 Modal 控制台设。
 
@@ -590,29 +656,33 @@ uv run python tests/live_modal.py --live
 uv run python tests/run_smoke.py
 ```
 
-测试包含以下 18 个离线测试套件（Modal 相关的全部靠 `tests/_fake_modal.py` 的 FakeModal 离线运行：不联网、不读 `.env`、不调用真实 Modal；用户机器上 `.env` 里即使有真实令牌，结果也一致，因为测试自己控制 `config.MODAL_*`）：
+测试包含以下 20 个离线测试套件（Modal 相关的全部靠 `tests/_fake_modal.py` 的 FakeModal 离线运行：不联网、不读 `.env`、不调用真实 Modal；用户机器上 `.env` 里即使有真实令牌，结果也一致，因为测试自己控制 `config.MODAL_*`）：
 1. `tests/smoke_architecture.py`：分层单向依赖、语法禁令、空 `__init__`、提示词单例、专家规格、轻量隔离导入、无 Key 安全导入与 MCP 路径校验（8 个场景）。
 2. `tests/smoke_file_agent.py`：FileAgent 离线冒烟测试（含 MarkItDown 路径安全拦截、越界隔离、HITL 恢复映射以及 `run_host_command` 的工具白名单、免授权、批准/拒绝、绕过变体与授权提示内容等 23 个场景；`run_host_command` / `convert_to_markdown` 现在有 `require_owner()` 门控，场景运行器里统一套 `owner_context()`，断言不变）。
 3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试；阶段 2 新增 member 的 `skills_member/` 规范与禁用词检查、`ReadOnlyFilesystemBackend`（写 / 改 / 删 / 上传全部返回只读错误且磁盘上没有任何变化、读类方法仍可用）与经 `CompositeBackend` 的路径穿越检查。
 4. `tests/smoke_amap_contract.py`：高德地图 12 个本地工具契约与 Schema 快照测试（5 个场景）。
 5. `tests/smoke_amap_http.py`：高德工具 HTTP 异常与密钥脱敏测试（13 个场景）。
-6. `tests/smoke_chat_service.py`：以生产同款 `AsyncSqliteSaver` + `SessionStore` 驱动的服务层测试，覆盖多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复、`/reset`、图片轮不提取记忆，以及重启恢复、多会话 `/new` `/sessions` `/switch`、崩溃遗留、事件日志镜像、嵌套 checkpoint 清理、`/reset` 保留日志与 `wake` 幂等消费，以及 `/stop`（O1 慢模型中止、O2 子专家工具中止与悬空 tool_calls 补 cancelled、O3 空闲 `/stop`、O4 忙提示与忙时 `/reset`、O5 授权恢复阶段被中止、O6 终止原语在 cancel 之后被触发）；多用户新增 P1–P14（owner 与 member 各用各的图、不同用户互不阻塞与同用户忙提示、会话 / `/switch` 越权与“不存在”不可区分、member 的 `/reset` 不碰沙箱、管理命令仅 owner 与封禁、`/whoami`、欢迎语只出现一次、member 并发上限、缺图失败即关闭、identity 校验、多用户崩溃遗留、启动提示、`wake` 设置请求上下文、`init_service` 编译双图与 `shutdown_service` 中止所有人并清空状态）与 Q1–Q4（member 的 `/stop` 只中止自己、宿主机 / 沙箱终止原语只有 owner 的 `/stop` 才触发、owner 的 `/stop` 不中止 member、`/block` 与关闭服务时中止所有人）；阶段 2 新增 R1–R7（替换 `modal_sandbox` 模块属性来观察钩子：member 的 `/reset` 终止当前会话的云端沙箱且不碰 Docker、member 的 `/stop` 只中断自己会话的云端命令且不走进程级终止原语、失败的回合中断 member 沙箱而 owner 不调用、`/block` 回收云端沙箱、关闭服务时 `shutdown_pool` 先于 MCP 且互不连累、启动横幅与 `/whoami`、启动提示文案）（共 45 个场景）。
+6. `tests/smoke_chat_service.py`：以生产同款 `AsyncSqliteSaver` + `SessionStore` 驱动的服务层测试，覆盖多轮 HITL、发件箱图片连续性、并发忙提示、超时恢复、`/reset`、图片轮不提取记忆，以及重启恢复、多会话 `/new` `/sessions` `/switch`、崩溃遗留、事件日志镜像、嵌套 checkpoint 清理、`/reset` 保留日志与 `wake` 幂等消费，以及 `/stop`（O1 慢模型中止、O2 子专家工具中止与悬空 tool_calls 补 cancelled、O3 空闲 `/stop`、O4 忙提示与忙时 `/reset`、O5 授权恢复阶段被中止、O6 终止原语在 cancel 之后被触发）；多用户新增 P1–P14（owner 与 member 各用各的图、不同用户互不阻塞与同用户忙提示、会话 / `/switch` 越权与“不存在”不可区分、member 的 `/reset` 不碰沙箱、管理命令仅 owner 与封禁、`/whoami`、欢迎语只出现一次、member 并发上限、缺图失败即关闭、identity 校验、多用户崩溃遗留、启动提示、`wake` 设置请求上下文、`init_service` 编译双图与 `shutdown_service` 中止所有人并清空状态）与 Q1–Q4（member 的 `/stop` 只中止自己、宿主机 / 沙箱终止原语只有 owner 的 `/stop` 才触发、owner 的 `/stop` 不中止 member、`/block` 与关闭服务时中止所有人）；阶段 2 新增 R1–R7（替换 `modal_sandbox` 模块属性来观察钩子：member 的 `/reset` 终止当前会话的云端沙箱且不碰 Docker、member 的 `/stop` 只中断自己会话的云端命令且不走进程级终止原语、失败的回合中断 member 沙箱而 owner 不调用、`/block` 回收云端沙箱、关闭服务时 `shutdown_pool` 先于 MCP 且互不连累、启动横幅与 `/whoami`、启动提示文案）；定时任务新增 R8–R11（`init_service` 只在 `built.scheduled` 非空时才接入第三张图并打印横幅、`/tasks` 的权限与 `/block` 联动 / `/unblock` 不自动恢复、定时推送背景注入的边界与截断、经由真实的 `process_message → wake` 路径时 schedule 工具的推送目标取自请求上下文的平台原始 ID，P13 同时断言 `raw_id` 与 `is_scheduled`）（共 49 个场景）。
 7. `tests/smoke_session.py`：`SessionStore` 建表 / 活动指针 / 标题 / 前缀解析、事件追加与幂等 key、处理游标、`turn_state`（含 ≥1MB 发件箱）、搜索、关闭重开、并发 emit、`delete_session`，以及 `session_log.mirror_messages` 与两个回溯工具（接口都带 `user_id`，回溯工具缺 `user_id` 时拒绝）（12 个场景）。
 8. `tests/smoke_knowledge.py`：知识库建库、pending 增量入库、混合检索、长期记忆与 Reranker 阈值/降级离线冒烟测试（6 个场景）。
 9. `tests/smoke_memory.py`：长期记忆两阶段召回对账、版本化演进、代码护栏、输入隔离、fail-closed、多线程并发与平滑迁移离线冒烟测试（9 个场景）；多用户新增 10–12：每用户一个集合的命名 / 惰性创建 / 互相检索不到 / 跨用户 id 的 supersede、retire、restore、purge 失败，提取器与注入器按用户，`CLEAR_MEMORY_ON_STARTUP` 清空全部集合（共 12 个场景）。
-10. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（A–D 针对 owner 图，含主管时间 / 会话回溯工具与专家预算装配；多用户新增 E–H：owner 仍是 7 个专家、member 恰为 Knowledge / Media / Map、启动期断言对 13 个黑名单工具逐个注入主管 / 声明式子专家并拒绝、member 构建从不读取 desktop / markitdown MCP 工具、`MEMBER_MAIN_AGENT_PROMPT` 不含任何宿主机相关词）；阶段 2 新增 H2 / H3（带 CodeAgent 的 member 提示词，`MAIN_AGENT_PROMPT` 的 sha256 不变且禁用 CodeAgent 的 member 提示词与阶段 1 逐字相同）、I（启用 CodeAgent 的 member 图；任何一种不可用都回到 3 个专家）、F2（预编译子专家的严格例外：逐项破坏构建物都拒绝，13 个黑名单工具照样拒绝）、G2（启用 CodeAgent 时仍不碰 Docker 与宿主机）。文件顶部固定 `MODAL_DISABLED=true`，让 A–H 在有真实令牌的机器上也不受影响（共 13 个场景）。
+10. `tests/smoke_orchestrator.py`：编排层主 Agent 装配、专家顺序、规格与 HarnessProfile 排除写工具安全测试（A–D 针对 owner 图，含主管时间 / 会话回溯工具与专家预算装配；多用户新增 E–H：owner 仍是 7 个专家、member 恰为 Knowledge / Media / Map、启动期断言对 13 个黑名单工具逐个注入主管 / 声明式子专家并拒绝、member 构建从不读取 desktop / markitdown MCP 工具、`MEMBER_MAIN_AGENT_PROMPT` 不含任何宿主机相关词）；阶段 2 新增 H2 / H3（带 CodeAgent 的 member 提示词，`MAIN_AGENT_PROMPT` 的 sha256 不变且禁用 CodeAgent 的 member 提示词与阶段 1 逐字相同）、I（启用 CodeAgent 的 member 图；任何一种不可用都回到 3 个专家）、F2（预编译子专家的严格例外：逐项破坏构建物都拒绝，13 个黑名单工具照样拒绝）、G2（启用 CodeAgent 时仍不碰 Docker 与宿主机）。文件顶部固定 `MODAL_DISABLED=true`，让 A–H 在有真实令牌的机器上也不受影响；顶部同时固定 `SCHEDULER_ENABLED=false`，开关打开时的断言放在新增场景里：J / K / K2（owner 图与 member 图（含云端 CodeAgent 变体）追加调度说明与三个 schedule 工具，被 H3 钉死的原常量不变，追加的段落不含 member 能力边界之外的词）、L（无人值守的第三张图：只有三个声明式专家、主管工具只有 `get_current_time`、不带 CodeAgent，启动期断言逐项拒绝违规的图）（共 17 个场景）。
 11. `tests/smoke_units.py`：纯函数与小模块离线单元冒烟测试（路径解析、os.rename 兜底、MIME 判断、截图历史、未应答 tool_calls、SQL 加固与超时只读、rag 同源去重、浏览器幂等关闭、Milvus客户端双检锁、Neo4j图约束确保、图片编码与自检、Anthropic thinking 保留、浏览器 provider 选择与授权提示 URL 转义，以及多用户新增的 SQL 加固（系统库、`SLEEP(` / `BENCHMARK(` / `GET_LOCK(`、加锁读各自拒绝，注释写法绕不过）等 19 个场景）。
 12. `tests/smoke_budget.py`：专家独立停止条件（工具调用预算）离线冒烟测试（声明式专家 / FileAgent / DesktopAgent 的软硬停止、计数器隔离、超预算写入不弹授权、超预算宿主机命令不弹授权、生产递归上限下失控保护等 19 个场景）。
 13. `tests/smoke_sandbox.py`：Docker 沙箱架构契约与防护离线冒烟测试（含配置参数校验、单例跨调用复用与 TTL 超时重建、执行超时防护、输出洪泛头尾截断、多模态产物解析与安全防御、Docker 未启动友好引导、只读挂载降级与软链接防御、BaseSandbox 与 CompositeBackend 抽象基类契约、资源释放幂等性、并发串行化、code_tools 工具层与 Outbox 旁路集成、P0 命令包装与输出上限、O 超时细分保留状态、P 客户端缓存与 clamp、Q 指纹去重、R 沙箱工作台装配、S 多模态中间件与 T `interrupt` 不抢沙箱锁（`/stop`）、U owner 的 `execute_python_code` 描述（字节级 sha256）与工具集在阶段 2 之后不变等 21 个场景）。
 14. `tests/smoke_models.py`：模型角色默认 provider、Gemini 回退、未知 provider、缺 key 作用域、惰性单例与 thinking 文本隔离测试（5 个场景，构造过程不访问网络）。
 15. `tests/smoke_host_shell.py`：宿主机命令运行器测试（环境变量白名单、编码回退、免授权精确匹配、基础运行、子进程环境与 stdin、超时杀进程树、脱离孙进程不挂住、截断与洪泛硬上限、审计日志，仅 Windows 的专项用例，以及 H11 `kill_all_running`（`/stop` 终止在跑命令、之后新命令不受影响），共 11 个场景）。
-16. `tests/smoke_multiuser.py`：多用户改造离线冒烟测试（23 个场景）：身份与请求上下文（平台 id 格式 / 末尾换行 / 冒充 `owner`、`cli-`，`require_*` 失败即关闭）、会话库 v1→v2 迁移（数据归 owner、指针迁移、幂等、中途失败整体回滚）与用户隔离、users 表、回溯工具只读自己的会话、请求上下文穿过 `task` 子专家 / 线程池 / `asyncio.to_thread` 且并发互不串、`run_host_command` / `convert_to_markdown` / `execute_complex_browser_action` / DesktopAgent 工具节点在 member 与无上下文时一律拒绝、LLM 指标记录带 `user` 字段、QQ 插件只放行好友私聊（群 @ / 频道 / 频道私信忽略且日志限频，openid 格式不合法忽略，owner 的 openid 归一为 owner）。
+16. `tests/smoke_multiuser.py`：多用户改造离线冒烟测试（25 个场景）：身份与请求上下文（平台 id 格式 / 末尾换行 / 冒充 `owner`、`cli-`，`require_*` 失败即关闭）、会话库 v1→v2 迁移（数据归 owner、指针迁移、幂等、中途失败整体回滚）与用户隔离、users 表、回溯工具只读自己的会话、请求上下文穿过 `task` 子专家 / 线程池 / `asyncio.to_thread` 且并发互不串、`run_host_command` / `convert_to_markdown` / `execute_complex_browser_action` / DesktopAgent 工具节点在 member 与无上下文时一律拒绝、LLM 指标记录带 `user` 字段、QQ 插件只放行好友私聊（群 @ / 频道 / 频道私信忽略且日志限频，openid 格式不合法忽略，owner 的 openid 归一为 owner）；定时任务新增 8.8 / 8.9：`_qq_push` 不带 `msg_id`、抹掉链接、错误码与异常分类、日志里 openid 只显示前 8 位，调度器在插件里于 `init_service` 之后启动、先于 `shutdown_service` 停止且开关关闭 / 初始化失败 / 启停抛异常时都不影响主流程。
 
 17. `tests/smoke_modal.py`：Modal 云端沙箱离线冒烟测试（24 个场景）：S FakeModal 自检（`returncode` 在 `wait()` 之前访问抛错、兜底到点返回 -1 且静默、没有 `kill`、未知参数 `TypeError`、同名异常不继承内建……）、A 真实 SDK 表面（已安装 `modal` 时核对签名，没装就 SKIP；反方向检查 FakeModal 不接受真实 SDK 不认识的参数）、B 配置夹紧与 `member_code_status` 各分支与惰性导入、C 创建参数与环境白名单、D 池 / 租约 / 驱逐 / 上限、E 退出码与超时判定 / 不重试 / 重建、F 注入各类异常都不抛、G 路径规则、H 产物收集、I 软杀逻辑（伪造 `/proc`）与中止 / 关闭、J 熔断 / 创建超时 / 脱敏、K 路由与 `BaseSandbox` 契约（异步与线程池两条路径都拿得到上下文，没带上下文的线程 fail-closed）、L 审计日志、M 镜像定义与两个脚本、N 静态扫描（AST）、O member 的 `execute_python_code` 工具、P 提示词与描述的事实核对、K2 驱动真实编译的 member CodeAgent 做越权尝试、Q 真机验收脚本不带 `--live` 时完全离线。
 
 18. `tests/smoke_qq_files.py`：QQ 文件接收（owner + member）离线冒烟测试（25 个场景）：配置夹紧、文件名清洗与下载地址校验、`httpx.MockTransport` 下载（超限 / 超时 / 重定向 / 错误文案与日志不含下载地址）、owner 落盘（符号链接与路径穿越被拒、无临时文件残留）、member 直传 FakeModal（宿主机无痕）、在途闸门、未消费文件清单与注入边界、`chat_service` 集成（RAG / 记忆 / 事件日志不受清单块污染）、QQ 插件向后兼容、提示词与技能、清理与架构。
 
-此外还提供 `tests/live_modal.py` 真机验收脚本（**不在一键运行里**，需要真实 Modal 令牌与已发布的镜像，会产生少量 Modal 费用；不带 `--live` 只打印用法；`uv run python tests/live_modal.py --live [--slow]`，把终端里 `=== MEASUREMENTS ===` 那一整块复制出来用来决定 `MODAL_INTERRUPT_MODE` 等默认值）与 `tests/live_sandbox.py` 真机验收测试套件（包含 18 项端到端用例，需在已启动 Docker 守护进程的环境下执行 `uv run python tests/live_sandbox.py --live` 运行；慢测试需追加 `--slow` 参数）。
+19. `tests/smoke_scheduler.py`：定时任务与主动推送离线冒烟测试（33 个场景，全部离线：临时目录里的 `schedules.db`、假推送、假 agent，时间断言基于固定的 NOW）：A 时间（时区回落、`in_minutes` / `run_at` / cron 的校验与 cronsim 边界、夏令时、`next_fire` 严格晚于、`describe`，配置夹紧与 import 卫生，请求上下文新字段与 `require_owner` 对 scheduled 的拒绝，`get_current_time` 用业务时区）、B 存储（建库与版本、创建的数量上限与重复创建保护、编号解析、取消、暂停 / 恢复 / 管理员暂停、认领的原子性与错过窗口与 cli 分流与多连接并发、收尾、重启恢复、变更监听器、首个任务提示标记与清理）、C 调度循环（reminder 端到端、错过 / 重启恢复不补跑、被 notify 唤醒与停机、并发上限与推送节流、被封禁的 member 跳过、CLI 调度器只领 CLI 的任务、agent 成功路径）、D 失败策略（transient 重试与宽限截止、dedupe / too_long / url_rejected 各重试一次、permanent 暂停且不再通知、agent 失败的各种原因与通知、连续失败暂停与恢复）、E 事件写入（隔离、幂等、不是入站事件、日志卫生与分层）、F 工具（身份与推送目标门控、签名里没有 target / user 参数、参数校验、限额、重复创建保护、首个任务提示、列表与取消的跨用户隔离）、G `/tasks` 命令单元与 `main.py --run-scheduler`。
+
+20. `tests/smoke_scheduled_agent.py`：无人值守 agent 定时任务（`chat_service.run_scheduled_turn`）离线冒烟测试（7 个场景，假 agent / 假 checkpointer）：成功路径（输入块、config、请求上下文 `is_scheduled` 且 `require_owner` 拒绝、临时线程用完即删）、失败分类（unavailable / empty / hitl / timeout / error / busy / stopped）、不访问 `SessionStore` 且不查记忆 / 镜像日志 / `_finalize_round` / 提取记忆 / 清理嵌套 checkpoint、`_agent_for` 永远不返回 scheduled 图、`/stop` 短路（不碰任何终止原语）与忙提示、member 信号量（先锁后信号量）与取消。
+
+此外还提供 `tests/live_qq_push.py`（QQ 主动消息真机探针，**不在一键运行里**，会给目标用户的 QQ 发测试消息；不带 `--live` 只打印用法；`uv run python tests/live_qq_push.py --live --openid <openid> [--tag 名字] [--only 1,2,3]`，运行前要先停掉 `bot.py`，结果见 2.12）与 `tests/live_modal.py` 真机验收脚本（**不在一键运行里**，需要真实 Modal 令牌与已发布的镜像，会产生少量 Modal 费用；不带 `--live` 只打印用法；`uv run python tests/live_modal.py --live [--slow]`，把终端里 `=== MEASUREMENTS ===` 那一整块复制出来用来决定 `MODAL_INTERRUPT_MODE` 等默认值）与 `tests/live_sandbox.py` 真机验收测试套件（包含 18 项端到端用例，需在已启动 Docker 守护进程的环境下执行 `uv run python tests/live_sandbox.py --live` 运行；慢测试需追加 `--slow` 参数）。
 
 `tests/live_magpie.py` 是独立的 Magpie 协议探针，覆盖文本、工具轮次、普通图片、工具结果内图片和 browser_use 结构化输出。它不会启动真实浏览器/Desktop，也不会执行真实工具；只有显式设置 `RUN_MAGPIE_LIVE=1` 后运行 `uv run python tests/live_magpie.py` 才会访问网关，且不会加入离线 smoke 或 CI。
 
@@ -659,3 +729,10 @@ uv run python tests/run_smoke.py
 37. **QQ 的文件下载地址有时效**: 签名地址过一阵就失效（回执会提示“文件链接已失效，请重新发送”），所以文件必须在发出后很快被下载；机器人离线期间收到的文件无法补收。
 38. **未验证 QQ 是否拒收含扩展名的文本**: `QQ_FILE_SAFE_NAMES=true` 把文件名里的 `.` 显示成 `[.]` 只是防御性假设；真机确认回执不被拒收后可以设为 `false`。另外 QQ 对单条入站消息的被动回复次数上限、`http` 地址升级为 `https` 后对 QQ 下载域是否有效，也都没有真机验证。
 39. **NoneBot 自带的事件日志会打印附件的完整下载地址**: 收到带附件的私聊时，框架在进入插件之前就会记一行 `Message ... [Attachment(type='file', data={'url': 'https://…?rkey=…'})]`（图片附件同理，这是框架行为，不是本功能的日志）。地址带签名，所以不要把控制台输出原样贴给别人；需要脱敏时可在 `bot.py` 里给 loguru 加一个过滤器。
+40. **无人值守的定时任务会占着该用户的锁直到跑完或超时**: agent 模式的任务运行期间，用户的普通消息会收到“正在执行你的定时任务，请稍候再发；需要中止请发送 /stop”；最坏要等 `AGENT_TURN_TIMEOUT_SECONDS`。同一用户两个任务同时到点时，后者等锁，靠“忙”重试兜底。
+41. **主动推送依赖用户没有关闭“允许主动发送消息”，实测并不完整**: 2026-11-26 的真机探针只确认了“刚聊完”这一档能发出；用户关闭该开关之后的错误码没有量到（那次发送仍然成功），permanent 组仍是平台文档的说法；“隔 1 天 / 隔 7 天是否还能主动发”（互动窗口）没有测。收不到提醒时先让用户发 `/tasks` 看任务状态。
+42. **定时任务只支持单实例**: 多开 `bot.py` 时认领是原子的，不会重复执行，但不受支持；`main.py --run-scheduler` 的 CLI 调度器只领取目标为命令行的任务，不会领取 QQ 用户的任务。
+43. **崩溃时 `checkpoints.db` 里可能残留 `sched-*` 临时线程**: 无人值守的任务在临时线程里跑、结束后删除；进程在运行中被强杀时不会自动清理，需要时用 SQL 或重建库处理。
+44. **一次性任务错过 / 被中断只通知一次，重复任务静默跳过**: 机器人离线超过错过窗口（默认 15 分钟）后，一次性任务不补跑；重复任务只记一条 `missed` 的 run，用户不会收到通知。
+45. **系统时区要与 `DEFAULT_TIMEZONE` 对齐**: 调度计算只用 epoch 加任务自己的时区名，但 `get_current_time` 之外的一些展示（会话回溯工具的事件时间、文件清单的上传时间）用系统本地时区；VPS 上用 `timedatectl set-timezone` 或 `TZ` 环境变量对齐，否则这些时间会和用户理解的“本地时间”差几个小时。
+46. **定时任务的范围**: 只做 QQ 私聊的纯文本主动推送；不做群聊 / 频道、图片 / 文件推送、稍后提醒 / 贪睡、Web 管理界面、多机部署；“明天下午三点”之类的自然语言时间由主管模型换算成三选一的时间参数，代码里不解析。agent 模式在无人值守时只有资料库 / 媒体 / 地图三类能力，遇到需要授权的操作一律放弃。

@@ -1312,6 +1312,8 @@ def ctx_probe(config: RunnableConfig) -> str:
         "ctx_user": ctx.user_id if ctx else None,
         "ctx_session": ctx.session_id if ctx else None,
         "ctx_is_owner": ctx.is_owner if ctx else None,
+        "ctx_raw_id": ctx.raw_id if ctx else None,
+        "ctx_is_scheduled": ctx.is_scheduled if ctx else None,
         "cfg_user": configurable.get("user_id"),
         "cfg_thread": configurable.get("thread_id"),
     })
@@ -1338,6 +1340,10 @@ async def test_p13_wake_sets_request_context():
         rec = by_user[uid]
         assert rec["ctx_is_owner"] is is_owner and rec["cfg_user"] == uid, rec
         assert rec["ctx_session"] == rec["cfg_thread"] == _sid(uid), "上下文里的会话就是该用户当前的活动会话，thread_id 同一个"
+        assert rec["ctx_is_scheduled"] is False, "用户发起的一轮不是无人值守的定时任务"
+    assert by_user[OWNER]["ctx_raw_id"] == ID.raw_id == "cli", "命令行里 owner 的平台原始 ID 是 cli"
+    assert by_user[MEMBER_A.user_id]["ctx_raw_id"] == MEMBER_A.raw_id and by_user[MEMBER_B.user_id]["ctx_raw_id"] == MEMBER_B.raw_id, \
+        "member 的平台原始 ID（openid）经 process_message → wake 写进了请求上下文"
     assert get_request_context() is None, "wake 之外不应残留请求上下文"
 
 
@@ -1929,6 +1935,69 @@ async def test_r10_scheduled_push_context_injection():
         await _teardown()
 
 
+class _CreateTaskModel(BaseChatModel):
+    """无状态假模型：没有工具结果就调一次 create_scheduled_task，有了就收尾。"""
+    reply: str
+
+    @property
+    def _llm_type(self) -> str:
+        return "createtask"
+
+    def bind_tools(self, tools, **kw):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kw):
+        last_human = max((i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=-1)
+        if any(isinstance(m, ToolMessage) for m in messages[last_human + 1:]):      # 同一用户的历史里早就有工具结果：只看这一条消息之后的
+            msg = AIMessage(content=self.reply)
+        else:
+            human = [m for m in messages if isinstance(m, HumanMessage)]
+            title = str(human[-1].content)[:30] if human else "喝水"            # 每条用户消息一个标题：同一用户 5 分钟内完全相同的创建会被去重
+            args = {"title": title, "mode": "reminder", "prompt": "该喝水了", "in_minutes": 30}
+            msg = AIMessage(content="", tool_calls=[{"name": "create_scheduled_task", "args": args, "id": "mk1"}])
+        return ChatResult(generations=[ChatGeneration(message=msg)])
+
+
+register_harness_profile(
+    "createtaskmodel",
+    HarnessProfile(
+        general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+        excluded_tools=frozenset({"write_file", "edit_file", "delete", "execute", "ls", "glob", "grep"}),
+    ),
+)
+
+
+async def test_r11_schedule_tool_target_comes_from_request_context():
+    """R11 经由 process_message → wake 的真实路径：工具在 LangChain 线程里看到的请求上下文带着平台原始 ID（raw_id），
+    创建的任务推送目标就是它——QQ 的 member 与 owner 是各自的 openid，命令行里的 owner 是 cli；不依赖任何模型给出的参数。"""
+    from app.tools import schedule_tools
+    global _env
+    _env = _Env()
+    await _open_stack(_env)
+    old_ids = config.OWNER_USER_IDS
+    config.OWNER_USER_IDS = frozenset({"OWNERQQ00000001"})
+    try:
+        owner_qq = resolve_platform_user("OWNERQQ00000001")
+        graph = lambda: create_deep_agent(model=_CreateTaskModel(reply="好了"), tools=[schedule_tools.create_scheduled_task],
+                                          subagents=[], checkpointer=_env.saver)
+        cs._agents = {"owner": graph(), "member": graph()}
+        cs._initialized, cs._checkpointer = True, _env.saver
+        with _scheduler_env(True) as store:
+            assert owner_qq.is_owner and owner_qq.raw_id == "OWNERQQ00000001"
+            for who, label in ((MEMBER_A, "A"), (owner_qq, "owner-QQ"), (ID, "owner-CLI")):
+                reply = await _say(who, f"提醒我 30 分钟后喝水（{label}）")
+                assert reply.text.endswith("好了"), reply.text
+            got = {(j.user_id, j.target_openid) for j in store.list_jobs()}
+            assert got == {(MEMBER_A.user_id, MEMBER_A.raw_id), (OWNER, "OWNERQQ00000001"), (OWNER, "cli")}, got
+            assert len(store.list_jobs()) == 3
+            # 事件日志里能看到工具结果（创建成功），说明不是被拒绝后才碰巧一致
+            events = _env.store.get_events(_sid(MEMBER_A.user_id), types=["tool_result"])
+            assert events and "已创建定时任务" in str(events[-1].payload), events
+    finally:
+        config.OWNER_USER_IDS = old_ids
+        await _teardown()
+
+
 async def test_r7_startup_notice_wording():
     """R7 OWNER_USER_IDS 为空时的启动提示：不再说 member 没有“代码能力”，改为说明代码只能在云端沙箱里跑；P12 原有断言的关键词都在。"""
     old_ids, old_user = config.OWNER_USER_IDS, config.MYSQL_USER
@@ -1990,6 +2059,7 @@ SCENARIOS = [
     ("R8 scheduled 图的接线与启动横幅", test_r8_scheduled_graph_wiring),
     ("R9 /tasks 命令与 /block 联动", test_r9_tasks_command_and_block_linkage),
     ("R10 定时推送背景注入", test_r10_scheduled_push_context_injection),
+    ("R11 schedule 工具的推送目标来自请求上下文", test_r11_schedule_tool_target_comes_from_request_context),
 ]
 
 

@@ -711,7 +711,7 @@ async def _prepare_user_input(
 
 
 async def _run_turn(
-    uid: str, sid: str, text: str, image_url: Optional[str], turn_start: float
+    uid: str, sid: str, text: str, image_url: Optional[str], turn_start: float, *, raw_id: str = ""
 ) -> Optional[ChatReply]:
     """一轮普通对话（HITL 检查 -> Y/N 恢复 / 图片转文字 -> 写入入站事件 -> wake）。
 
@@ -725,7 +725,7 @@ async def _run_turn(
         user_reply = text.strip().upper()
         if user_reply in ("Y", "N"):
             store.emit_event(sid, "approval", {"answer": user_reply})
-            return await wake(sid, turn_start=turn_start)
+            return await wake(sid, turn_start=turn_start, raw_id=raw_id)
         cli_logger.log_hitl_status("REMIND", user_reply)
         warn = hitl.format_hitl_warning(current_state)
         msg = f"⚠️ 当前正在等待授权确认，请回复 Y 允许或 N 拒绝。\n\n{warn}"
@@ -741,7 +741,7 @@ async def _run_turn(
         "user_message",
         {"text": text, "processed_text": processed_text, "has_image": bool(image_url)},
     )
-    return await wake(sid, turn_start=turn_start)
+    return await wake(sid, turn_start=turn_start, raw_id=raw_id)
 
 
 async def _run_cancellable(coro, user_id: str, session_id: str, turn_start: float, source: str = "chat") -> Optional[ChatReply]:
@@ -1014,7 +1014,9 @@ async def _process_unblocked(text: str, image_url: Optional[str], identity: Iden
                 return reply
 
             sid = session_store.get_store().get_active_session_id(user_id=uid)
-            return await _run_cancellable(_run_turn(uid, sid, text, image_url, turn_start), uid, sid, turn_start)
+            return await _run_cancellable(
+                _run_turn(uid, sid, text, image_url, turn_start, raw_id=identity.raw_id), uid, sid, turn_start
+            )
 
         except GraphRecursionError as e:
             print(f"[WARN] 任务步骤超限 (GraphRecursionError): {e}")
@@ -1058,12 +1060,13 @@ def _failure_reason(exc: BaseException, user_id: str) -> tuple[str, str]:
     return "error", f"{type(exc).__name__}: {str(exc)[:200]}"
 
 
-async def wake(session_id: str, *, turn_start: Optional[float] = None) -> Optional[ChatReply]:
+async def wake(session_id: str, *, turn_start: Optional[float] = None, raw_id: str = "") -> Optional[ChatReply]:
     """按需触发（用户消息 / Y-N 审批）：读取该会话 seq > processed_seq 的入站事件，逐条处理。
 
     不携带载荷；没有待处理事件返回 None（幂等）；返回最后一条事件的 ChatReply。
     会话归属的用户决定三件事：用哪张图（owner / member）、请求上下文里的身份（工具层门控用）、
-    member 是否要先过全局并发上限。
+    member 是否要先过全局并发上限。raw_id 是平台原始 ID（QQ openid，CLI 为 "cli"），原样写进请求上下文：
+    定时任务工具据此确定推送目标，由代码填写、模型无法指定。
     处理失败时追加 turn_failed 并把异常抛给 process_message 转成友好文案；
     无论成功失败，最后都推进游标（不做崩溃自动重试）。
     """
@@ -1079,7 +1082,7 @@ async def wake(session_id: str, *, turn_start: Optional[float] = None) -> Option
     started = turn_start if turn_start is not None else time.perf_counter()
     cfg = _run_config(session_id, user_id)
     is_owner = user_id == OWNER_USER_ID
-    token = set_request_context(RequestContext(user_id=user_id, session_id=session_id, is_owner=is_owner))
+    token = set_request_context(RequestContext(user_id=user_id, session_id=session_id, is_owner=is_owner, raw_id=raw_id))
     sem = None if is_owner else _member_semaphore()
     reply: Optional[ChatReply] = None
     try:
