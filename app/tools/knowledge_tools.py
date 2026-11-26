@@ -9,6 +9,7 @@ from app import config
 from app.infra.milvus_client import get_client
 from app.knowledge.search import execute_hybrid_search, rerank_candidates
 from app.knowledge import query_transform
+from app.utils import schedule_time
 from app.utils.images import compress_image_to_base64
 
 
@@ -173,9 +174,9 @@ _WEEKDAYS_CN = ["星期一", "星期二", "星期三", "星期四", "星期五",
 
 @tool
 def get_current_time(placeholder: str = "default") -> str:
-    """获取当前的日期、时间和星期（本机时区）。用于回答今天几号、星期几、现在几点、今年是哪一年、距离某个日期还有几天等问题。本工具不需要任何参数，placeholder 可忽略。"""
+    """获取当前的日期、时间和星期（业务时区，即 DEFAULT_TIMEZONE）。用于回答今天几号、星期几、现在几点、今年是哪一年、距离某个日期还有几天等问题。本工具不需要任何参数，placeholder 可忽略。"""
     print("\n[Tool Call: get_current_time]")
-    now = datetime.now().astimezone()
+    now = datetime.now(schedule_time.get_tz())
     off = now.strftime("%z")  # 例如 +0800
     return f"{now.strftime('%Y-%m-%d %H:%M:%S')} {_WEEKDAYS_CN[now.weekday()]} (UTC{off[:3]}:{off[3:]})"
 

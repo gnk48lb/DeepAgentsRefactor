@@ -96,6 +96,8 @@ colorama==0.4.6 ; sys_platform == 'win32'
     #   loguru
     #   tqdm
     #   uvicorn
+cronsim==2.9
+    # via gnk48-agent
 cryptography==46.0.7
     # via
     #   google-auth
@@ -1433,8 +1435,10 @@ typing-inspection==0.4.2
     #   mcp
     #   pydantic
     #   pydantic-settings
-tzdata==2026.2 ; sys_platform == 'emscripten' or sys_platform == 'win32'
-    # via pandas
+tzdata==2026.2
+    # via
+    #   gnk48-agent
+    #   pandas
 uritemplate==4.2.0
     # via google-api-python-client
 urllib3==2.7.0

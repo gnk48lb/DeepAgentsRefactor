@@ -14,9 +14,17 @@ from typing import Iterator, Optional
 
 @dataclass(frozen=True)
 class RequestContext:
+    """本轮的身份。新字段只能加在末尾并带默认值：这个类被按位置构造。
+
+    raw_id：平台原始 ID（QQ openid；CLI 为 "cli"），定时任务据此取推送目标，由代码填写，模型无法指定。
+    is_scheduled：这一轮是无人值守的定时任务，没有任何人在对话里；require_owner() 对它一律拒绝。
+    """
+
     user_id: str
     session_id: str
     is_owner: bool
+    raw_id: str = ""
+    is_scheduled: bool = False
 
 
 _current: contextvars.ContextVar[Optional[RequestContext]] = contextvars.ContextVar(
@@ -55,8 +63,12 @@ def require_request_context() -> RequestContext:
 
 
 def require_owner() -> RequestContext:
-    """只有 owner 能过：没有上下文抛 RuntimeError，非 owner 抛 PermissionError。"""
+    """只有 owner 能过：没有上下文抛 RuntimeError，非 owner 抛 PermissionError。
+
+    无人值守的定时任务（is_scheduled）即使是 owner 的任务也一律拒绝：没有人在场可以授权。"""
     ctx = require_request_context()
+    if ctx.is_scheduled:
+        raise PermissionError("无人值守的定时任务不能执行需要管理员权限的操作")
     if not ctx.is_owner:
         raise PermissionError("该操作仅管理员可用")
     return ctx

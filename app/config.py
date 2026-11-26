@@ -295,6 +295,25 @@ MEMBER_WELCOME_TEXT = os.getenv("MEMBER_WELCOME_TEXT") or (
     "可用 /new 新建会话，/reset 清空当前会话的上下文。"
 )
 
+# ── 定时任务与主动推送（见 README「定时任务与主动推送」，实现见 app/services/scheduler_service.py）──
+# 默认关闭：关闭时不创建 schedules.db、不编译无人值守的 scheduled 图、不挂 schedule 工具、不追加提示词段、不启动调度器。
+# 非法值回落默认，越界值夹紧，不能让一个写错的数字把 import 搞崩。
+# DEFAULT_TIMEZONE 只存字符串（IANA 时区名）；ZoneInfo 对象由 app/utils/schedule_time.py 惰性创建，import 时不读时区库。
+DEFAULT_TIMEZONE = (os.getenv("DEFAULT_TIMEZONE") or "").strip() or "Asia/Shanghai"
+SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+SCHEDULES_DB_PATH = _resolve_path(os.getenv("SCHEDULES_DB_PATH") or "storage/schedules.db")
+SCHEDULER_MAX_JOBS_OWNER = min(_env_pos_int("SCHEDULER_MAX_JOBS_OWNER", 30), 1000)         # 每个用户最多几个任务（active 与 paused 一起算）
+SCHEDULER_MAX_JOBS_MEMBER = min(_env_pos_int("SCHEDULER_MAX_JOBS_MEMBER", 5), 1000)
+SCHEDULER_MIN_INTERVAL_MINUTES = min(max(1, _env_int("SCHEDULER_MIN_INTERVAL_MINUTES", 30)), 1440)  # 重复任务相邻两次触发的最小间隔
+SCHEDULER_MISFIRE_GRACE_SECONDS = min(max(30, _env_int("SCHEDULER_MISFIRE_GRACE_SECONDS", 900)), 86400)  # 到点后多久内还算“按时”，超过记为错过
+SCHEDULER_LOCK_WAIT_SECONDS = min(max(1, _env_int("SCHEDULER_LOCK_WAIT_SECONDS", 60)), 3600)  # 无人值守任务等用户锁的最长时间，超时按 busy 重试
+SCHEDULER_MAX_CONCURRENT_RUNS = min(max(1, _env_int("SCHEDULER_MAX_CONCURRENT_RUNS", 2)), 16)  # 同时在跑的定时任务数
+SCHEDULER_PUSH_MAX_CHARS = min(max(100, _env_int("SCHEDULER_PUSH_MAX_CHARS", 1500)), 4000)  # 单条推送正文上限（tests/live_qq_push.py 实测 4000 字可发）
+SCHEDULER_PUSH_MIN_INTERVAL_SECONDS = min(_env_float("SCHEDULER_PUSH_MIN_INTERVAL_SECONDS", 0.5), 60.0)  # 全局相邻两条推送的最小间隔
+SCHEDULER_MAX_CONSECUTIVE_FAILURES = min(max(1, _env_int("SCHEDULER_MAX_CONSECUTIVE_FAILURES", 3)), 100)  # 连续失败几次后暂停该任务
+SCHEDULER_RETRY_MAX = min(max(0, _env_int("SCHEDULER_RETRY_MAX", 3)), 10)                  # busy / 临时推送错误的最多重试次数
+SCHEDULER_RETRY_DELAY_SECONDS = min(max(1, _env_int("SCHEDULER_RETRY_DELAY_SECONDS", 30)), 600)
+
 # Agent 执行 recursion_limit
 AGENT_RECURSION_LIMIT = 60
 

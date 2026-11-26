@@ -449,6 +449,14 @@ wheels = [
 ]
 
 [[package]]
+name = "cronsim"
+version = "2.9"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/84/8e/954a8bfd82ce74157bbcf9f5510152f0f3d3927eed7923e016b97eee6099/cronsim-2.9-py3-none-any.whl", hash = "sha256:fcee664c9a206ac06913d8fc4b41b5fc1bd9c38b8242b0d5cb14d21f142b8bda", size = 14605, upload-time = "2026-11-23T08:30:36.143Z" },
+]
+
+[[package]]
 name = "cryptography"
 version = "46.0.7"
 source = { registry = "https://pypi.org/simple" }
@@ -711,6 +719,7 @@ dependencies = [
     { name = "aiosqlite" },
     { name = "anyio" },
     { name = "browser-use" },
+    { name = "cronsim" },
     { name = "deepagents" },
     { name = "docker" },
     { name = "fastapi" },
@@ -748,6 +757,7 @@ dependencies = [
     { name = "requests" },
     { name = "scipy" },
     { name = "typing-extensions" },
+    { name = "tzdata" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -756,6 +766,7 @@ requires-dist = [
     { name = "aiosqlite", specifier = ">=0.22.1" },
     { name = "anyio", specifier = ">=4.12.1" },
     { name = "browser-use", specifier = ">=0.12.6" },
+    { name = "cronsim", specifier = ">=2,<3" },
     { name = "deepagents", specifier = ">=0.7,<0.8" },
     { name = "docker", specifier = ">=7.0.0" },
     { name = "fastapi", specifier = ">=0.136.1" },
@@ -793,6 +804,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.32.5" },
     { name = "scipy", specifier = ">=1.10.0" },
     { name = "typing-extensions", specifier = ">=4.15.0" },
+    { name = "tzdata", specifier = ">=2024.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.46.0" },
 ]
 

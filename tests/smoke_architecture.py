@@ -344,6 +344,8 @@ import app.infra.modal_sandbox
 import app.infra.modal_image
 import app.utils.files
 import app.services.file_staging
+import app.utils.schedule_time
+import app.infra.schedule_store
 
 forbidden = ["app.infra.models", "app.infra.milvus_client", "app.knowledge", "app.memory", "modal"]
 loaded = [m for m in forbidden if any(name == m or name.startswith(m + ".") for name in sys.modules)]
