@@ -1,8 +1,10 @@
 """Modal 云端代码沙箱（member 的 CodeAgent 用） (所在层: L1)
 
 契约与分层规则：
-  - owner 的 CodeAgent 用本机 Docker 沙箱（app/infra/sandbox.py），member 的 CodeAgent 用本模块的 Modal 沙箱，
-    两条路径完全分开：本模块不引用本机沙箱的任何入口，也不触碰宿主机命令。
+  - desktop 形态：owner 的 CodeAgent 用本机 Docker 沙箱（app/infra/sandbox.py），member 的 CodeAgent 用本模块的 Modal 沙箱，
+    两条路径完全分开：本模块不引用本机沙箱的任何入口，也不触碰宿主机命令；owner 在这里一律被拒绝。
+    cloud 形态（config.is_cloud_mode()）：没有本机 Docker 路径，owner 与普通租户一样按 (owner, session_id) 取沙箱；
+    其余的失败即关闭（没有上下文、非法 user_id、空 session_id）照旧。
   - 复用 app.infra.sandbox 里的纯数据 / 工具类（RunResult、OutputsResult、SandboxImage、StreamingBuffer、SandboxUnavailable）。
   - `modal` 只在 load_modal() 里惰性导入：没装 modal、没有令牌时，全部 app 模块照样能被导入。
   - 令牌只由 modal SDK 自己从环境变量读取；本模块只看 config.MODAL_TOKENS_PRESENT（布尔），
@@ -1339,7 +1341,8 @@ class ModalRoutedSandbox(BaseSandbox):
     """同时当 CompositeBackend 的 default 与 execute_python_code / SandboxOutputsMiddleware 的“沙箱”用。
 
     无状态：每次调用都现解析请求上下文，拿到 (user_id, session_id) 后用池的 lease() 取沙箱并转发。
-    失败即关闭：没有上下文、owner、非法 user_id、空 session_id 一律拒绝（owner 永远不该走到这里，这是纵深防御）。
+    失败即关闭：没有上下文、非法 user_id、空 session_id 一律拒绝；desktop 下 owner 也拒绝（owner 永远不该走到这里，这是纵深防御），
+    cloud 下 owner 是普通租户，不拒绝（config.is_cloud_mode() 在每次调用时现读）。
     deepagents 同步路径下工具跑在 LangChain 的线程池（copy_context），异步路径下 BaseSandbox.aexecute 走 asyncio.to_thread，
     两条路径都会继承 ContextVar。
     """
@@ -1353,7 +1356,7 @@ class ModalRoutedSandbox(BaseSandbox):
         reason = None
         if ctx is None:
             reason, text = "no_context", _MSG_NO_IDENTITY
-        elif ctx.is_owner:
+        elif ctx.is_owner and not config.is_cloud_mode():       # desktop 下 owner 用本机 Docker，不该走到这里；cloud 下 owner 是普通租户
             reason, text = "owner", _MSG_OWNER_DENIED
         elif not ctx.session_id or not isinstance(ctx.session_id, str):
             reason, text = "no_session", _MSG_NO_IDENTITY
@@ -1537,7 +1540,7 @@ _MSG_UPLOAD_TOO_LARGE = "文件超过云端工作区允许的大小上限"
 
 def upload_session_file(user_id: str, session_id: str, remote_path: str, data: bytes,
                         *, max_bytes: Optional[int] = None) -> tuple[bool, str]:
-    """把一个用户上传的文件写进这个 (用户, 会话) 的沙箱（member 专用，owner 绝不能走到这里）。
+    """把一个用户上传的文件写进这个 (用户, 会话) 的沙箱（desktop 下 member 专用，owner 绝不能走到这里；cloud 下 owner 是普通租户）。
     成功 -> (True, 沙箱代标识)；失败 -> (False, 给用户看的中文短句)。永不抛异常，返回的文案不含内部细节。
     阻塞调用：调用方用 asyncio.to_thread。"""
     try:
@@ -1545,7 +1548,7 @@ def upload_session_file(user_id: str, session_id: str, remote_path: str, data: b
             validate_user_id(user_id)
         except ValueError:
             return False, _MSG_UPLOAD_FAILED
-        if user_id == OWNER_USER_ID or not isinstance(session_id, str) or not session_id:
+        if (user_id == OWNER_USER_ID and not config.is_cloud_mode()) or not isinstance(session_id, str) or not session_id:
             return False, _MSG_UPLOAD_FAILED
         if (not isinstance(remote_path, str) or not remote_path.startswith(_UPLOAD_ROOT)
                 or posixpath.normpath(remote_path) != remote_path):
