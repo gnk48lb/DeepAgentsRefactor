@@ -1,16 +1,43 @@
 """知识库检索与外部信息查询工具 (所在层: L3)"""
 
 import os
+import re
 import traceback
 from datetime import datetime
 from langchain_core.tools import tool
 from langchain_community.tools.tavily_search import TavilySearchResults
 from app import config
+from app.infra.browser_service import fetch_generic_webpage_content
 from app.infra.milvus_client import get_client
 from app.knowledge.search import execute_hybrid_search, rerank_candidates
 from app.knowledge import query_transform
 from app.utils import schedule_time
 from app.utils.images import compress_image_to_base64
+
+_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
+
+
+def _data_file(rel: str) -> str:
+    """把 Milvus 元数据里的相对路径（source_path / image_path）解析成 DATA_DIR 下的真实文件路径。
+
+    Windows 上建库时这些路径是 os.path.relpath 的结果，带反斜杠：先统一成正斜杠，在 Linux 上才拼得出存在的路径。
+    绝对路径（含盘符、UNC）和越出 DATA_DIR 的结果一律拒绝，返回空串，调用处按“文件不存在”处理。"""
+    if not isinstance(rel, str) or not rel.strip():
+        return ""
+    norm = rel.replace("\\", "/")
+    if norm.startswith("/") or _DRIVE_PREFIX.match(norm) or os.path.isabs(norm):
+        print(f"[Tool Warn] 知识库元数据里的路径不是相对路径，已忽略: {rel!r}")
+        return ""
+    base = os.path.normpath(config.DATA_DIR)
+    full = os.path.normpath(os.path.join(base, norm))
+    try:
+        inside = os.path.commonpath([base, full]) == base and full != base
+    except ValueError:                      # 不同盘符等：不可能在 DATA_DIR 里面
+        inside = False
+    if not inside:
+        print(f"[Tool Warn] 知识库元数据里的路径越出了数据目录，已忽略: {rel!r}")
+        return ""
+    return full
 
 
 def _build_context(best_hits) -> tuple[list[str], list[str]]:
@@ -31,10 +58,10 @@ def _build_context(best_hits) -> tuple[list[str], list[str]]:
             if source_path and source_path in seen_summary_paths:
                 continue
 
-            full_summary_path = os.path.join(config.DATA_DIR, source_path)
+            full_summary_path = _data_file(source_path)
             read_success = False
             try:
-                if os.path.exists(full_summary_path):
+                if full_summary_path and os.path.exists(full_summary_path):
                     with open(full_summary_path, "r", encoding="utf-8") as f:
                         text = f.read()
                         read_success = True
@@ -140,8 +167,8 @@ def rag(query: str):
             multimodal_content = []
             # 先添加图片，再添加文字描述，有助于模型更好地结合视觉信息
             for img_rel_path in image_paths:
-                full_img_path = os.path.join(config.DATA_DIR, img_rel_path)
-                if os.path.exists(full_img_path):
+                full_img_path = _data_file(img_rel_path)
+                if full_img_path and os.path.exists(full_img_path):
                     b64_img = compress_image_to_base64(full_img_path, max_size=(800, 800), quality=80)
                     if b64_img:
                         multimodal_content.append({
@@ -201,5 +228,17 @@ def web_search(query: str) -> str:
         return f"Error: 网络搜索失败: {str(e)}"
 
 
+@tool
+async def read_webpage_content(url: str) -> str:
+    """只读地读取用户给出的完整 http / https 链接，返回网页正文（Markdown 文本）。不点击、不输入、不登录，不做任何页面操作。用于总结网页、回答“这个网页说了什么”。输入必须是完整的 URL。"""
+    content = await fetch_generic_webpage_content(url)
+    max_chars = getattr(config, "WEBPAGE_MAX_CHARS", 30000)
+    if len(content) > max_chars:
+        return f"{content[:max_chars]}\n…（内容过长，已截断至前 {max_chars} 字符）"
+    return content
+
+
 # get_current_time 只由主管挂载，不属于 KnowledgeAgent。
 TOOLS = [rag, web_search]
+# cloud 形态的 KnowledgeAgent 多一个读网页的工具（云端没有 BrowserAgent）：新列表对象，TOOLS 本身保持不变。
+CLOUD_TOOLS = [rag, web_search, read_webpage_content]
