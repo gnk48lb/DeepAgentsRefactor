@@ -232,6 +232,22 @@ MODAL_INTERRUPT_MODE = (os.getenv("MODAL_INTERRUPT_MODE") or "").strip().lower()
 if MODAL_INTERRUPT_MODE not in ("soft", "terminate"):
     MODAL_INTERRUPT_MODE = "soft"
 
+# ── 部署形态（见 .env.example）──
+# desktop（默认）：Windows 本机，owner 有全部 7 个专家，member 只有 Knowledge / Media / Map（配了 Modal 令牌时多一个云端 CodeAgent）。
+# cloud：Linux 云主机，只编译一张主图，owner 与 member 共用：Knowledge / Media / Map（Modal 可用时再加云端 CodeAgent），
+#        不构建 FileAgent / DesktopAgent / BrowserAgent，不加载本机 MCP，不碰本机 Docker 沙箱与宿主机命令。
+# 与上面的数值配置不同，这里写错必须报错而不是回退：静默当成 desktop 会在云主机上拉起宿主机相关的专家。
+# 取值只在 import 时解析；云端分支要在调用时用 is_cloud_mode() 现读，不要缓存它的结果（测试靠 monkeypatch DEPLOY_MODE 切换）。
+DEPLOY_MODES = ("desktop", "cloud")
+DEPLOY_MODE = (os.getenv("DEPLOY_MODE") or "desktop").strip().lower()
+if DEPLOY_MODE not in DEPLOY_MODES:
+    raise ValueError(f"DEPLOY_MODE 的值不合法: {DEPLOY_MODE!r}，合法取值只有 {' / '.join(DEPLOY_MODES)}（留空等于 desktop）")
+
+
+def is_cloud_mode() -> bool:
+    """当前是不是云主机形态；每次读模块属性，不缓存。"""
+    return DEPLOY_MODE == "cloud"
+
 # 宿主机命令执行（FileAgent 的 run_host_command，见 app/infra/host_shell.py）。
 # 这是在用户真实机器上跑命令，没有任何沙箱：防线只有 人工授权 + 环境变量白名单 + 提示词约束。
 HOST_SHELL_TIMEOUT_SECONDS = int(os.getenv("HOST_SHELL_TIMEOUT_SECONDS", "60"))
