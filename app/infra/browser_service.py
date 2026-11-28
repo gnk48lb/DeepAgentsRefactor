@@ -4,8 +4,10 @@ import json
 import os
 import urllib.parse
 import httpx
-from browser_use import Agent, Browser
 from app import config
+
+# browser_use 只在 init_browser / run_browser_task 里惰性导入：cloud 形态的 knowledge_tools 只需要本模块的
+# fetch_generic_webpage_content，不该因此把整套 browser-use 依赖加载进云端进程。
 
 _browser = None
 _http_client: httpx.AsyncClient | None = None
@@ -23,6 +25,8 @@ async def init_browser():
     """
     global _browser
     if _browser is None:
+        from browser_use import Browser
+
         user_data_dir = config.BROWSER_PROFILE_DIR
         
         print(f"\n[BrowserService] 🚀 正在启动可见模式浏览器...")
@@ -110,6 +114,8 @@ async def run_browser_task(task_description: str) -> str:
     运行 BrowserAgent 任务
     """
     try:
+        from browser_use import Agent
+
         browser_llm = _build_browser_llm()
         browser = await init_browser()
 
