@@ -4,6 +4,16 @@
 - owner 图：7 个专家全挂（含 FileAgent / DesktopAgent / BrowserAgent / CodeAgent），构造路径与单用户时代完全等价；
 - member 图：只有 KnowledgeAgent / MediaAgent / MapAgent，编译期就不含任何通往宿主机的专家与工具。
 能力门控放在编译期而不是运行时：member 图里根本不存在通往宿主机资源的路径，不做按身份路由的设计。
+
+cloud 形态（DEPLOY_MODE=cloud，config.is_cloud_mode()，调用时现读）：整台云主机不开放任何“碰这台机器本身”的能力，
+所以只编译一张 member 式的主图，owner 与 member 共用（MainAgents.owner is MainAgents.member）：
+- 专家是 KnowledgeAgent（用 knowledge_agent.CLOUD_SPEC，多一个读网页的 read_webpage_content）/ MediaAgent / MapAgent，
+  Modal 令牌齐全时再加云端 CodeAgent（owner 的代码也走 Modal，沙箱键是 (owner, session_id)）；
+- 不构建 FileAgent / DesktopAgent / BrowserAgent 与 owner 的 CodeAgent，不初始化 MCP（desktop、markitdown），
+  不碰本机 Docker 沙箱与宿主机命令；
+- 提示词用 prompts.CLOUD_MAIN_AGENT_PROMPT*（定时任务图用 CLOUD_SCHEDULED_MAIN_AGENT_PROMPT）；
+- 现有的 member / scheduled 启动期断言一点不放松，另加 _assert_cloud_graph_safe 钉死 read_webpage_content 只在 KnowledgeAgent 手里。
+desktop 形态（默认）的构建顺序、调用次数与传给 create_deep_agent 的提示词常量与引入 cloud 之前完全一致。
 """
 
 from dataclasses import dataclass
@@ -25,6 +35,11 @@ from app import config
 from app.infra import models, mcp_service, modal_sandbox
 from app.tools import amap, knowledge_tools, markitdown_tool, schedule_tools, session_tools
 from app.agents.prompts import (
+    CLOUD_MAIN_AGENT_PROMPT,
+    CLOUD_MAIN_AGENT_PROMPT_CODE,
+    CLOUD_MAIN_AGENT_PROMPT_CODE_SCHED,
+    CLOUD_MAIN_AGENT_PROMPT_SCHED,
+    CLOUD_SCHEDULED_MAIN_AGENT_PROMPT,
     MAIN_AGENT_PROMPT,
     MAIN_AGENT_PROMPT_SCHED,
     MEMBER_MAIN_AGENT_PROMPT,
@@ -167,10 +182,13 @@ _MEMBER_CODE_TOOL_NAMES = frozenset({
 })
 
 
-def _member_subagents(code=None) -> list:
+def _member_subagents(code=None, *, cloud=False) -> list:
     """member 图的子专家：KnowledgeAgent / MediaAgent / MapAgent（按名字从 _DECLARATIVE_SPECS 里挑），
-    code 是通过构建的 MemberCodeAgentBuild 时再追加云端 CodeAgent（顺序：Knowledge、Media、Map、Code）。"""
+    code 是通过构建的 MemberCodeAgentBuild 时再追加云端 CodeAgent（顺序：Knowledge、Media、Map、Code）。
+    cloud=True 时 KnowledgeAgent 换成 knowledge_agent.CLOUD_SPEC（多一个读网页的工具；_DECLARATIVE_SPECS 本身不动），顺序不变。"""
     by_name = {spec.name: spec for spec in _DECLARATIVE_SPECS}
+    if cloud:
+        by_name[knowledge_agent.CLOUD_SPEC.name] = knowledge_agent.CLOUD_SPEC
     subagents = [by_name[name].to_subagent(models) for name in _MEMBER_EXPERT_NAMES]
     if code is not None:
         subagents.append(CompiledSubAgent(
@@ -251,18 +269,46 @@ def _assert_scheduled_graph_safe(supervisor_tools: list, subagents: list) -> Non
         raise RuntimeError(f"scheduled 图不允许预编译的子专家: {precompiled}")
 
 
-def _build_scheduled_agent(checkpointer: BaseCheckpointSaver):
+# cloud 图里读网页的工具：只有 KnowledgeAgent 能拿着它（它不是宿主机相关工具，不在上面的黑名单里，别加进去）
+_CLOUD_WEB_TOOL_NAME = "read_webpage_content"
+_CLOUD_KNOWLEDGE_TOOL_NAMES = ["rag", "web_search", _CLOUD_WEB_TOOL_NAME]
+
+
+def _assert_cloud_graph_safe(supervisor_tools: list, subagents: list, vetted_code=None) -> None:
+    """cloud 图的启动期断言（失败即关闭，叠加在 _assert_member_graph_safe 之上，不替代它）：
+    KnowledgeAgent 的工具名恰为 [rag, web_search, read_webpage_content]；主管与其余专家（含带 vetted_code 的 CodeAgent）
+    都不得持有 read_webpage_content。"""
+    if _CLOUD_WEB_TOOL_NAME in _tool_names(supervisor_tools):
+        raise RuntimeError(f"cloud 图的主管不得持有 {_CLOUD_WEB_TOOL_NAME}")
+    knowledge = [sa for sa in subagents if sa["name"] == knowledge_agent.CLOUD_SPEC.name]
+    if len(knowledge) != 1:
+        raise RuntimeError(f"cloud 图里必须恰有一个 {knowledge_agent.CLOUD_SPEC.name}，实际 {len(knowledge)} 个")
+    got = [getattr(t, "name", str(t)) for t in (knowledge[0].get("tools") or [])]
+    if got != _CLOUD_KNOWLEDGE_TOOL_NAMES:
+        raise RuntimeError(f"cloud 图的 KnowledgeAgent 工具必须恰为 {_CLOUD_KNOWLEDGE_TOOL_NAMES}，实际是 {got}")
+    for sa in subagents:
+        if sa is not knowledge[0] and _CLOUD_WEB_TOOL_NAME in _tool_names(sa.get("tools")):
+            raise RuntimeError(f"cloud 图的子专家 '{sa['name']}' 不得持有 {_CLOUD_WEB_TOOL_NAME}")
+    if vetted_code is not None and _CLOUD_WEB_TOOL_NAME in vetted_code.tool_names:
+        raise RuntimeError(f"cloud 图的 CodeAgent 不得持有 {_CLOUD_WEB_TOOL_NAME}")
+
+
+def _build_scheduled_agent(checkpointer: BaseCheckpointSaver, *, cloud=False):
     """无人值守的第三张图：Knowledge / Media / Map 三个声明式专家，监督者工具只有 get_current_time。
     owner 的定时任务也走它：不复用 owner 图（有宿主机能力），也不复用 member 图（带会话回溯工具，可能带云端 CodeAgent）。
-    图里不挂任何会产生 HITL 中断的工具，也没有会话回溯 / schedule 工具。只在 config.SCHEDULER_ENABLED 为真时构建（调用方判断）。"""
-    subagents = _member_subagents(None)
+    图里不挂任何会产生 HITL 中断的工具，也没有会话回溯 / schedule 工具。只在 config.SCHEDULER_ENABLED 为真时构建（调用方判断）。
+    cloud=True：KnowledgeAgent 用 CLOUD_SPEC（多读网页工具），提示词用 CLOUD_SCHEDULED_MAIN_AGENT_PROMPT，其余不变。
+    desktop 下仍按原样调用 _member_subagents(None) 并传原常量对象本身。"""
+    subagents = _member_subagents(None, cloud=True) if cloud else _member_subagents(None)
     supervisor_tools = [knowledge_tools.get_current_time]
     _assert_member_graph_safe(supervisor_tools, subagents)
     _assert_scheduled_graph_safe(supervisor_tools, subagents)
+    if cloud:
+        _assert_cloud_graph_safe(supervisor_tools, subagents)
     agent = create_deep_agent(
         model=models.orchestrator_llm,
         tools=supervisor_tools,
-        system_prompt=SCHEDULED_MAIN_AGENT_PROMPT,
+        system_prompt=CLOUD_SCHEDULED_MAIN_AGENT_PROMPT if cloud else SCHEDULED_MAIN_AGENT_PROMPT,
         subagents=subagents,
         middleware=[ToolCallLimitMiddleware(tool_name="task", run_limit=6, exit_behavior="continue")],
         backend=build_member_skills_backend(),
@@ -272,11 +318,14 @@ def _build_scheduled_agent(checkpointer: BaseCheckpointSaver):
     return agent, tuple(sa["name"] for sa in subagents)
 
 
-def _build_member_agent(checkpointer: BaseCheckpointSaver):
+def _build_member_agent(checkpointer: BaseCheckpointSaver, *, cloud=False):
     """member 图：Knowledge / Media / Map 三个声明式专家 + 主管自带的时间与会话回溯工具；
     Modal 可用（member_code_status 为真）时再多一个云端 CodeAgent。不可用时与阶段 1 等价，不调用任何 CodeAgent 构建函数。
     绝不读取 desktop / markitdown 的 MCP 工具，也不构造 owner 的 CodeAgent / FileAgent / DesktopAgent / BrowserAgent，
-    不触达本机 Docker 沙箱与宿主机命令。"""
+    不触达本机 Docker 沙箱与宿主机命令。
+    cloud=True（cloud 形态下 owner 与 member 共用这张图）：KnowledgeAgent 用 CLOUD_SPEC（多读网页工具），
+    提示词按“有无 CodeAgent、SCHEDULER_ENABLED 是否打开”在 4 个 CLOUD_MAIN_AGENT_PROMPT* 里选一个，其余逻辑不变。
+    desktop 下仍按原样调用 _member_subagents(code) 并传原常量对象本身。"""
     ok, _reason = modal_sandbox.member_code_status()
     code = None
     if ok:
@@ -284,13 +333,21 @@ def _build_member_agent(checkpointer: BaseCheckpointSaver):
             llm=models.worker_llm,
             system_prompt=code_agent.MEMBER_PROMPT,
         )
-    subagents = _member_subagents(code)
+    subagents = _member_subagents(code, cloud=True) if cloud else _member_subagents(code)
     supervisor_tools = [knowledge_tools.get_current_time, *session_tools.TOOLS]
-    system_prompt = MEMBER_MAIN_AGENT_PROMPT_CODE if code is not None else MEMBER_MAIN_AGENT_PROMPT
+    if cloud:
+        system_prompt = CLOUD_MAIN_AGENT_PROMPT_CODE if code is not None else CLOUD_MAIN_AGENT_PROMPT
+    else:
+        system_prompt = MEMBER_MAIN_AGENT_PROMPT_CODE if code is not None else MEMBER_MAIN_AGENT_PROMPT
     if config.SCHEDULER_ENABLED:            # 开关在调用时现读：打开才追加调度说明与三个 schedule 工具，关闭时与原来完全一致
         supervisor_tools = [*supervisor_tools, *schedule_tools.TOOLS]
-        system_prompt = MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED if code is not None else MEMBER_MAIN_AGENT_PROMPT_SCHED
+        if cloud:
+            system_prompt = CLOUD_MAIN_AGENT_PROMPT_CODE_SCHED if code is not None else CLOUD_MAIN_AGENT_PROMPT_SCHED
+        else:
+            system_prompt = MEMBER_MAIN_AGENT_PROMPT_CODE_SCHED if code is not None else MEMBER_MAIN_AGENT_PROMPT_SCHED
     _assert_member_graph_safe(supervisor_tools, subagents, vetted_code=code)
+    if cloud:
+        _assert_cloud_graph_safe(supervisor_tools, subagents, vetted_code=code)
 
     agent = create_deep_agent(
         model=models.orchestrator_llm,
@@ -370,24 +427,36 @@ async def build_main_agents(
     """编译 owner 与 member 两张主图（共用同一个 checkpointer）。
 
     高德配置校验与 MCP 初始化只做一次；持久化由调用方传入 checkpointer（生产为 AsyncSqliteSaver），不传时回退 MemorySaver。
+    cloud 形态（config.is_cloud_mode()，调用时现读）：跳过 MCP 初始化，不构建 owner 图与本机专家，只编译一张 member 式的图，
+    owner 与 member 是同一个对象（owner_experts 也同样）；scheduled 图照旧由 SCHEDULER_ENABLED 决定。
     """
+    cloud = config.is_cloud_mode()
+
     # 校验高德配置并获取本地工具
     amap.validate_config()
     amap_tools = amap.get_tools()
     if not amap_tools:
         print("⚠️ 警告：MapAgent 没有任何高德工具，地图/天气查询将不可用！")
 
-    # 确保 MCP 服务已初始化
-    await mcp_service.initialize_mcp()
+    # 确保 MCP 服务已初始化（cloud 不加载任何本机 MCP：desktop、markitdown）
+    if not cloud:
+        await mcp_service.initialize_mcp()
 
     if checkpointer is None:
         checkpointer = MemorySaver()
 
-    owner, owner_experts = await _build_owner_agent(checkpointer)
-    member, member_experts = _build_member_agent(checkpointer)
+    if cloud:
+        member, member_experts = _build_member_agent(checkpointer, cloud=True)
+        owner, owner_experts = member, member_experts
+    else:
+        owner, owner_experts = await _build_owner_agent(checkpointer)
+        member, member_experts = _build_member_agent(checkpointer)
     scheduled, scheduled_experts = None, ()
     if config.SCHEDULER_ENABLED:            # 开关在调用时现读：关闭时不编译第三张图
-        scheduled, scheduled_experts = _build_scheduled_agent(checkpointer)
+        if cloud:
+            scheduled, scheduled_experts = _build_scheduled_agent(checkpointer, cloud=True)
+        else:
+            scheduled, scheduled_experts = _build_scheduled_agent(checkpointer)
     return MainAgents(
         owner=owner, member=member, owner_experts=owner_experts, member_experts=member_experts,
         scheduled=scheduled, scheduled_experts=scheduled_experts,
