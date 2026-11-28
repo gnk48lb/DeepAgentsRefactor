@@ -6,9 +6,11 @@ QQ 把每个文件作为单独一条消息推送（文字内容为空），用�
   3. 进入回合时：collect_pending_notices 取出"上一条文字消息之后上传的文件"，format_uploaded_files_block 生成清单块，
      由 inject_files_block 加在最后一条 HumanMessage 前面。清单块不进入 RAG 查询、记忆抽取和事件日志的 text。
 
-落地位置：
+落地位置（由 uses_host_inbox 决定，每次调用时现读 config.is_cloud_mode()）：
   owner  -> WORKSPACE_DIR/inbox/<session_id>/<stem>_<sha8><suffix>（FileAgent 与本机 Docker CodeAgent 直接读）
   member -> 直接上传到该 (用户, 会话) 的 Modal 云端沙箱 /work/uploads/；字节只在内存里，宿主机不落盘、不解析
+  以上是 desktop 形态。cloud 形态（DEPLOY_MODE=cloud）没有宿主机 inbox：所有人（含 owner）都走 member 这条路，
+  owner 的沙箱键是 ('owner', session_id)，单文件上限仍按身份取（owner 的 QQ_FILE_MAX_MB_OWNER 高于 member）。
 
 安全约束：下载地址带签名参数，等同凭证，不得出现在日志、异常文本、事件、回执里（httpx 的异常字符串会带 URL，
 所以一律在抛出前换成固定文案）；owner 的所有磁盘操作限定在 inbox 内，不跟随符号链接；失败即关闭。
@@ -128,15 +130,27 @@ def _uid8(user_id: str) -> str:
 # 开关与门控
 # ══════════════════════════════════════════════════════════════════════════════
 
+def uses_host_inbox(is_owner: bool) -> bool:
+    """这个身份的文件是不是落到宿主机的 WORKSPACE_DIR/inbox（由 FileAgent / 本机 Docker CodeAgent 读取）。
+
+    desktop 下只有 owner 的文件落到宿主机 inbox；cloud 下所有人（含 owner）的文件都直传 Modal 沙箱，宿主机不落盘。
+    每次调用都现读 config.is_cloud_mode()，不缓存（测试靠 monkeypatch config.DEPLOY_MODE 切换）。"""
+    return bool(is_owner) and not config.is_cloud_mode()
+
+
 def gate(identity: Identity, *, member_code_enabled: bool) -> tuple[bool, str]:
-    """能不能接收这个用户的文件；不能时第二项是给用户看的固定文案。"""
+    """能不能接收这个用户的文件；不能时第二项是给用户看的固定文案。
+
+    宿主机 inbox 的用户（desktop 下的 owner）直接放行；其余人先看 QQ_FILE_MEMBER_ENABLED（那个开关只管 member，
+    cloud 下的 owner 不看它），然后都要求云端代码环境可用（文件只能直传 Modal 沙箱）。"""
     if not config.QQ_FILE_ENABLED:
         return False, "当前未开启文件接收功能。"
-    if not identity.is_owner:
-        if not config.QQ_FILE_MEMBER_ENABLED:
-            return False, "文件接收功能目前仅对管理员开放。"
-        if not member_code_enabled:
-            return False, "当前未启用云端代码环境，暂不支持处理文件附件（仅支持文本和图片）。"
+    if uses_host_inbox(identity.is_owner):
+        return True, ""
+    if not identity.is_owner and not config.QQ_FILE_MEMBER_ENABLED:
+        return False, "文件接收功能目前仅对管理员开放。"
+    if not member_code_enabled:
+        return False, "当前未启用云端代码环境，暂不支持处理文件附件（仅支持文本和图片）。"
     return True, ""
 
 
@@ -408,7 +422,7 @@ async def _stage_incoming(files: list[IncomingFile], *, identity: Identity, sess
                 if f.size > limit:
                     raise _TooLarge()
                 async with _get_sem():              # 包住单个文件的整个落地过程（下载 + 写盘 / 上传），也就限住了驻留内存的字节数
-                    if is_owner:
+                    if uses_host_inbox(is_owner):       # 落地位置看 uses_host_inbox；上限与 role 仍按身份（is_owner）
                         item = await _stage_owner(f.url, display=display, limit=limit, session_id=session_id)
                     else:
                         item = await _stage_member(f.url, display=display, limit=limit, user_id=uid, session_id=session_id)
@@ -447,12 +461,13 @@ def _idle_minutes() -> int:
 
 
 def format_receipts(outcome: StageOutcome, *, is_owner: bool, approval_pending: bool = False) -> str:
-    """纯文件消息的确定性回执（不调 LLM）。"""
+    """纯文件消息的确定性回执（不调 LLM）。措辞看文件落在哪（uses_host_inbox）：cloud 下 owner 收到的是 member 版。"""
     safe = config.QQ_FILE_SAFE_NAMES
+    host = uses_host_inbox(is_owner)
     lines: list[str] = []
     staged = outcome.staged
     if staged:
-        if is_owner:
+        if host:
             tail = "直接告诉我怎么处理（仅当前会话临时使用，不会存入知识库）。"
         else:
             tail = (
@@ -461,16 +476,16 @@ def format_receipts(outcome: StageOutcome, *, is_owner: bool, approval_pending: 
         if len(staged) == 1:
             item = staged[0]
             name, size = receipt_name(item.display_name, safe=safe), format_file_size(item.size)
-            if is_owner:
+            if host:
                 lines.append(f"已暂存：{name}（{size}）。{tail}")
             else:
                 lines.append(f"已收到：{name}（{size}），已放入你的云端工作区。{tail}")
         else:
-            lines.append(f"已暂存 {len(staged)} 个文件：" if is_owner else f"已收到 {len(staged)} 个文件：")
+            lines.append(f"已暂存 {len(staged)} 个文件：" if host else f"已收到 {len(staged)} 个文件：")
             lines.extend(
                 f"- {receipt_name(it.display_name, safe=safe)}（{format_file_size(it.size)}）" for it in staged
             )
-            lines.append(tail if is_owner else f"已放入你的云端工作区。{tail}")
+            lines.append(tail if host else f"已放入你的云端工作区。{tail}")
     lines.extend(outcome.errors)
     if staged and approval_pending:
         lines.append("提醒：当前还有一项待授权的操作，请先回复 Y 或 N。")
@@ -515,9 +530,9 @@ async def collect_pending_notices(session_id: str, user_id: str, *, upto_seq: in
         picked = list(latest.values())[-config.QQ_FILE_INJECT_MAX_ITEMS:]
         if not picked:
             return []
-        is_owner = user_id == OWNER_USER_ID
+        host = uses_host_inbox(user_id == OWNER_USER_ID)     # desktop 下的 owner 看宿主机 inbox；其余（含 cloud 下的 owner）比对沙箱代标识
         current_gen: Optional[str] = None
-        if not is_owner:                            # member 的代标识只查一次，所有文件共用
+        if not host:                                # 沙箱的代标识只查一次，所有文件共用
             try:
                 current_gen = await asyncio.wait_for(
                     asyncio.to_thread(modal_sandbox.session_sandbox_generation, user_id, session_id), 15
@@ -528,7 +543,7 @@ async def collect_pending_notices(session_id: str, user_id: str, *, upto_seq: in
         for ev in picked:
             p = ev.payload
             path = p["path"]
-            if is_owner:
+            if host:
                 available = _owner_file_available(path)
             else:
                 gen = p.get("gen")
@@ -574,7 +589,8 @@ def format_uploaded_files_block(notices: Sequence[FileNotice], *, is_owner: bool
         return ""
     ok = [n for n in notices if n.available]
     stale = [n for n in notices if not n.available]
-    gone = "已被清理" if is_owner else "云端工作区已被回收"
+    host = uses_host_inbox(is_owner)                # 开头句、失效说明与处理规则都看文件落在哪：cloud 下 owner 用 member 的那一套
+    gone = "已被清理" if host else "云端工作区已被回收"
     if not ok:
         lines = [
             "<uploaded_files>",
@@ -584,7 +600,7 @@ def format_uploaded_files_block(notices: Sequence[FileNotice], *, is_owner: bool
             "</uploaded_files>",
         ]
         return "\n".join(lines)
-    if is_owner:
+    if host:
         head = "用户在发这条消息之前，通过 QQ 上传了下面这些文件（仅本次会话临时使用，不会进入知识库；用户的原话在本块之后）："
     else:
         head = "用户在发这条消息之前，通过 QQ 上传了下面这些文件（仅本次会话临时使用，已放进用户的云端工作区；用户的原话在本块之后）："
@@ -593,7 +609,7 @@ def format_uploaded_files_block(notices: Sequence[FileNotice], *, is_owner: bool
         lines.append(f"以下文件已失效（{gone}），不要委派，请告诉用户重新发送：")
         lines.extend(_notice_line(n, with_path=False) for n in stale)
     lines.append("")
-    lines.append(_OWNER_RULES if is_owner else _MEMBER_RULES)
+    lines.append(_OWNER_RULES if host else _MEMBER_RULES)
     lines.append("</uploaded_files>")
     return "\n".join(lines)
 

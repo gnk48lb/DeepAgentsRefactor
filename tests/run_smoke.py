@@ -25,6 +25,7 @@ SMOKES = [
     "tests/smoke_memory.py",
     "tests/smoke_orchestrator.py",
     "tests/smoke_cloud_mode.py",
+    "tests/smoke_cloud_service.py",
     "tests/smoke_models.py",
     "tests/smoke_units.py",
     "tests/smoke_sandbox.py",
