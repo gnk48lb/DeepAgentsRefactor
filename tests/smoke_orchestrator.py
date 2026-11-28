@@ -33,6 +33,9 @@ os.environ["MODAL_DISABLED"] = "true"
 # 定时任务开关同理：本机 .env 里可能是 true，那样主管会多三个 schedule 工具、提示词也不是原常量，A–I 全红。
 # 开关打开时的断言放在 J / K 里（自己用上下文管理器临时打开）。
 os.environ["SCHEDULER_ENABLED"] = "false"
+# 部署形态同理：本机 .env 里可能是 cloud，那样 owner 图会被换成云端那张共用的图（只有三个专家），A–E 全红。
+# cloud 的断言放在 tests/smoke_cloud_mode.py 里（自己用上下文管理器临时切换 config.DEPLOY_MODE）。
+os.environ["DEPLOY_MODE"] = "desktop"
 for _role in ("WORKER_LLM", "ORCHESTRATOR_LLM", "KNOWLEDGE_LLM", "INGESTION_VLM", "BROWSER_VLM", "DESKTOP_VLM"):
     os.environ[f"{_role}_PROVIDER"] = "magpie"
     os.environ.pop(f"{_role}_MODEL", None)

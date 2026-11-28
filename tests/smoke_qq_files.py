@@ -30,6 +30,9 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
+# 本机 .env 里可能是 DEPLOY_MODE=cloud：load_dotenv 不覆盖已有的环境变量，所以这一行能压过它（本测试针对 desktop 形态）。
+os.environ["DEPLOY_MODE"] = "desktop"
+
 import httpx
 from langchain_core.messages import AIMessage, HumanMessage
 
