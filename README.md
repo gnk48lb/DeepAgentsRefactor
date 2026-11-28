@@ -73,6 +73,8 @@ L0 Config & Utils    (app/config.py, app/utils/*)
 | CodeAgent | 有（本机 Docker） | 有（Modal 云端沙箱，需配置令牌；仅在 Modal 可用时） |
 | FileAgent、BrowserAgent、DesktopAgent | 有 | 无 |
 
+上表是默认的 desktop 形态。`DEPLOY_MODE=cloud`（云主机）下不分 owner 图和 member 图：只编译一张图，owner 与 member 共用，见 2.13。
+
 - member 永远碰不到：本机 Docker 沙箱及其 `/workspace` 镜像、宿主机命令、桌面、真实浏览器、MCP 的 `desktop` 与 `markitdown` 工具、`workspace/` 目录。member 的代码只能在 Modal 云端沙箱里跑，绝不会落到本机 Docker 沙箱上。
 - owner 图的构造路径与单用户时代完全等价（7 个专家、顺序、工具、`MAIN_AGENT_PROMPT` 都没变）；member 图使用独立的 `MEMBER_MAIN_AGENT_PROMPT`（带云端 CodeAgent 时用 `MEMBER_MAIN_AGENT_PROMPT_CODE`），其中有【能力边界】一节，要求如实告知做不到读写用户电脑上的文件 / 操作桌面或浏览器。
 - **启动期断言**（失败即阻止启动）：member 图的专家名必须是 Knowledge / Media / Map 再加可选的一个经过验证的 CodeAgent；预编译子专家只允许这一个，且它的工具集（恰为 8 个，不含 `delete`）、后端（默认是云端路由沙箱而不是本机 Docker）与路由（`/skills/` 只读且指向 `skills_member/`、`/_artifacts/` 是内存 state）都严格校验；主管与各声明式子专家的工具都不得含 `run_host_command`、`move_file`、`create_directory`、`convert_to_markdown`、`take_grid_screenshot`、`click_grid_center`、`safe_input_text`、`press_hotkey`、`execute_complex_browser_action`、`execute_python_code`、`execute`、`write_file`、`edit_file`。
@@ -308,6 +310,34 @@ owner 和 member 都可以在 QQ 私聊里用自然语言让机器人定时做�
 
 **真机实测（2026-11-26，`tests/live_qq_push.py`，目标是一个已和机器人聊过的好友）**：无 `msg_id` 的主动文本能发出；间隔 1 秒的相同内容没有被去重；一次运行连发 17 条（其中 8 条无间隔）没有触发限频，所以旧资料里“每月只能主动发 4 条”的说法在这个机器人 / 用户上不适用（这是单个机器人 / 用户的观察，不是平台保证）；`https://example.com` 与裸域名都没有被拒收（仍保留抹掉链接的做法，保守）；4000 字的文本可以发出。**没有量到的**：用户关闭“允许主动发送消息”之后的错误码（那次运行时发送仍然成功），所以 `plugins/chat.py` 错误码表里的 permanent 组仍是平台文档的说法、标注“未实测”；“刚聊完 / 隔 1 天 / 隔 7 天”的互动窗口也只测了第一档。
 
+### 2.13 部署形态（desktop 与 cloud）
+`.env` 里的 `DEPLOY_MODE` 决定机器人跑在哪种机器上，取值只有两个：`desktop`（默认，留空等于它）与 `cloud`，不区分大小写；写错会在启动时直接报错，**不会回退成 desktop**。云端分支每次调用时现读 `config.is_cloud_mode()`，不缓存。desktop 的行为、回复文案与启动 / 关闭日志与引入 cloud 之前逐字一致，改回 `desktop` 就回到原样。
+
+cloud 面向一台 Linux 云主机（7×24 小时运行）：这台机器不开放任何“碰机器本身”的能力，所以没有 FileAgent / DesktopAgent / BrowserAgent，不加载本机 MCP，不碰本机 Docker 沙箱与宿主机命令。owner 与 member 走同一条云端沙箱路径。
+
+| 项目 | desktop（默认，Windows 本机） | cloud（Linux 云主机） |
+| --- | --- | --- |
+| 主图数量 | 两张：owner 图、member 图 | 一张，owner 与 member 是同一个对象 |
+| owner 的专家 | 7 个：Knowledge、Media、Map、Code（本机 Docker）、Browser、File、Desktop | Knowledge、Media、Map；Modal 令牌齐全时再加云端 CodeAgent |
+| member 的专家 | Knowledge、Media、Map；Modal 可用时再加云端 CodeAgent | 与 owner 相同（同一张图） |
+| KnowledgeAgent 的工具 | `rag`、`web_search` | `rag`、`web_search`、`read_webpage_content`（只读，读取用户给出的 http / https 链接，不点击不操作；没有 BrowserAgent，网页链接由它处理） |
+| owner 的代码在哪里跑 | 本机 Docker 沙箱 | Modal 云端沙箱，沙箱键是 `('owner', session_id)`；没配 Modal 就没有代码能力 |
+| 文件接收落在哪里 | owner：`WORKSPACE_DIR/inbox/<会话 id>/`；member：直传 Modal 沙箱 `/work/uploads/` | 所有人（含 owner）直传 Modal 沙箱 `/work/uploads/`，宿主机不落盘；要求云端 CodeAgent 已启用；`QQ_FILE_MEMBER_ENABLED` 只管 member |
+| 回执与文件清单 | owner：已暂存 + 委派 FileAgent / `/workspace/inbox/` 路径；member：已放入云端工作区 | 所有人都是 member 版措辞与规则（委派 CodeAgent，路径是 `/work/uploads/...`） |
+| `/reset` | owner：重置本机 Docker 沙箱并删该会话的 inbox 目录；member：只终止当前会话的云端沙箱 | 所有人：只终止当前会话的云端沙箱 |
+| `/stop` | owner：终止宿主机命令与 Docker 沙箱里的进程；member：只中断自己会话的云端命令 | 所有人：只中断自己会话的云端命令 |
+| 失败 / 超时的回合 | 只有 member 会中断自己会话的云端命令 | 所有人都会中断 |
+| `/whoami` 的 CodeAgent 后端 | owner：本机 Docker；member：云端沙箱（Modal）或未启用 | 所有人：云端沙箱（Modal）或未启用；多一行“部署形态：cloud” |
+| MCP 与浏览器 | 启动时初始化 `desktop`、`markitdown` 两个 MCP；owner 的 BrowserAgent 用本机浏览器 | 不初始化任何 MCP，不启动浏览器 |
+| 启动日志 | “owner 图专家”与“member 图专家”两行；“member 云端 CodeAgent：…” | “部署形态: cloud”一行，加一行“cloud 主图专家（owner 与 member 共用）”；“云端 CodeAgent（owner 与 member 共用）：…” |
+| 关闭服务 | 终止云端沙箱、关闭 MCP / 浏览器 / Milvus、销毁本机 Docker 沙箱 | 终止云端沙箱、关闭 MCP（没初始化过也无害）/ Milvus；不碰浏览器与本机 Docker 沙箱 |
+
+**cloud 下不变的**：`OWNER_USER_IDS` 仍决定谁是 owner，`/users`、`/label`、`/block`、`/unblock` 仍仅 owner 可用；owner 不占 member 的并发信号量；owner 的单文件上限 `QQ_FILE_MAX_MB_OWNER` 仍高于 member；身份自洽等失败即关闭的校验一个字没动。
+
+**cloud 下不生效的配置项**：`WORKSPACE_DIR`（没有任何代码会用它，`config` 仍会在 import 时建这个空目录，无害）、`QQ_INBOX_TTL_DAYS`（没有宿主机 inbox）、`DOCKER_*` 与 `SANDBOX_*`（本机 Docker 沙箱不会启动）、`HOST_SHELL_*`（没有宿主机命令）、`BROWSER_*`（`BROWSER_VLM_PROVIDER` / `BROWSER_VLM_MODEL`，没有 BrowserAgent）；`DESKTOP_VLM_*` 与 `MARKITDOWN_*` 同理。反过来，cloud 下更关键的是 `MODAL_*`（owner 的代码与所有人的文件接收都靠它）与 `TAVILY_API_KEY`（`read_webpage_content` 经 Tavily Extract 读取网页）。
+
+**从 desktop 迁到 cloud 要知道的**：`sessions.db` 里 Windows 时代留下的文件事件路径是 `/workspace/inbox/...`，cloud 下会被判为失效（清单块会请用户重新发送），这是预期行为；Modal 令牌没配齐时，cloud 里没有 CodeAgent，所有人的文件附件都会收到“当前未启用云端代码环境……”。对应的离线测试是 `tests/smoke_cloud_mode.py`（配置、编排、提示词、Modal 门控）与 `tests/smoke_cloud_service.py`（服务层），见第 8 节。
+
 ---
 
 ## 3. 目录结构
@@ -419,6 +449,8 @@ DeepAgentsRefactor/
 │   ├── smoke_architecture.py # 架构分层、规范与契约冒烟测试
 │   ├── smoke_budget.py       # 专家工具调用预算（独立停止条件）冒烟测试
 │   ├── smoke_chat_service.py # chat_service 服务层离线冒烟测试
+│   ├── smoke_cloud_mode.py   # DEPLOY_MODE=cloud 离线冒烟测试：配置解析、desktop 回归、云端 KnowledgeAgent 与读网页工具、知识库路径归一、云端提示词、云端构建与启动期断言、Modal 门控、browser_use 惰性导入
+│   ├── smoke_cloud_service.py# DEPLOY_MODE=cloud 服务层离线冒烟测试：文件落地与回执、/reset /whoami /stop、失败回合、启动与关闭，以及 desktop 回归（自成一体，不 import 其他 smoke 模块）
 │   ├── smoke_file_agent.py   # FileAgent 离线冒烟测试
 │   ├── smoke_host_shell.py   # 宿主机命令运行器离线冒烟测试
 │   ├── smoke_knowledge.py    # 知识库离线冒烟测试
@@ -656,7 +688,7 @@ uv run python tests/live_modal.py --live
 uv run python tests/run_smoke.py
 ```
 
-测试包含以下 20 个离线测试套件（Modal 相关的全部靠 `tests/_fake_modal.py` 的 FakeModal 离线运行：不联网、不读 `.env`、不调用真实 Modal；用户机器上 `.env` 里即使有真实令牌，结果也一致，因为测试自己控制 `config.MODAL_*`）：
+测试包含以下 22 个离线测试套件（Modal 相关的全部靠 `tests/_fake_modal.py` 的 FakeModal 离线运行：不联网、不读 `.env`、不调用真实 Modal；用户机器上 `.env` 里即使有真实令牌，结果也一致，因为测试自己控制 `config.MODAL_*`）：
 1. `tests/smoke_architecture.py`：分层单向依赖、语法禁令、空 `__init__`、提示词单例、专家规格、轻量隔离导入、无 Key 安全导入与 MCP 路径校验（8 个场景）。
 2. `tests/smoke_file_agent.py`：FileAgent 离线冒烟测试（含 MarkItDown 路径安全拦截、越界隔离、HITL 恢复映射以及 `run_host_command` 的工具白名单、免授权、批准/拒绝、绕过变体与授权提示内容等 23 个场景；`run_host_command` / `convert_to_markdown` 现在有 `require_owner()` 门控，场景运行器里统一套 `owner_context()`，断言不变）。
 3. `tests/smoke_skills.py`：Skills 规范与 Backend 虚拟路由冒烟测试；阶段 2 新增 member 的 `skills_member/` 规范与禁用词检查、`ReadOnlyFilesystemBackend`（写 / 改 / 删 / 上传全部返回只读错误且磁盘上没有任何变化、读类方法仍可用）与经 `CompositeBackend` 的路径穿越检查。
@@ -681,6 +713,10 @@ uv run python tests/run_smoke.py
 19. `tests/smoke_scheduler.py`：定时任务与主动推送离线冒烟测试（33 个场景，全部离线：临时目录里的 `schedules.db`、假推送、假 agent，时间断言基于固定的 NOW）：A 时间（时区回落、`in_minutes` / `run_at` / cron 的校验与 cronsim 边界、夏令时、`next_fire` 严格晚于、`describe`，配置夹紧与 import 卫生，请求上下文新字段与 `require_owner` 对 scheduled 的拒绝，`get_current_time` 用业务时区）、B 存储（建库与版本、创建的数量上限与重复创建保护、编号解析、取消、暂停 / 恢复 / 管理员暂停、认领的原子性与错过窗口与 cli 分流与多连接并发、收尾、重启恢复、变更监听器、首个任务提示标记与清理）、C 调度循环（reminder 端到端、错过 / 重启恢复不补跑、被 notify 唤醒与停机、并发上限与推送节流、被封禁的 member 跳过、CLI 调度器只领 CLI 的任务、agent 成功路径）、D 失败策略（transient 重试与宽限截止、dedupe / too_long / url_rejected 各重试一次、permanent 暂停且不再通知、agent 失败的各种原因与通知、连续失败暂停与恢复）、E 事件写入（隔离、幂等、不是入站事件、日志卫生与分层）、F 工具（身份与推送目标门控、签名里没有 target / user 参数、参数校验、限额、重复创建保护、首个任务提示、列表与取消的跨用户隔离）、G `/tasks` 命令单元与 `main.py --run-scheduler`。
 
 20. `tests/smoke_scheduled_agent.py`：无人值守 agent 定时任务（`chat_service.run_scheduled_turn`）离线冒烟测试（7 个场景，假 agent / 假 checkpointer）：成功路径（输入块、config、请求上下文 `is_scheduled` 且 `require_owner` 拒绝、临时线程用完即删）、失败分类（unavailable / empty / hitl / timeout / error / busy / stopped）、不访问 `SessionStore` 且不查记忆 / 镜像日志 / `_finalize_round` / 提取记忆 / 清理嵌套 checkpoint、`_agent_for` 永远不返回 scheduled 图、`/stop` 短路（不碰任何终止原语）与忙提示、member 信号量（先锁后信号量）与取消。
+
+21. `tests/smoke_cloud_mode.py`：部署形态 `DEPLOY_MODE=cloud` 的离线冒烟测试（9 个场景）：C1 配置解析（`cloud` / 带空格的 `Cloud` / 空串 / 写错在 import 时报错，`is_cloud_mode()` 现读、没有任何模块在 import 时缓存它）、C2 desktop 回归（`knowledge_tools.TOOLS`、`_DECLARATIVE_SPECS`、被钉死的提示词哈希、新常量都不是旧常量的别名、desktop 下 `build_main_agents` 的构建顺序与调用方式）、C3 云端 KnowledgeAgent 与 `read_webpage_content`（短内容原样、超长截断、错误串透传）、C4 知识库元数据路径归一（反斜杠路径、绝对路径与越界路径被拒绝）、C5 云端提示词（识别短语、禁用词、只新增不改写，`web_read=False` 时与改动前逐字节相同）、C6 云端构建（不碰 MCP / owner 图 / 本机专家，`owner is member`，FakeModal 启用时多云端 CodeAgent，定时任务图）、C7 启动期断言仍然有效（13 个宿主机工具名、非法专家名、预编译子专家都拒绝，cloud 专用断言逐项拒绝）、C8 Modal 门控（cloud 下 owner 按 `('owner', session_id)` 取沙箱、可以上传文件，desktop 下仍拒绝）、C9 `browser_use` 惰性导入。
+
+22. `tests/smoke_cloud_service.py`：服务层适配 `DEPLOY_MODE=cloud` 的离线冒烟测试（6 个场景，自成一体：夹具照抄自 `smoke_qq_files.py` 与 `smoke_chat_service.py`，不 import 它们；Docker 沙箱、`host_shell`、`browser_service` 的入口换成一碰就失败的绊线，Modal 用 FakeModal / 钩子替身）：S1 `uses_host_inbox` 真值表与 `gate` 的各种组合、S2 文件落地（cloud 下 owner 的文件进 `('owner', sid)` 沙箱、宿主机无 inbox、`QQ_FILE_MAX_MB_OWNER` 仍生效，desktop 下 owner 仍落 inbox）、S3 回执与清单（cloud 下 owner 是 member 版措辞与规则，Windows 时代的路径被判失效，desktop 输出逐字不变）、S4 `chat_service` 的 cloud 行为（`/reset`、`/whoami`、`/stop`、失败回合、owner 不占 member 信号量、`init_service`、`shutdown_service`）、S5 desktop 回归、S6 静态检查（没有模块级 `is_cloud_mode()` 调用或缓存，cloud 分支不 import 本机沙箱 / 宿主机命令 / 浏览器）。
 
 此外还提供 `tests/live_qq_push.py`（QQ 主动消息真机探针，**不在一键运行里**，会给目标用户的 QQ 发测试消息；不带 `--live` 只打印用法；`uv run python tests/live_qq_push.py --live --openid <openid> [--tag 名字] [--only 1,2,3]`，运行前要先停掉 `bot.py`，结果见 2.12）与 `tests/live_modal.py` 真机验收脚本（**不在一键运行里**，需要真实 Modal 令牌与已发布的镜像，会产生少量 Modal 费用；不带 `--live` 只打印用法；`uv run python tests/live_modal.py --live [--slow]`，把终端里 `=== MEASUREMENTS ===` 那一整块复制出来用来决定 `MODAL_INTERRUPT_MODE` 等默认值）与 `tests/live_sandbox.py` 真机验收测试套件（包含 18 项端到端用例，需在已启动 Docker 守护进程的环境下执行 `uv run python tests/live_sandbox.py --live` 运行；慢测试需追加 `--slow` 参数）。
 
